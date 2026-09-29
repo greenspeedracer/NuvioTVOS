@@ -142,7 +142,7 @@ extension PlayerView {
                 }
             }
             .onChange(of: scenePhase) { oldPhase, phase in
-                print("[ScreensaverDebug][PlayerView] scenePhase changed from \(oldPhase) to \(phase), status=\(viewModel.status), time=\(viewModel.time.current)/\(viewModel.time.duration), showPauseOverlay=\(viewModel.showPauseOverlay), showControls=\(viewModel.showControls)")
+                screensaverDebugLog("[ScreensaverDebug][PlayerView] scenePhase changed from \(oldPhase) to \(phase), status=\(viewModel.status), time=\(viewModel.time.current)/\(viewModel.time.duration), showPauseOverlay=\(viewModel.showPauseOverlay), showControls=\(viewModel.showControls)")
                 switch phase {
                 case .inactive:
                     break
@@ -158,16 +158,16 @@ extension PlayerView {
                 }
             }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
-                print("[ScreensaverDebug][PlayerView] willResignActiveNotification received, status=\(viewModel.status), time=\(viewModel.time.current)")
+                screensaverDebugLog("[ScreensaverDebug][PlayerView] willResignActiveNotification received, status=\(viewModel.status), time=\(viewModel.time.current)")
             }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
-                print("[ScreensaverDebug][PlayerView] didEnterBackgroundNotification received, status=\(viewModel.status), time=\(viewModel.time.current)")
+                screensaverDebugLog("[ScreensaverDebug][PlayerView] didEnterBackgroundNotification received, status=\(viewModel.status), time=\(viewModel.time.current)")
             }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
-                print("[ScreensaverDebug][PlayerView] willEnterForegroundNotification received, status=\(viewModel.status), time=\(viewModel.time.current)")
+                screensaverDebugLog("[ScreensaverDebug][PlayerView] willEnterForegroundNotification received, status=\(viewModel.status), time=\(viewModel.time.current)")
             }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
-                print("[ScreensaverDebug][PlayerView] didBecomeActiveNotification received, status=\(viewModel.status), time=\(viewModel.time.current), setting lastBecameActiveAt")
+                screensaverDebugLog("[ScreensaverDebug][PlayerView] didBecomeActiveNotification received, status=\(viewModel.status), time=\(viewModel.time.current), setting lastBecameActiveAt")
                 lastBecameActiveAt = Date()
             }
     }

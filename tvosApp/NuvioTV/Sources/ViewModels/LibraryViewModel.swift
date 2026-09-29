@@ -156,7 +156,9 @@ public class LibraryViewModel: ObservableObject {
         displayedSource = .local
         mdbListLists = []
         selectedMdbListListID = nil
-        items = LibraryStore.items().map(\.stremioMeta)
+        let storeItems = LibraryStore.items()
+        storeItems.forEach { CinemetaCatalogRepository.cacheCatalogMetadata($0.meta) }
+        items = storeItems.map(\.stremioMeta)
         validateFilters()
     }
 
@@ -186,6 +188,7 @@ public class LibraryViewModel: ObservableObject {
 
         let source = TraktSettingsStore.librarySourceMode
         displayedSource = source
+        remoteItems.forEach { CinemetaCatalogRepository.cacheCatalogMetadata($0.meta) }
         items = remoteItems.map(\.stremioMeta)
         if source == .mdblist {
             let lists = await MdbListListService.fetchUserLists()

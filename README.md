@@ -48,23 +48,24 @@ Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/
 ## Latest tvOS Beta
 
 <!-- BEGIN LATEST_BETA -->
-**Beta 3.3.8** is the latest tvOS release.
+**Beta 3.3.9** is the latest tvOS release.
 
-[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3.8/NuvioTV-3.3.8-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.3.8) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3.9/NuvioTV-3.3.9-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.3.9) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 <!-- END LATEST_BETA -->
 
 > 🎉 **Thank you for 200+ GitHub Stars!** A huge thank you to everyone in the community for supporting NuvioTVOS and helping us reach 200+ stars!
 
 The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
 
-### New in Beta 3.3.8
+### New in Beta 3.3.9
 
-- **Native ASS/SSA Typeset Subtitles:** Integrated `SwiftAssRenderer` with frame-synchronized rendering of complex stylized typography, karaoke, dialogue styling, and custom font positioning directly over video in AetherEngine.
-- **Dynamic Stream Caching & MPV Bridge:** Forward-lead prefetching with intelligent buffer ceilings and an MPV protocol bridge for unified caching across both playback engines.
-- **Structured Playback Diagnostics & Error Insights:** Clear classification and user-friendly diagnostics on stream failures, plus real-time framerate and buffer telemetry in the debug HUD.
-- **Intelligent Backend Routing & Anime Detection:** Automatic anime categorization and metadata heuristics to route playback seamlessly to optimal rendering pipelines.
-- **Complete App Localization (4,000+ New Strings):** Full translations covering all UI components, settings sections, player controls, dialogs, and error messages.
-- **Details Screen & Navigation Polish:** Asynchronous metadata loading, refined season/episode transitions, fluid 60fps catalog browsing, and instant settings synchronization.
+- **Apple TV-Style Scene Insights (CoreML AI):** Integrated on-device CoreML facial recognition neural networks (**YuNet** + **SFace**) to scan live scenes and match appearing actors to TMDB profiles in real time.
+- **Anime & Animated Voice Cast Fallback:** Automatically identifies anime and animated media, bypassing face scanning to instantly display full episode voice casts and character roles.
+- **Real-Time Music & Subtitle Cue Recognition:** Identifies background songs and soundtrack cues via audio recognition and subtitle parsing, complete with Apple Music and Shazam album art.
+- **Seamless Background Trailers in Details Screen:** Background trailers are now enabled by default; preview trailers inside poster cards and seamlessly resume directly into Details or expand full-screen without rebuffering.
+- **Production Browse & Catalog Rails:** Dedicated production company browse views with live collection item counts.
+- **Simkl & Trakt Synchronization:** Hardened scrobbling, episode matching, and instant settings synchronization.
+- **Release Diagnostics & Watchdog Hardening:** Main thread stall watchdog disabled by default for fluid 60fps UI performance while retaining 30s load failover and AetherEngine recovery.
 
 ### Built-in Player
 

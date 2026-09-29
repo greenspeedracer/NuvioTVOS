@@ -67,6 +67,29 @@ struct PlaybackErrorDiagnostic: Equatable {
             )
         }
 
+        // 1b. Hostname Resolution / DNS Failure (-1003, EAI_NONAME / CannotFindHost)
+        if lower.contains("hostname could not be found")
+            || lower.contains("error code: -1003")
+            || lower.contains("code=-1003")
+            || lower.contains("cannot find host")
+            || lower.contains("nodename nor servname provided")
+            || lower.contains("eai_noname") {
+            let hostLabel = host.map { " (\($0))" } ?? ""
+            return PlaybackErrorDiagnostic(
+                origin: .network,
+                badgeText: "DNS / HOST UNRESOLVED",
+                badgeIconName: "antenna.radiowaves.left.and.right.slash",
+                title: L10n.string("error_host_unresolved_title", fallback: "Cannot Resolve Stream Host"),
+                message: L10n.string(
+                    "error_host_unresolved_msg",
+                    fallback: "Your Apple TV could not find the stream server\(hostLabel). Check your DNS settings, VPN/ad-blocker, or choose another stream."
+                ),
+                suggestedAction: L10n.string("error_host_unresolved_action", fallback: "Verify DNS configuration or try selecting another stream source."),
+                technicalDetails: formatTechnicalLine(host: host, code: "-1003 (Cannot Find Host)", raw: rawError),
+                host: host
+            )
+        }
+
         // 2. Remote Host Connection Refused / Server Unreachable (-1004, ECONNREFUSED 61)
         if lower.contains("could not connect to the server")
             || lower.contains("error code: -1004")

@@ -769,7 +769,7 @@ actor PlaybackStreamCacheServer {
                 if didDispatch {
                     try? await Task.sleep(nanoseconds: 50_000_000)
                 } else {
-                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    try? await Task.sleep(nanoseconds: 100_000_000)
                 }
             }
         }

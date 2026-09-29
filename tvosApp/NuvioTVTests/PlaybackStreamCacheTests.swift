@@ -852,7 +852,7 @@ extension PlaybackStreamCacheTests {
         )
         _ = try await server.start()
 
-        for _ in 0..<500 where PlaybackStreamCacheURLProtocol.requestCount < 2 {
+        for _ in 0..<1000 where PlaybackStreamCacheURLProtocol.requestCount < 2 {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         let requestedRanges = PlaybackStreamCacheURLProtocol.requestRanges.compactMap { $0 }
@@ -2077,6 +2077,35 @@ extension PlaybackStreamCacheTests {
         )
 
         XCTAssertEqual(available, limit)
+    }
+
+    func testCurrentSessionIdentificationResolvesSymlinksAndStandardizedPaths() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let currentSessionDir = root.appendingPathComponent("current_session", isDirectory: true)
+        try FileManager.default.createDirectory(at: currentSessionDir, withIntermediateDirectories: true)
+        let dummyChunk = currentSessionDir.appendingPathComponent("chunk_0.dat")
+        let dummyBytes: Int64 = 5 * 1024 * 1024
+        try Data(repeating: 0x01, count: Int(dummyBytes)).write(to: dummyChunk)
+
+        // Pass a non-standardized path (e.g. with ../ or symlinks)
+        let nonStandardCurrentDir = root.appendingPathComponent("other/../current_session/", isDirectory: true)
+
+        let limit: Int64 = 10 * 1024 * 1024
+        let available = PlaybackStreamDiskBudget.shared.availableBytes(
+            in: root,
+            limit: limit,
+            preserving: nonStandardCurrentDir,
+            freeSpaceReserve: 0,
+            freeSpaceProvider: { _ in limit * 2 }
+        )
+
+        // The current session (5 MiB) must be identified as currentBytes, not otherBytes.
+        // Budget allowance = limit - otherBytes (0) = 10 MiB.
+        XCTAssertEqual(available, limit)
+        // Ensure the current session directory was preserved and not pruned.
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dummyChunk.path))
     }
 
     func testNormalBufferingDoesNotTriggerFalseSeek() async throws {

@@ -122,5 +122,190 @@ final class SceneMusicTests: XCTestCase {
             .unavailable(reason: "ShazamKit requires App Service enabled in Apple Developer Portal")
         )
     }
+    
+    func testMusicRecognitionBareCode202ReportsUnavailable() async {
+        let expectation = expectation(description: "Status changed to unavailable for bare code 202")
+        var observedStatus: SceneMusicStatus?
+        let service = MusicRecognitionService { status in
+            observedStatus = status
+            if case .unavailable = status {
+                expectation.fulfill()
+            }
+        }
+        
+        let dummyStream = AsyncStream<AudioTapBuffer> { continuation in
+            continuation.finish()
+        }
+        await service.startListening(stream: dummyStream, isPlaying: true, currentSourceTime: 0)
+        
+        // Bare code 202 error with empty userInfo (as produced on Simulator / unsigned app)
+        let bareCode202Error = NSError(domain: "com.apple.ShazamKit", code: 202, userInfo: [:])
+        await service.handleNoMatch(error: bareCode202Error)
+        
+        await fulfillment(of: [expectation], timeout: 1.0)
+        XCTAssertEqual(
+            observedStatus,
+            .unavailable(reason: "ShazamKit requires App Service enabled in Apple Developer Portal")
+        )
+    }
+    
+    func testSceneSongIntervalActiveState() {
+        let song = SceneRecognizedSong(
+            id: "s1",
+            title: "God Save the Queen",
+            artist: "Sex Pistols",
+            observedSourceTime: 0.0,
+            startTime: 0.0,
+            endTime: 85.0,
+            sceneDescription: "Opening scene"
+        )
+        
+        // Inside interval -> Active (Appears)
+        XCTAssertTrue(song.isActive(at: 0.0))
+        XCTAssertTrue(song.isActive(at: 45.0))
+        XCTAssertTrue(song.isActive(at: 85.0))
+        
+        // Outside interval -> Inactive (Disappears)
+        XCTAssertFalse(song.isActive(at: 86.0))
+        XCTAssertFalse(song.isActive(at: 120.0))
+        XCTAssertFalse(song.isActive(at: -1.0))
+    }
+    
+    func testSceneSubtitleMusicRecognizerParsesCues() {
+        let cue1 = "♪ \"God Save the Queen\" by Sex Pistols ♪"
+        let song1 = SceneSubtitleMusicRecognizer.detectSong(
+            in: cue1,
+            startTime: 0.0,
+            endTime: 85.0,
+            canonicalId: "ted-lasso-s1e1"
+        )
+        XCTAssertNotNil(song1)
+        XCTAssertEqual(song1?.title, "God Save the Queen")
+        XCTAssertEqual(song1?.artist, "Sex Pistols")
+        XCTAssertEqual(song1?.startTime, 0.0)
+        XCTAssertEqual(song1?.endTime, 85.0)
+        
+        let cue2 = "[Playing \"Simplify\" by Los Coast]"
+        let song2 = SceneSubtitleMusicRecognizer.detectSong(
+            in: cue2,
+            startTime: 860.0,
+            endTime: 900.0,
+            canonicalId: "ted-lasso-s1e1"
+        )
+        XCTAssertNotNil(song2)
+        XCTAssertEqual(song2?.title, "Simplify")
+        XCTAssertEqual(song2?.artist, "Los Coast")
+        
+        let cue3 = "♪ Sex Pistols - God Save the Queen ♪"
+        let song3 = SceneSubtitleMusicRecognizer.detectSong(
+            in: cue3,
+            startTime: 10.0,
+            endTime: 40.0,
+            canonicalId: "ted-lasso-s1e1"
+        )
+        XCTAssertNotNil(song3)
+        XCTAssertEqual(song3?.title, "God Save the Queen")
+        XCTAssertEqual(song3?.artist, "Sex Pistols")
+        
+        // Non-music cue should return nil
+        let nonMusic = "Ted: How you doing Coach?"
+        let nonSong = SceneSubtitleMusicRecognizer.detectSong(
+            in: nonMusic,
+            startTime: 20.0,
+            endTime: 25.0,
+            canonicalId: "ted-lasso-s1e1"
+        )
+        XCTAssertNil(nonSong)
+    }
+    
+    func testSceneResultCacheStoresAndRetrievesSongIntervals() async {
+        let cache = SceneResultCache()
+        let context = SceneContext(canonicalId: "test-movie", mediaType: "movie", title: "Test Movie")
+        
+        let song = SceneRecognizedSong(
+            id: "s1",
+            title: "God Save the Queen",
+            artist: "Sex Pistols",
+            observedSourceTime: 10.0,
+            startTime: 10.0,
+            endTime: 60.0,
+            sceneDescription: "Locker room dance"
+        )
+        
+        let interval = SceneTimelineInterval(
+            canonicalId: "test-movie",
+            startTime: 10.0,
+            endTime: 60.0,
+            actors: [],
+            song: song,
+            sceneDescription: "Locker room dance"
+        )
+        
+        await cache.storeTimelineInterval(interval)
+        
+        // At 25.0s (within range) -> Song found!
+        let activeSong = await cache.findTimelineSong(for: context, sourceTime: 25.0)
+        XCTAssertNotNil(activeSong)
+        XCTAssertEqual(activeSong?.title, "God Save the Queen")
+        
+        // At 75.0s (outside range) -> Song is nil! (Finished)
+        let inactiveSong = await cache.findTimelineSong(for: context, sourceTime: 75.0)
+        XCTAssertNil(inactiveSong)
+    }
+    
+    func testCuratedSoundtrackCatalogFetchesTedLassoOpeningTrack() async {
+        let provider = CommunitySceneSoundtrackProvider()
+        let context = SceneContext(
+            canonicalId: "tt10986410",
+            mediaType: "series",
+            title: "Ted Lasso",
+            season: 1,
+            episode: 1,
+            imdbId: "tt10986410"
+        )
+        
+        let intervals = try! await provider.fetchSoundtrack(context: context)
+        XCTAssertFalse(intervals.isEmpty)
+        
+        // At timestamp 28.0s (opening practice / sprints), God Save the Queen must be active!
+        let openingInterval = intervals.first(where: { $0.contains(timestamp: 28.0) })
+        XCTAssertNotNil(openingInterval)
+        XCTAssertEqual(openingInterval?.song?.title, "God Save the Queen")
+        XCTAssertEqual(openingInterval?.song?.artist, "Sex Pistols")
+        XCTAssertNotNil(openingInterval?.song?.artworkURL)
+        
+        // At timestamp 85.0s, Ted Lasso Theme must be active!
+        let themeInterval = intervals.first(where: { $0.contains(timestamp: 85.0) })
+        XCTAssertNotNil(themeInterval)
+        XCTAssertEqual(themeInterval?.song?.title, "Ted Lasso Theme")
+    }
+    
+    func testSceneSubtitleMusicRecognizerParsesUppercaseSDHCues() {
+        let uppercaseCue = "(GOD SAVE THE QUEEN BY SEX PISTOLS PLAYING)"
+        let song = SceneSubtitleMusicRecognizer.detectSong(
+            in: uppercaseCue,
+            startTime: 0.0,
+            endTime: 75.0,
+            canonicalId: "tt10986410"
+        )
+        XCTAssertNotNil(song)
+        XCTAssertEqual(song?.title, "God Save The Queen")
+        XCTAssertEqual(song?.artist, "Sex Pistols")
+    }
+    
+    func testSceneSongMetadataEnricherResolvesAlbumArtwork() async {
+        let enricher = SceneSongMetadataEnricher.shared
+        let rawSong = SceneRecognizedSong(
+            id: "test-simplify",
+            title: "Simplify",
+            artist: "Los Coast",
+            observedSourceTime: 860.0
+        )
+        
+        let enriched = await enricher.enrich(song: rawSong)
+        XCTAssertNotNil(enriched.artworkURL)
+        XCTAssertTrue(enriched.artworkURL?.absoluteString.contains("mzstatic.com") == true)
+        XCTAssertNotNil(enriched.appleMusicURL)
+    }
 }
 

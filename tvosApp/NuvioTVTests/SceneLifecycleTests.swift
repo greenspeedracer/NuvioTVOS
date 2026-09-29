@@ -330,7 +330,7 @@ final class SceneLifecycleTests: XCTestCase {
     }
     
     func testDynamicPlayerSceneFrameProviderMPVFallback() {
-        var currentBackend: PlayerBackendKind = .mpv
+        let currentBackend: PlayerBackendKind = .mpv
         let dynamicProvider = DynamicPlayerSceneFrameProvider(
             activeEngineKindProvider: { currentBackend },
             aetherControllerProvider: { nil }
@@ -397,6 +397,60 @@ final class SceneLifecycleTests: XCTestCase {
         XCTAssertTrue(coordinator.isPanelOpen)
         XCTAssertEqual(castProvider.fetchCount, 1, "Opening panel should not re-fetch already pre-warmed cast")
         XCTAssertGreaterThanOrEqual(captureCount, 1, "Opening panel should initiate frame capture")
+    }
+    
+    func testAnimeContextPopulatesEpisodeCastAndBypassesFrameCapture() async throws {
+        let animeCandidates = [
+            SceneCastCandidate(id: "1", name: "Yuki Kaji", character: "Eren Yeager (voice)", tmdbId: 101),
+            SceneCastCandidate(id: "2", name: "Yui Ishikawa", character: "Mikasa Ackerman (voice)", tmdbId: 102),
+            SceneCastCandidate(id: "3", name: "Marina Inoue", character: "Armin Arlert (voice)", tmdbId: 103)
+        ]
+        let castProvider = StubSceneCastProvider(candidates: animeCandidates)
+        let frameProvider = CountingSceneFrameProvider()
+        var captureCount = 0
+        frameProvider.onCapture = {
+            captureCount += 1
+        }
+        
+        let coordinator = SceneCoordinator(
+            frameProvider: frameProvider,
+            castProvider: castProvider
+        )
+        
+        let animeContext = SceneContext(
+            canonicalId: "kitsu:1234:1",
+            mediaType: "series",
+            title: "Attack on Titan",
+            season: 1,
+            episode: 1,
+            isAnime: true
+        )
+        
+        coordinator.updateContext(animeContext)
+        XCTAssertTrue(coordinator.isAnime)
+        
+        coordinator.openPanel()
+        XCTAssertTrue(coordinator.isPanelOpen)
+        
+        // Allow async cast fetch task to finish
+        for _ in 0..<20 {
+            if !coordinator.currentSnapshot.actors.isEmpty { break }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        
+        // Assert: all anime episode voice actors are immediately populated and recognized!
+        XCTAssertEqual(coordinator.currentSnapshot.actors.count, 3)
+        XCTAssertEqual(coordinator.currentSnapshot.actors.map(\.name), ["Yuki Kaji", "Yui Ishikawa", "Marina Inoue"])
+        XCTAssertEqual(coordinator.currentSnapshot.actors.first?.character, "Eren Yeager (voice)")
+        XCTAssertEqual(coordinator.currentSnapshot.actorStatus, .recognized(coordinator.currentSnapshot.actors))
+        
+        // Frame capture for facial recognition must be bypassed for anime
+        XCTAssertEqual(captureCount, 0, "Anime media must bypass visual face capture and directly show full episode cast")
+        
+        // Seeking in anime preserves the full episode cast
+        coordinator.handleSeek()
+        XCTAssertEqual(coordinator.currentSnapshot.actors.count, 3)
+        XCTAssertEqual(coordinator.currentSnapshot.actors.map(\.name), ["Yuki Kaji", "Yui Ishikawa", "Marina Inoue"])
     }
 }
 

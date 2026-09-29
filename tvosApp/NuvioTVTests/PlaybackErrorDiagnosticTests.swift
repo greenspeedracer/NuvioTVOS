@@ -140,4 +140,24 @@ final class PlaybackErrorDiagnosticTests: XCTestCase {
         XCTAssertEqual(diag.badgeText, "PLAYER ENGINE")
         XCTAssertEqual(diag.title, "Player Engine Unavailable")
     }
+
+    func testCannotFindHostCode1003() {
+        let rawError = "Error Domain=NSURLErrorDomain Code=-1003 \"A server with the specified hostname could not be found.\""
+        let streamURL = URL(string: "https://unknown.download.real-debrid.com/d/123/movie.mp4")!
+
+        let diag = PlaybackErrorDiagnostic.analyze(
+            errorMessage: rawError,
+            streamURL: streamURL
+        )
+
+        XCTAssertEqual(diag.origin, .network)
+        XCTAssertTrue(diag.isNetworkIssue)
+        XCTAssertFalse(diag.isHostingIssue)
+        XCTAssertEqual(diag.badgeText, "DNS / HOST UNRESOLVED")
+        XCTAssertEqual(diag.title, "Cannot Resolve Stream Host")
+        XCTAssertEqual(diag.host, "unknown.download.real-debrid.com")
+        XCTAssertTrue(diag.message.contains("unknown.download.real-debrid.com"))
+        XCTAssertTrue(diag.suggestedAction.contains("DNS"))
+    }
 }
+

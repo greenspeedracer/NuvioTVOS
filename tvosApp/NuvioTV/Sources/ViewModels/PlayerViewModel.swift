@@ -2542,7 +2542,7 @@ class PlayerViewModel: ObservableObject {
     // MARK: - Transport
 
     func play() {
-        print("[ScreensaverDebug][PlayerVM] play() called: currentStatus=\(status), time=\(time.current)/\(time.duration)")
+        screensaverDebugLog("[ScreensaverDebug][PlayerVM] play() called: currentStatus=\(status), time=\(time.current)/\(time.duration)")
         if status == .ended { seek(to: 0) }
         engine.playPlayback()
         status = .playing
@@ -2572,7 +2572,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     func pause(forBackground: Bool = false) {
-        print("[ScreensaverDebug][PlayerVM] pause(forBackground=\(forBackground)) called: currentStatus=\(status), time=\(time.current)/\(time.duration)")
+        screensaverDebugLog("[ScreensaverDebug][PlayerVM] pause(forBackground=\(forBackground)) called: currentStatus=\(status), time=\(time.current)/\(time.duration)")
         cancelControlsHideTimer()
         engine.pausePlayback()
         status = .paused
@@ -2604,7 +2604,7 @@ class PlayerViewModel: ObservableObject {
                   self.sidePanel == nil,
                   self.subtitle != PlaybackMarkers.trailerSubtitle
             else { return }
-            print("[ScreensaverDebug][PlayerVM] schedulePauseOverlay fired: showing pause overlay")
+            screensaverDebugLog("[ScreensaverDebug][PlayerVM] schedulePauseOverlay fired: showing pause overlay")
             self.showControls = false
             self.showPauseOverlay = true
             self.updateSkipIntervalState()
@@ -2703,7 +2703,7 @@ class PlayerViewModel: ObservableObject {
             return
         }
         let dir = PlaybackToggleDirection(isTransportPlaying: engine.isTransportPlaying)
-        print("[ScreensaverDebug][PlayerVM] togglePlayPause() called: isTransportPlaying=\(engine.isTransportPlaying), direction=\(dir), status=\(status), time=\(time.current)")
+        screensaverDebugLog("[ScreensaverDebug][PlayerVM] togglePlayPause() called: isTransportPlaying=\(engine.isTransportPlaying), direction=\(dir), status=\(status), time=\(time.current)")
         switch dir {
         case .pause: pause()
         case .play: play()
@@ -2716,7 +2716,7 @@ class PlayerViewModel: ObservableObject {
         let target = duration > 0
             ? min(max(seconds, 0), max(duration - 0.25, 0))
             : max(seconds, 0)
-        print("[ScreensaverDebug][PlayerVM] seek(to: \(seconds)) called: target=\(target), prevCurrent=\(time.current), duration=\(duration)")
+        screensaverDebugLog("[ScreensaverDebug][PlayerVM] seek(to: \(seconds)) called: target=\(target), prevCurrent=\(time.current), duration=\(duration)")
         engine.seekToMs(Int64(target * 1000))
         if let source = activeStreamURL.flatMap(URL.init(string:)) {
             let generation = sessionCoordinator.loadGeneration
@@ -2751,18 +2751,18 @@ class PlayerViewModel: ObservableObject {
         guard !isLiveStream else { return }
         let sourcePositionMs = positionMs
         let sourceDurationMs = durationMs
-        print("[ScreensaverDebug][PlayerVM] playbackDidSuspend(pos=\(positionMs)ms, dur=\(durationMs)ms): currentTime=\(time.current), lastStable=\(lastStablePlaybackTime?.current ?? -1), clock=\(clock.position)")
+        screensaverDebugLog("[ScreensaverDebug][PlayerVM] playbackDidSuspend(pos=\(positionMs)ms, dur=\(durationMs)ms): currentTime=\(time.current), lastStable=\(lastStablePlaybackTime?.current ?? -1), clock=\(clock.position)")
         guard !didShutdown,
               sourceDurationMs > 0,
               sourcePositionMs >= 0,
               sourcePositionMs < sourceDurationMs else {
-            print("[ScreensaverDebug][PlayerVM] playbackDidSuspend dropped: shutdown=\(didShutdown), dur=\(sourceDurationMs), pos=\(sourcePositionMs)")
+            screensaverDebugLog("[ScreensaverDebug][PlayerVM] playbackDidSuspend dropped: shutdown=\(didShutdown), dur=\(sourceDurationMs), pos=\(sourcePositionMs)")
             return
         }
         let existingPositionSeconds = lastStablePlaybackTime?.current ?? time.current
         let targetPositionSeconds: Double
         if sourcePositionMs == 0 && existingPositionSeconds > 5.0 {
-            print("[ScreensaverDebug][PlayerVM] playbackDidSuspend preserving existing position \(existingPositionSeconds)s against zero-clock sample")
+            screensaverDebugLog("[ScreensaverDebug][PlayerVM] playbackDidSuspend preserving existing position \(existingPositionSeconds)s against zero-clock sample")
             targetPositionSeconds = existingPositionSeconds
         } else {
             targetPositionSeconds = Double(sourcePositionMs) / 1000.0
@@ -4513,6 +4513,14 @@ class PlayerViewModel: ObservableObject {
         let resolvedImdb = contentImdbId?.split(separator: ":").first.map(String.init)
         let resolvedTitle = targetMeta?.name ?? title
 
+        let isAnime = (targetMeta?.isAnime == true)
+            || (targetMeta?.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "anime")
+            || NuvioMeta.isAnimeStream(
+                filename: activeFilename ?? activeStreamURL,
+                streamName: activeProviderName,
+                streamDescription: activeBingeGroup
+            )
+
         return SceneContext(
             canonicalId: targetMeta?.id ?? targetEpisode?.id ?? resolvedTitle,
             mediaType: targetMeta?.type ?? "movie",
@@ -4524,7 +4532,8 @@ class PlayerViewModel: ObservableObject {
             streamURL: activeStreamURL.flatMap(URL.init(string:)),
             sessionID: sessionID ?? sceneSessionID,
             timelineGeneration: sessionCoordinator.loadGeneration,
-            backend: activeEngineKind
+            backend: activeEngineKind,
+            isAnime: isAnime
         )
     }
 

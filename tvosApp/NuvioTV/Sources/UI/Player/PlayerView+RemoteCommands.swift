@@ -5,9 +5,9 @@ extension PlayerView {
         layersObservingFocus
             .onPlayPauseCommand {
                 let elapsedWake = Date().timeIntervalSince(lastBecameActiveAt)
-                print("[ScreensaverDebug][Input] onPlayPauseCommand: isWakingFromBg=\(isWakingFromBackground) (elapsedWake=\(String(format: "%.3f", elapsedWake))s), status=\(viewModel.status), pos=\(viewModel.time.current)")
+                screensaverDebugLog("[ScreensaverDebug][Input] onPlayPauseCommand: isWakingFromBg=\(isWakingFromBackground) (elapsedWake=\(String(format: "%.3f", elapsedWake))s), status=\(viewModel.status), pos=\(viewModel.time.current)")
                 guard !isWakingFromBackground else {
-                    print("[ScreensaverDebug][Input] onPlayPauseCommand suppressed by isWakingFromBackground")
+                    screensaverDebugLog("[ScreensaverDebug][Input] onPlayPauseCommand suppressed by isWakingFromBackground")
                     return
                 }
                 guard viewModel.currentErrorDiagnostic == nil else { return }
@@ -15,7 +15,9 @@ extension PlayerView {
             }
             .onExitCommand {
                 if viewModel.isSceneDetailVisible {
-                    viewModel.closeSceneDetail()
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        viewModel.closeSceneDetail()
+                    }
                     return
                 }
                 if viewModel.showScenePanel {

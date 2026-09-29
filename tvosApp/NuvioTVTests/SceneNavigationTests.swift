@@ -37,7 +37,7 @@ final class SceneNavigationTests: XCTestCase {
         
         // Opening detail sheet
         let actor = SceneRecognizedActor(id: "1", name: "Keanu Reeves", character: "Neo")
-        sceneVM.openDetail(.actor(actor, biography: "Action star", knownFor: ["The Matrix"]))
+        sceneVM.openDetail(.actor(actor, detail: ScenePersonDetail(id: 1, name: "Keanu Reeves", biography: "Action star")))
         XCTAssertTrue(sceneVM.isDetailVisible)
         
         // Back/Menu closes detail first

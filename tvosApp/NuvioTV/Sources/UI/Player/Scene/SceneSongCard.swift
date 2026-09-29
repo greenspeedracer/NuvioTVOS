@@ -66,7 +66,12 @@ struct SceneSongCard: View {
                         .foregroundColor(.white.opacity(0.75))
                         .lineLimit(1)
                     
-                    if let genre = song.genres.first, !genre.isEmpty {
+                    if let desc = song.sceneDescription, !desc.isEmpty {
+                        Text(desc)
+                            .font(.system(size: 13, weight: .regular))
+                            .foregroundColor(.white.opacity(0.65))
+                            .lineLimit(1)
+                    } else if let genre = song.genres.first, !genre.isEmpty {
                         Text(genre)
                             .font(.system(size: 14, weight: .medium))
                             .foregroundColor(.white.opacity(0.5))

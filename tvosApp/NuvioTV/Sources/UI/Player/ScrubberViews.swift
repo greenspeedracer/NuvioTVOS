@@ -78,7 +78,7 @@ struct PlayerProgressTrack: View {
         .onAppear {
             animatedBuffered = buffered
         }
-        .onChange(of: buffered) { newBuffered in
+        .onChange(of: buffered) { _, newBuffered in
             updateAnimatedBuffered(to: newBuffered)
         }
     }

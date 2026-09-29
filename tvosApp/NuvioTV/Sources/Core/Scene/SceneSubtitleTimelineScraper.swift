@@ -22,7 +22,7 @@ actor SceneSubtitleTimelineScraper {
         context: SceneContext,
         resultCache: SceneResultCache
     ) async {
-        guard !subtitles.isEmpty, !candidates.isEmpty else { return }
+        guard !subtitles.isEmpty else { return }
         guard !isScraping, scrapedCanonicalId != context.canonicalId else { return }
         
         isScraping = true
@@ -31,8 +31,12 @@ actor SceneSubtitleTimelineScraper {
         let prioritized = prioritizeSubtitles(subtitles)
         print("[SceneScraper] Prioritized \(prioritized.count) subtitle candidate(s) to inspect for \"\(context.title)\"")
         
-        // Inspect up to 4 candidate subtitle tracks
-        let inspectionLimit = min(prioritized.count, 4)
+        var combinedIntervals: [SceneTimelineInterval] = []
+        var foundMusicCues = false
+        var foundSpeakerCues = false
+        
+        // Inspect up to 6 candidate subtitle tracks to get a rich combined timeline
+        let inspectionLimit = min(prioritized.count, 6)
         for i in 0..<inspectionLimit {
             let sub = prioritized[i]
             guard let url = URL(string: sub.url) else { continue }
@@ -51,16 +55,31 @@ actor SceneSubtitleTimelineScraper {
                     context: context
                 )
                 
-                // If at least 2 distinct speaker intervals were identified, this is a valid named track!
-                if intervals.count >= 2 {
-                    print("[SceneScraper] Successfully extracted \(intervals.count) named speaker intervals from \"\(sub.label ?? sub.language)\"")
-                    await resultCache.storeTimelineIntervals(intervals)
-                    scrapedCanonicalId = context.canonicalId
-                    return
+                if !intervals.isEmpty {
+                    for interval in intervals {
+                        if interval.song != nil {
+                            foundMusicCues = true
+                            combinedIntervals.append(interval)
+                        } else if !interval.actors.isEmpty {
+                            foundSpeakerCues = true
+                            combinedIntervals.append(interval)
+                        }
+                    }
+                }
+                
+                // If we found both speaker cues and music cues, we have a complete timeline
+                if foundSpeakerCues && foundMusicCues {
+                    break
                 }
             } catch {
                 print("[SceneScraper] Subtitle fetch failed for \(sub.url): \(error.localizedDescription)")
             }
+        }
+        
+        if !combinedIntervals.isEmpty {
+            print("[SceneScraper] Successfully extracted \(combinedIntervals.count) timeline intervals (music: \(foundMusicCues), speakers: \(foundSpeakerCues)) for \"\(context.title)\"")
+            await resultCache.storeTimelineIntervals(combinedIntervals)
+            scrapedCanonicalId = context.canonicalId
         }
     }
     
@@ -108,7 +127,13 @@ actor SceneSubtitleTimelineScraper {
                 in: cue.text,
                 candidates: candidates
             )
-            guard !speakers.isEmpty else { continue }
+            let song = SceneSubtitleMusicRecognizer.detectSong(
+                in: cue.text,
+                startTime: cue.start,
+                endTime: cue.end,
+                canonicalId: context.canonicalId
+            )
+            guard !speakers.isEmpty || song != nil else { continue }
             
             let actors = speakers.map { candidate in
                 SceneRecognizedActor(
@@ -128,7 +153,9 @@ actor SceneSubtitleTimelineScraper {
                 episode: context.episode,
                 startTime: cue.start,
                 endTime: cue.end,
-                actors: actors
+                actors: actors,
+                song: song,
+                sceneDescription: song?.sceneDescription
             )
             intervals.append(interval)
         }

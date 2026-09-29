@@ -3032,13 +3032,13 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
 
     @objc private func appWillResignActive() {
-        print("[ScreensaverDebug][AetherController] appWillResignActive: state=\(engine.state), isPlayerPlaying=\(isPlayerPlaying), lastKnownPos=\(lastKnownPositionMs)ms, clock=\(engine.clock.currentTime)")
+        screensaverDebugLog("[ScreensaverDebug][AetherController] appWillResignActive: state=\(engine.state), isPlayerPlaying=\(isPlayerPlaying), lastKnownPos=\(lastKnownPositionMs)ms, clock=\(engine.clock.currentTime)")
         if !engine.pictureInPictureActive {
             foregroundReloadTask?.cancel()
             foregroundReloadTask = nil
         }
         playbackWasPlayingBeforeBackground = engine.state == .playing || (isPlayerPlaying && engine.state != .paused)
-        print("[ScreensaverDebug][AetherController] appWillResignActive: computed playbackWasPlayingBeforeBackground=\(playbackWasPlayingBeforeBackground)")
+        screensaverDebugLog("[ScreensaverDebug][AetherController] appWillResignActive: computed playbackWasPlayingBeforeBackground=\(playbackWasPlayingBeforeBackground)")
         #if os(tvOS)
         let pos = lastKnownPositionMs
         let dur = lastKnownDurationMs
@@ -3046,22 +3046,22 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         #endif
 
         let shouldReload = AetherPlaybackLifecyclePolicy.shouldReloadAfterBackground(state: engine.state)
-        print("[ScreensaverDebug][AetherController] appWillResignActive: shouldReload=\(shouldReload)")
+        screensaverDebugLog("[ScreensaverDebug][AetherController] appWillResignActive: shouldReload=\(shouldReload)")
         guard shouldReload else { return }
 
         lifecycleReloadToken &+= 1
         needsForegroundReload = true
-        print("[ScreensaverDebug][AetherController] appWillResignActive: set needsForegroundReload=true, playbackWasPlayingBeforeBackground=\(playbackWasPlayingBeforeBackground)")
+        screensaverDebugLog("[ScreensaverDebug][AetherController] appWillResignActive: set needsForegroundReload=true, playbackWasPlayingBeforeBackground=\(playbackWasPlayingBeforeBackground)")
     }
 
     @objc private func appDidEnterBackground() {
         let pos = lastKnownPositionMs
         let dur = lastKnownDurationMs
-        print("[ScreensaverDebug][AetherController] appDidEnterBackground: state=\(engine.state), isPlayerPlaying=\(isPlayerPlaying), pos=\(pos)ms, dur=\(dur)ms, clock=\(engine.clock.currentTime)")
+        screensaverDebugLog("[ScreensaverDebug][AetherController] appDidEnterBackground: state=\(engine.state), isPlayerPlaying=\(isPlayerPlaying), pos=\(pos)ms, dur=\(dur)ms, clock=\(engine.clock.currentTime)")
         onPlaybackSuspended?(pos, dur)
 
         let shouldReload = AetherPlaybackLifecyclePolicy.shouldReloadAfterBackground(state: engine.state)
-        print("[ScreensaverDebug][AetherController] appDidEnterBackground: shouldReload=\(shouldReload)")
+        screensaverDebugLog("[ScreensaverDebug][AetherController] appDidEnterBackground: shouldReload=\(shouldReload)")
         guard shouldReload else { return }
 
         lifecycleReloadToken &+= 1
@@ -3071,11 +3071,11 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         if !playbackWasPlayingBeforeBackground {
             playbackWasPlayingBeforeBackground = engine.state == .playing || (isPlayerPlaying && engine.state != .paused)
         }
-        print("[ScreensaverDebug][AetherController] appDidEnterBackground: set needsForegroundReload=true, playbackWasPlayingBeforeBackground=\(playbackWasPlayingBeforeBackground)")
+        screensaverDebugLog("[ScreensaverDebug][AetherController] appDidEnterBackground: set needsForegroundReload=true, playbackWasPlayingBeforeBackground=\(playbackWasPlayingBeforeBackground)")
     }
 
     @objc private func appDidBecomeActive() {
-        print("[ScreensaverDebug][AetherController] appDidBecomeActive: appState=\(UIApplication.shared.applicationState.rawValue), needsReload=\(needsForegroundReload), hasTask=\(foregroundReloadTask != nil), wasPlaying=\(playbackWasPlayingBeforeBackground), pip=\(engine.pictureInPictureActive)")
+        screensaverDebugLog("[ScreensaverDebug][AetherController] appDidBecomeActive: appState=\(UIApplication.shared.applicationState.rawValue), needsReload=\(needsForegroundReload), hasTask=\(foregroundReloadTask != nil), wasPlaying=\(playbackWasPlayingBeforeBackground), pip=\(engine.pictureInPictureActive)")
         guard UIApplication.shared.applicationState == .active else { return }
         guard needsForegroundReload,
               foregroundReloadTask == nil else { return }
@@ -3093,7 +3093,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         let shouldResume = playbackWasPlayingBeforeBackground
         playbackWasPlayingBeforeBackground = false
         let token = lifecycleReloadToken
-        print("[ScreensaverDebug][AetherController] appDidBecomeActive: starting foreground reload task with shouldResume=\(shouldResume), token=\(token)")
+        screensaverDebugLog("[ScreensaverDebug][AetherController] appDidBecomeActive: starting foreground reload task with shouldResume=\(shouldResume), token=\(token)")
         rebindSurface()
         foregroundReloadTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -3103,15 +3103,15 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                 }
             }
             do {
-                print("[ScreensaverDebug][AetherController] calling engine.reloadAtCurrentPosition(shouldResume=\(shouldResume))")
+                screensaverDebugLog("[ScreensaverDebug][AetherController] calling engine.reloadAtCurrentPosition(shouldResume=\(shouldResume))")
                 let outcome = try await self.engine.reloadAtCurrentPosition {
                     $0.autoplay = shouldResume
                 }
-                print("[ScreensaverDebug][AetherController] engine.reloadAtCurrentPosition returned: applied=\(outcome.applied), sessionOwned=\(outcome.sessionOwned), rebuilt=\(outcome.rebuilt)")
+                screensaverDebugLog("[ScreensaverDebug][AetherController] engine.reloadAtCurrentPosition returned: applied=\(outcome.applied), sessionOwned=\(outcome.sessionOwned), rebuilt=\(outcome.rebuilt)")
             } catch {
                 guard self.lifecycleReloadToken == token else { return }
                 let message = error.localizedDescription
-                print("[ScreensaverDebug][AetherController] engine.reloadAtCurrentPosition FAILED: \(message)")
+                screensaverDebugLog("[ScreensaverDebug][AetherController] engine.reloadAtCurrentPosition FAILED: \(message)")
                 self.currentErrorMessage = message
                 self.isPlayerLoading = false
                 if !self.didReportTerminalError {
@@ -3123,12 +3123,12 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
 
             guard self.lifecycleReloadToken == token,
                   !self.engine.pictureInPictureActive else {
-                print("[ScreensaverDebug][AetherController] reload completed but token mismatch or pip active")
+                screensaverDebugLog("[ScreensaverDebug][AetherController] reload completed but token mismatch or pip active")
                 return
             }
             self.rebindSurface()
             let resumeAfterReload = shouldResume || self.playbackWasPlayingBeforeBackground
-            print("[ScreensaverDebug][AetherController] reload completed, asserting post-reload state: resumeAfterReload=\(resumeAfterReload)")
+            screensaverDebugLog("[ScreensaverDebug][AetherController] reload completed, asserting post-reload state: resumeAfterReload=\(resumeAfterReload)")
             if resumeAfterReload {
                 self.engine.play()
             } else {
@@ -3766,19 +3766,19 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
 
     func playPlayback() {
-        print("[ScreensaverDebug][AetherController] playPlayback() called: state=\(engine.state), clock=\(engine.clock.currentTime)")
+        screensaverDebugLog("[ScreensaverDebug][AetherController] playPlayback() called: state=\(engine.state), clock=\(engine.clock.currentTime)")
         if foregroundReloadTask != nil {
             playbackWasPlayingBeforeBackground = true
         }
         engine.play()
     }
     func pausePlayback() {
-        print("[ScreensaverDebug][AetherController] pausePlayback() called: state=\(engine.state), clock=\(engine.clock.currentTime)")
+        screensaverDebugLog("[ScreensaverDebug][AetherController] pausePlayback() called: state=\(engine.state), clock=\(engine.clock.currentTime)")
         engine.pause()
     }
 
     func seekToMs(_ ms: Int64) {
-        print("[ScreensaverDebug][AetherController] seekToMs(\(ms)) called: lastKnownPos=\(lastKnownPositionMs)ms, clock=\(engine.clock.currentTime)")
+        screensaverDebugLog("[ScreensaverDebug][AetherController] seekToMs(\(ms)) called: lastKnownPos=\(lastKnownPositionMs)ms, clock=\(engine.clock.currentTime)")
         lastKnownPositionMs = max(0, ms)
         Task { @MainActor in
             await engine.seek(to: Double(ms) / 1000.0)

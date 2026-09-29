@@ -5,6 +5,13 @@ import AVFoundation
 import Darwin
 import OSLog
 
+@inline(__always)
+func screensaverDebugLog(_ message: @autoclosure () -> String) {
+    #if DEBUG
+    print(message())
+    #endif
+}
+
 struct PlaybackDebugInfo: Equatable {
     // Engine / Backend identification
     var player: String = ""

@@ -6661,6 +6661,7 @@ private struct PlaybackSettingsView: View {
     /// legacy Small/Medium/Large keys still work via PlaybackCacheSettings.
     private let cacheModes = ["Auto", "Conservative", "Medium", "Large", "Max", "Ultra"]
     private let assModes = ["Off", "Strip", "Scale", "Force"]
+    private let diskCacheLimitOptions = ["5 GB", "10 GB", "20 GB", "30 GB", "50 GB"]
     private let streamSortModes = StreamSortOption.allCases.map(\.rawValue)
 
     var body: some View {
@@ -6772,6 +6773,34 @@ private struct PlaybackSettingsView: View {
                     options: cacheModes,
                     accentColor: accentColor
                 )
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_hybrid_disk_cache", fallback: "Hybrid Disk Cache"),
+                    subtitle: L10n.string(
+                        "tvos_settings_hybrid_disk_cache_subtitle",
+                        fallback: "Cache stream segments to disk storage for large forward buffering and instant seeking."
+                    ),
+                    isOn: $hybridDiskCacheEnabled,
+                    accentColor: accentColor
+                )
+
+                if hybridDiskCacheEnabled {
+                    SettingsOptionRow(
+                        title: L10n.string("tvos_settings_disk_cache_limit", fallback: "Disk Cache Limit"),
+                        subtitle: L10n.string(
+                            "tvos_settings_disk_cache_limit_subtitle",
+                            fallback: "Maximum storage allocated for stream disk cache. Older titles are pruned automatically."
+                        ),
+                        selection: Binding(
+                            get: { "\(hybridDiskCacheLimitGB) GB" },
+                            set: { newValue in
+                                hybridDiskCacheLimitGB = Int(newValue.replacingOccurrences(of: " GB", with: "")) ?? 20
+                            }
+                        ),
+                        options: diskCacheLimitOptions,
+                        accentColor: accentColor
+                    )
+                }
             }
 
             SettingsGroup(

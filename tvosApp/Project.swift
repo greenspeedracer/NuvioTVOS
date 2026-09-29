@@ -49,8 +49,8 @@ let signingXCConfig: Path = .relativeToManifest("Configurations/Signing.xcconfig
 // MARK: - Shared values
 
 let bundleID = "com.pyksel.nuviotvos"
-let marketingVersion = "3.3.8"
-let projectVersion = "69"
+let marketingVersion = "3.3.9"
+let projectVersion = "70"
 let tvOSDeployment = "17.5"
 
 // MARK: - Project-level settings

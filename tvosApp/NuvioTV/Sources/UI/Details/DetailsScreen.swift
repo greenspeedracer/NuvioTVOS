@@ -2459,7 +2459,7 @@ struct TvDetailsContent: View {
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
     @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
-    @AppStorage(SettingsKey.backgroundTrailersEnabled) private var backgroundTrailersEnabled = false
+    @AppStorage(SettingsKey.backgroundTrailersEnabled) private var backgroundTrailersEnabled = true
     @AppStorage(SettingsKey.trailerPreviewSound) private var trailerPreviewSound = false
     @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
     @State private var trailerPlayer = AVPlayer()

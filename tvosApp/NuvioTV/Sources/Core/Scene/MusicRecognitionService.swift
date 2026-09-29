@@ -22,6 +22,9 @@ actor MusicRecognitionService: NSObject {
     private let minMatchDuration: Double = 5.0
     private let maxMatchDuration: Double = 12.0
     
+    private var lastMatchAttemptTime: Date = .distantPast
+    private let matchCooldownInterval: TimeInterval = 4.0
+    
     init(onStatusChanged: (@Sendable (SceneMusicStatus) -> Void)? = nil) {
         self.onStatusChanged = onStatusChanged
         super.init()
@@ -68,6 +71,7 @@ actor MusicRecognitionService: NSObject {
         self.signatureGenerator = SHSignatureGenerator()
         self.bufferCounter = 0
         self.isMatching = false
+        self.lastMatchAttemptTime = .distantPast
         updateStatus(.listening)
         
         streamingTask = Task { [weak self, stream] in
@@ -109,6 +113,7 @@ actor MusicRecognitionService: NSObject {
         bufferCounter = 0
         currentSegmentSourceTime = 0
         isMatching = false
+        lastMatchAttemptTime = .distantPast
         if isSessionActive {
             updateStatus(.listening)
         }
@@ -123,6 +128,7 @@ actor MusicRecognitionService: NSObject {
         currentSegmentSourceTime = 0
         isMatching = false
         hasEntitlementError = false
+        lastMatchAttemptTime = .distantPast
         updateStatus(.disabled)
     }
     
@@ -150,6 +156,8 @@ actor MusicRecognitionService: NSObject {
         
         // When enough audio duration is accumulated and no match is currently running
         if duration >= minMatchDuration && !isMatching {
+            guard Date().timeIntervalSince(lastMatchAttemptTime) >= matchCooldownInterval else { return }
+            lastMatchAttemptTime = Date()
             isMatching = true
             let matchSignature = signature
             let time = currentSegmentSourceTime
@@ -198,14 +206,18 @@ actor MusicRecognitionService: NSObject {
             print("[MusicRecognition] ⚠️ Shazam match error: \(error.localizedDescription) (domain: \(nsError.domain), code: \(nsError.code))")
             
             let errorString = "\(nsError) \(nsError.userInfo)"
-            let isEntitlementIssue = (nsError.domain == "com.apple.ShazamKit" || nsError.domain == SHErrorDomain) &&
-                nsError.code == 202 &&
-                (errorString.localizedCaseInsensitiveContains("entitlement") ||
+            let isEntitlementOrDaemonIssue = (nsError.domain == "com.apple.ShazamKit" || nsError.domain == SHErrorDomain) &&
+                (nsError.code == 202 ||
+                 nsError.code == 200 ||
+                 nsError.code == 201 ||
+                 nsError.code == 203 ||
+                 nsError.code == 204 ||
+                 errorString.localizedCaseInsensitiveContains("entitlement") ||
                  errorString.contains("401") ||
                  errorString.localizedCaseInsensitiveContains("unauthorized"))
             
-            if isEntitlementIssue {
-                print("[MusicRecognition] ❌ ShazamKit requires App Service entitlement enabled for this App ID in Apple Developer Portal")
+            if isEntitlementOrDaemonIssue {
+                print("[MusicRecognition] ❌ ShazamKit requires App Service entitlement enabled for this App ID in Apple Developer Portal (or unavailable on simulator)")
                 hasEntitlementError = true
                 streamingTask?.cancel()
                 streamingTask = nil

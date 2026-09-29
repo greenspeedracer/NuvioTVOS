@@ -23,10 +23,10 @@ struct ScenePanelView: View {
             Spacer()
             
             // Bottom third panel
-            VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 14) {
                 // Tab Header Bar
                 tabHeaderBar
-                    .padding(.top, 14)
+                    .padding(.top, 10)
                 
                 // Active Tab Content
                 Group {
@@ -39,8 +39,8 @@ struct ScenePanelView: View {
                         upNextTabContent
                     }
                 }
-                .frame(height: 220)
-                .padding(.bottom, 54)
+                .frame(height: 248)
+                .padding(.bottom, 40)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -109,77 +109,94 @@ struct ScenePanelView: View {
     private var sceneTabContent: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(alignment: .center, spacing: 20) {
-                // Recognized Actors section
-                actorCardsSection
+                let recognizedActors = viewModel.snapshot.actors
+                let playingSong = viewModel.snapshot.song
                 
-                // Recognized Music section
-                songCardSection
+                if recognizedActors.isEmpty, let song = playingSong {
+                    // When music is playing but no cast is detected, music is in first place!
+                    SceneSongCard(song: song) {
+                        viewModel.openDetail(.song(song))
+                    }
+                    .focused($focusedCardID, equals: "song-\(song.id)")
+                    .onMoveCommand { direction in
+                        if direction == .up {
+                            focusedTab = viewModel.selectedTab
+                        }
+                    }
+                } else if !recognizedActors.isEmpty {
+                    // Live detected actors in current scene
+                    ForEach(recognizedActors) { actor in
+                        SceneActorCard(
+                            actor: actor,
+                            isLiveRecognized: true
+                        ) {
+                            viewModel.openDetail(.actor(actor, detail: nil))
+                        }
+                        .focused($focusedCardID, equals: "actor-\(actor.id)")
+                        .onMoveCommand { direction in
+                            if direction == .up {
+                                focusedTab = viewModel.selectedTab
+                            }
+                        }
+                    }
+                    
+                    // Accompanied by playing music if present
+                    if let song = playingSong {
+                        SceneSongCard(song: song) {
+                            viewModel.openDetail(.song(song))
+                        }
+                        .focused($focusedCardID, equals: "song-\(song.id)")
+                        .onMoveCommand { direction in
+                            if direction == .up {
+                                focusedTab = viewModel.selectedTab
+                            }
+                        }
+                    }
+                } else {
+                    // No detected actors and no music: show clean scanning / status card
+                    statusCard
+                }
             }
             .padding(.horizontal, 60)
+            .padding(.vertical, 16)
         }
     }
     
     @ViewBuilder
-    private var actorCardsSection: some View {
-        let recognizedActors = viewModel.snapshot.actors
-        
-        if !recognizedActors.isEmpty {
-            ForEach(recognizedActors) { actor in
-                SceneActorCard(
-                    actor: actor,
-                    isLiveRecognized: true
-                ) {
-                    viewModel.openDetail(.actor(actor, biography: nil, knownFor: []))
-                }
-                .focused($focusedCardID, equals: "actor-\(actor.id)")
-                .onMoveCommand { direction in
-                    if direction == .up {
-                        focusedTab = viewModel.selectedTab
-                    }
-                }
-            }
-        } else {
-            // Status fallback
-            VStack(spacing: 8) {
-                switch viewModel.snapshot.actorStatus {
-                case .analyzing, .preparingReferences:
-                    ProgressView()
-                        .scaleEffect(1.1)
-                        .padding(.bottom, 4)
-                    Text("Scanning scene…")
-                        .font(.system(size: 16, weight: .medium))
-                        .foregroundColor(.white.opacity(0.7))
-                default:
-                    Image(systemName: "person.crop.circle.badge.questionmark")
-                        .font(.system(size: 32))
-                        .foregroundColor(.white.opacity(0.35))
-                        .padding(.bottom, 2)
-                    Text("No actors in this shot")
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundColor(.white.opacity(0.6))
-                        .multilineTextAlignment(.center)
-                }
-            }
-            .padding(.vertical, 14)
-            .padding(.horizontal, 10)
-            .frame(width: 174, height: 188)
-            .modifier(TvCardGlassBackground(isFocused: false, shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
-        }
-    }
-    
-    @ViewBuilder
-    private var songCardSection: some View {
-        if let song = viewModel.snapshot.song {
-            SceneSongCard(song: song) {
-                viewModel.openDetail(.song(song))
-            }
-            .focused($focusedCardID, equals: "song-\(song.id)")
-            .onMoveCommand { direction in
-                if direction == .up {
-                    focusedTab = viewModel.selectedTab
-                }
+    private var statusCard: some View {
+        VStack(spacing: 8) {
+            switch viewModel.snapshot.actorStatus {
+            case .analyzing, .preparingReferences:
+                ProgressView()
+                    .scaleEffect(1.1)
+                    .padding(.bottom, 4)
+                Text(viewModel.isAnime ? "Loading cast…" : "Scanning scene…")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundColor(.white.opacity(0.7))
+            case .unavailable(let reason):
+                Image(systemName: "person.crop.circle.badge.questionmark")
+                    .font(.system(size: 32))
+                    .foregroundColor(.white.opacity(0.35))
+                    .padding(.bottom, 2)
+                Text(reason.isEmpty ? (viewModel.isAnime ? "No cast available" : "No actors in this shot") : reason)
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundColor(.white.opacity(0.6))
+                    .multilineTextAlignment(.center)
+            default:
+                Image(systemName: "person.crop.circle.badge.questionmark")
+                    .font(.system(size: 32))
+                    .foregroundColor(.white.opacity(0.35))
+                    .padding(.bottom, 2)
+                Text(viewModel.isAnime ? "No cast for this episode" : "No actors in this shot")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundColor(.white.opacity(0.6))
+                    .multilineTextAlignment(.center)
             }
         }
+        .padding(.vertical, 14)
+        .padding(.horizontal, 10)
+        .frame(width: 174, height: 188)
+        .modifier(TvCardGlassBackground(isFocused: false, shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
     }
     
     // MARK: - Info Tab Content
@@ -311,7 +328,9 @@ struct ScenePanelView: View {
     private func focusFirstCard() {
         switch viewModel.selectedTab {
         case .scene:
-            if let firstActor = viewModel.snapshot.actors.first {
+            if viewModel.snapshot.actors.isEmpty, let song = viewModel.snapshot.song {
+                focusedCardID = "song-\(song.id)"
+            } else if let firstActor = viewModel.snapshot.actors.first {
                 focusedCardID = "actor-\(firstActor.id)"
             } else if let song = viewModel.snapshot.song {
                 focusedCardID = "song-\(song.id)"

@@ -20,7 +20,7 @@ jobs:
 
             function sectionContent(title) {
               const escaped = title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-              const re = new RegExp(`^##\\s+${escaped}\\s*$`, "m");
+              const re = new RegExp(`^##\\s+${escaped}(?:\\s*\\([^\\r\\n]*\\))?\\s*$`, "m");
               const match = body.match(re);
               if (!match) return null;
               const start = match.index + match[0].length;
@@ -48,7 +48,7 @@ jobs:
             }
 
             function hasIssueReference(content) {
-              return /(^|\s)(#\d+|https:\/\/github\.com\/\S+\/issues\/\d+)/i.test(content || "");
+              return /(?:^|[\s(\[<])(?:#\d+|https?:\/\/github\.com\/[^\s/]+\/[^\s/]+\/(?:issues|pull)\/\d+)/i.test(content || "");
             }
 
             const required = [
@@ -77,10 +77,16 @@ jobs:
 
               const cleaned = cleanedContent(name);
               const normalized = cleaned.toLowerCase();
-              const allowsNone = name === "Breaking changes" || name === "Screenshots / Video";
+              const allowsNone =
+                name === "Breaking changes" ||
+                name === "Screenshots / Video" ||
+                name === "Linked issues";
+              const isAllowedNoneValue =
+                allowsNone &&
+                ["none", "n/a", "na", "no", "not applicable", "not a ui change", "no linked issue", "none."].includes(normalized);
 
               if (
-                cleaned.length < 4 ||
+                (!isAllowedNoneValue && cleaned.length < 4) ||
                 (!allowsNone && ["none", "n/a", "na", "not applicable"].includes(normalized)) ||
                 normalized.includes("what changed in this pr") ||
                 normalized.includes("why this change is needed") ||

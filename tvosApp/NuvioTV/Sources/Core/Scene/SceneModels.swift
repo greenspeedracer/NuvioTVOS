@@ -40,6 +40,7 @@ struct SceneContext: Equatable, Sendable {
     let selectedAudioTrackId: Int?
     let isLiveStream: Bool
     let backend: PlayerBackendKind
+    let isAnime: Bool
 
     init(
         canonicalId: String,
@@ -54,7 +55,8 @@ struct SceneContext: Equatable, Sendable {
         timelineGeneration: UInt64 = 0,
         selectedAudioTrackId: Int? = nil,
         isLiveStream: Bool = false,
-        backend: PlayerBackendKind = .aether
+        backend: PlayerBackendKind = .aether,
+        isAnime: Bool = false
     ) {
         self.canonicalId = canonicalId
         self.mediaType = mediaType
@@ -69,6 +71,7 @@ struct SceneContext: Equatable, Sendable {
         self.selectedAudioTrackId = selectedAudioTrackId
         self.isLiveStream = isLiveStream
         self.backend = backend
+        self.isAnime = isAnime
     }
 }
 
@@ -133,6 +136,9 @@ struct SceneRecognizedSong: Identifiable, Codable, Equatable, Hashable, Sendable
     let shazamURL: URL?
     let genres: [String]
     let observedSourceTime: Double
+    let startTime: Double?
+    let endTime: Double?
+    let sceneDescription: String?
 
     init(
         id: String,
@@ -142,7 +148,10 @@ struct SceneRecognizedSong: Identifiable, Codable, Equatable, Hashable, Sendable
         appleMusicURL: URL? = nil,
         shazamURL: URL? = nil,
         genres: [String] = [],
-        observedSourceTime: Double = 0
+        observedSourceTime: Double = 0,
+        startTime: Double? = nil,
+        endTime: Double? = nil,
+        sceneDescription: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -152,6 +161,20 @@ struct SceneRecognizedSong: Identifiable, Codable, Equatable, Hashable, Sendable
         self.shazamURL = shazamURL
         self.genres = genres
         self.observedSourceTime = observedSourceTime
+        self.startTime = startTime
+        self.endTime = endTime
+        self.sceneDescription = sceneDescription
+    }
+
+    /// Determines if this song should be actively visible at the specified video timestamp.
+    func isActive(at sourceTime: Double) -> Bool {
+        if let startTime, let endTime {
+            return sourceTime >= startTime && sourceTime <= endTime
+        }
+        if let startTime {
+            return sourceTime >= startTime && sourceTime <= (startTime + 45.0)
+        }
+        return abs(sourceTime - observedSourceTime) <= 30.0
     }
 }
 
@@ -261,15 +284,138 @@ struct SceneSnapshot: Equatable, Sendable {
     static let empty = SceneSnapshot()
 }
 
+// MARK: - Person Media Credit & Full Detail
+
+struct ScenePersonMediaCredit: Identifiable, Codable, Equatable, Hashable, Sendable {
+    let id: String
+    let tmdbId: Int
+    let title: String
+    let mediaType: String // "movie" or "tv"
+    let posterURL: URL?
+    let backdropURL: URL?
+    let character: String?
+    let releaseYear: String?
+    let voteAverage: Double?
+
+    init(
+        id: String = UUID().uuidString,
+        tmdbId: Int,
+        title: String,
+        mediaType: String,
+        posterURL: URL? = nil,
+        backdropURL: URL? = nil,
+        character: String? = nil,
+        releaseYear: String? = nil,
+        voteAverage: Double? = nil
+    ) {
+        self.id = id
+        self.tmdbId = tmdbId
+        self.title = title
+        self.mediaType = mediaType
+        self.posterURL = posterURL
+        self.backdropURL = backdropURL
+        self.character = character
+        self.releaseYear = releaseYear
+        self.voteAverage = voteAverage
+    }
+    
+    var asRelatedTitle: RelatedTitle {
+        RelatedTitle(
+            id: "tmdb:\(tmdbId)",
+            type: mediaType == "tv" ? "series" : "movie",
+            name: title,
+            posterURL: posterURL?.absoluteString,
+            year: releaseYear,
+            rating: voteAverage,
+            overview: nil,
+            backdropURL: backdropURL?.absoluteString
+        )
+    }
+}
+
+struct ScenePersonDetail: Identifiable, Codable, Equatable, Hashable, Sendable {
+    let id: Int
+    let name: String
+    let biography: String?
+    let birthday: String?
+    let deathday: String?
+    let placeOfBirth: String?
+    let profileURL: URL?
+    let movies: [ScenePersonMediaCredit]
+    let series: [ScenePersonMediaCredit]
+
+    init(
+        id: Int,
+        name: String,
+        biography: String? = nil,
+        birthday: String? = nil,
+        deathday: String? = nil,
+        placeOfBirth: String? = nil,
+        profileURL: URL? = nil,
+        movies: [ScenePersonMediaCredit] = [],
+        series: [ScenePersonMediaCredit] = []
+    ) {
+        self.id = id
+        self.name = name
+        self.biography = biography
+        self.birthday = birthday
+        self.deathday = deathday
+        self.placeOfBirth = placeOfBirth
+        self.profileURL = profileURL
+        self.movies = movies
+        self.series = series
+    }
+    
+    /// Formatted birth string matching screenshot:
+    /// e.g. "Born: Jul 28, 1974 (age 52)" or "Died: Jan 22, 2008 (aged 28)"
+    var birthInfo: String? {
+        guard let birthday, !birthday.isEmpty else { return nil }
+        
+        let inputFormatter = DateFormatter()
+        inputFormatter.dateFormat = "yyyy-MM-dd"
+        inputFormatter.locale = Locale(identifier: "en_US_POSIX")
+        inputFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+        
+        guard let birthDate = inputFormatter.date(from: birthday) else {
+            return "Born: \(birthday)"
+        }
+        
+        let outputFormatter = DateFormatter()
+        outputFormatter.dateFormat = "MMM d, yyyy"
+        outputFormatter.locale = Locale(identifier: "en_US_POSIX")
+        outputFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+        
+        let formattedBirth = outputFormatter.string(from: birthDate)
+        
+        let calendar = Calendar.current
+        if let deathday, !deathday.isEmpty, let deathDate = inputFormatter.date(from: deathday) {
+            let formattedDeath = outputFormatter.string(from: deathDate)
+            let ageComponents = calendar.dateComponents([.year], from: birthDate, to: deathDate)
+            if let age = ageComponents.year {
+                return "Died: \(formattedDeath) (aged \(age)) • Born: \(formattedBirth)"
+            } else {
+                return "Died: \(formattedDeath) • Born: \(formattedBirth)"
+            }
+        } else {
+            let ageComponents = calendar.dateComponents([.year], from: birthDate, to: Date())
+            if let age = ageComponents.year {
+                return "Born: \(formattedBirth) (age \(age))"
+            } else {
+                return "Born: \(formattedBirth)"
+            }
+        }
+    }
+}
+
 // MARK: - Scene Detail Item
 
 enum SceneDetailItem: Identifiable, Equatable, Sendable {
-    case actor(SceneRecognizedActor, biography: String?, knownFor: [String])
+    case actor(SceneRecognizedActor, detail: ScenePersonDetail?)
     case song(SceneRecognizedSong)
 
     var id: String {
         switch self {
-        case .actor(let actor, _, _): return "actor-\(actor.id)"
+        case .actor(let actor, _): return "actor-\(actor.id)"
         case .song(let song): return "song-\(song.id)"
         }
     }

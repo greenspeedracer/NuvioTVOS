@@ -45,6 +45,10 @@ final class SceneViewModel: ObservableObject {
         selectedDetailItem != nil
     }
     
+    var isAnime: Bool {
+        coordinator.isAnime
+    }
+    
     func setMetadata(
         title: String,
         year: Int?,
@@ -90,19 +94,13 @@ final class SceneViewModel: ObservableObject {
     
     func openDetail(_ item: SceneDetailItem) {
         selectedDetailItem = item
-        if case .actor(let actor, let bio, let knownFor) = item, (bio == nil || bio?.isEmpty == true), let tmdbId = actor.tmdbId {
+        if case .actor(let actor, let detail) = item, detail == nil, let tmdbId = actor.tmdbId {
             Task { [weak self] in
                 guard let self else { return }
-                let fetchedBio = await self.coordinator.fetchPersonBiography(personId: tmdbId)
+                let fetchedDetail = await self.coordinator.fetchPersonDetail(personId: tmdbId)
                 await MainActor.run {
-                    if case .actor(let curActor, _, _) = self.selectedDetailItem, curActor.id == actor.id {
-                        let finalBio: String
-                        if let bio = fetchedBio?.trimmingCharacters(in: .whitespacesAndNewlines), !bio.isEmpty {
-                            finalBio = bio
-                        } else {
-                            finalBio = "No biography available."
-                        }
-                        self.selectedDetailItem = .actor(curActor, biography: finalBio, knownFor: knownFor)
+                    if case .actor(let curActor, _) = self.selectedDetailItem, curActor.id == actor.id {
+                        self.selectedDetailItem = .actor(curActor, detail: fetchedDetail)
                     }
                 }
             }

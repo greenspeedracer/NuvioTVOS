@@ -32,12 +32,12 @@ final class TrailerSettingsTests: XCTestCase {
 
     func testTrailerSettingsDefaults() {
         let trailersEnabled = testDefaults.object(forKey: SettingsKey.trailersEnabled) as? Bool ?? true
-        let backgroundTrailersEnabled = testDefaults.object(forKey: SettingsKey.backgroundTrailersEnabled) as? Bool ?? false
+        let backgroundTrailersEnabled = testDefaults.object(forKey: SettingsKey.backgroundTrailersEnabled) as? Bool ?? true
         let trailerPreviewSound = testDefaults.object(forKey: SettingsKey.trailerPreviewSound) as? Bool ?? false
         let trailerDelay = testDefaults.object(forKey: SettingsKey.trailerDelay) as? Int ?? 7
 
         XCTAssertTrue(trailersEnabled, "Autoplay trailers should default to true")
-        XCTAssertFalse(backgroundTrailersEnabled, "Background trailers should default to false (opt-in)")
+        XCTAssertTrue(backgroundTrailersEnabled, "Background trailers should default to true")
         XCTAssertFalse(trailerPreviewSound, "Trailer preview sound should default to false")
         XCTAssertEqual(trailerDelay, 7, "Trailer delay should default to 7 seconds")
     }
@@ -58,21 +58,21 @@ final class TrailerSettingsTests: XCTestCase {
     }
 
     func testPreservationAcrossAutoplayToggles() {
-        // User opts in to background trailers
-        testDefaults.set(true, forKey: SettingsKey.backgroundTrailersEnabled)
-        XCTAssertTrue(testDefaults.bool(forKey: SettingsKey.backgroundTrailersEnabled))
+        // User turns off background trailers
+        testDefaults.set(false, forKey: SettingsKey.backgroundTrailersEnabled)
+        XCTAssertFalse(testDefaults.bool(forKey: SettingsKey.backgroundTrailersEnabled))
 
         // User turns off master autoplay toggle
         testDefaults.set(false, forKey: SettingsKey.trailersEnabled)
         XCTAssertFalse(testDefaults.bool(forKey: SettingsKey.trailersEnabled))
 
         // Background trailer preference is preserved
-        XCTAssertTrue(testDefaults.bool(forKey: SettingsKey.backgroundTrailersEnabled))
+        XCTAssertFalse(testDefaults.bool(forKey: SettingsKey.backgroundTrailersEnabled))
 
         // User turns autoplay back on
         testDefaults.set(true, forKey: SettingsKey.trailersEnabled)
         XCTAssertTrue(testDefaults.bool(forKey: SettingsKey.trailersEnabled))
-        XCTAssertTrue(testDefaults.bool(forKey: SettingsKey.backgroundTrailersEnabled))
+        XCTAssertFalse(testDefaults.bool(forKey: SettingsKey.backgroundTrailersEnabled))
     }
 
     func testTrailerSettingsProfileIsolation() {
@@ -81,17 +81,17 @@ final class TrailerSettingsTests: XCTestCase {
         profile1Defaults.removePersistentDomain(forName: "TrailerProfile1Suite")
         profile2Defaults.removePersistentDomain(forName: "TrailerProfile2Suite")
 
-        // Profile 1 enables background trailers with 0s delay and sound on
-        profile1Defaults.set(true, forKey: SettingsKey.backgroundTrailersEnabled)
+        // Profile 1 disables background trailers with 0s delay and sound on
+        profile1Defaults.set(false, forKey: SettingsKey.backgroundTrailersEnabled)
         profile1Defaults.set(0, forKey: SettingsKey.trailerDelay)
         profile1Defaults.set(true, forKey: SettingsKey.trailerPreviewSound)
 
         // Profile 2 has default unconfigured values
-        let p2Background = profile2Defaults.object(forKey: SettingsKey.backgroundTrailersEnabled) as? Bool ?? false
+        let p2Background = profile2Defaults.object(forKey: SettingsKey.backgroundTrailersEnabled) as? Bool ?? true
         let p2Delay = profile2Defaults.object(forKey: SettingsKey.trailerDelay) as? Int ?? 7
         let p2Sound = profile2Defaults.object(forKey: SettingsKey.trailerPreviewSound) as? Bool ?? false
 
-        XCTAssertFalse(p2Background, "Profile 2 should retain default false for background trailers")
+        XCTAssertTrue(p2Background, "Profile 2 should retain default true for background trailers")
         XCTAssertEqual(p2Delay, 7, "Profile 2 should retain default 7s delay")
         XCTAssertFalse(p2Sound, "Profile 2 should retain default muted sound")
 

@@ -333,8 +333,9 @@ private struct CompanyBrowseScrollTransitionShadow: View {
     }
 }
 
-private struct NetworkBrowseRail: View {
+struct NetworkBrowseRail: View {
     let rail: TmdbNetworkBrowseRail
+    var externalFocus: FocusState<String?>.Binding? = nil
     let onSelect: (RelatedTitle) -> Void
 
     var body: some View {
@@ -347,9 +348,13 @@ private struct NetworkBrowseRail: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(alignment: .top, spacing: TmdbBrowseGridMetrics.posterGap) {
                     ForEach(rail.items) { title in
-                        ProductionBrowseCard(title: title) {
-                            onSelect(title)
-                        }
+                        ProductionBrowseCard(
+                            title: title,
+                            externalFocus: externalFocus,
+                            onSelect: {
+                                onSelect(title)
+                            }
+                        )
                     }
                 }
                 .padding(.horizontal, 80)
@@ -366,111 +371,260 @@ struct PersonBrowseView: View {
     let onSelect: (RelatedTitle) -> Void
     let onBack: () -> Void
 
-    @State private var titles: [RelatedTitle] = []
+    @State private var detail: ScenePersonDetail? = nil
     @State private var isLoading = true
-    @FocusState private var focusedId: String?
+    @State private var scrollOffset: CGFloat = 0
+    @FocusState private var focusedCardID: String?
     @FocusState private var placeholderFocused: Bool
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
 
-    private var columns: [GridItem] { TmdbBrowseGridMetrics.columns }
+    private var displayName: String { detail?.name ?? person.name }
+
+    private var rails: [TmdbNetworkBrowseRail] {
+        guard let detail else { return [] }
+        var list: [TmdbNetworkBrowseRail] = []
+        if !detail.movies.isEmpty {
+            list.append(
+                TmdbNetworkBrowseRail(
+                    id: "movies",
+                    title: L10n.format("details_movies_count", fallback: "Movies • %d", detail.movies.count),
+                    items: detail.movies.map(\.asRelatedTitle)
+                )
+            )
+        }
+        if !detail.series.isEmpty {
+            list.append(
+                TmdbNetworkBrowseRail(
+                    id: "series",
+                    title: L10n.format("details_series_count", fallback: "Series • %d", detail.series.count),
+                    items: detail.series.map(\.asRelatedTitle)
+                )
+            )
+        }
+        return list
+    }
+
+    private var backdropURL: URL? {
+        let movieBackdrop = detail?.movies.compactMap(\.backdropURL).first
+        let seriesBackdrop = detail?.series.compactMap(\.backdropURL).first
+        return movieBackdrop ?? seriesBackdrop
+    }
+
+    private var scrollShadowProgress: CGFloat {
+        min(max(scrollOffset / 120, 0), 1)
+    }
 
     var body: some View {
-        ZStack {
-            Color.nuvioBackground(amoled: amoled, body: bodyColor)
+        ZStack(alignment: .top) {
+            backdrop
+
+            Color.black
+                .opacity(0.78 * scrollShadowProgress)
                 .ignoresSafeArea()
+                .allowsHitTesting(false)
 
-            VStack(alignment: .leading, spacing: 20) {
-                HStack(spacing: 28) {
-                    if let profileURL = person.profileURL,
-                       let url = URL(string: profileURL) {
-                        AsyncImage(url: url) { phase in
-                            if case .success(let image) = phase {
-                                image
-                                    .resizable()
-                                    .scaledToFill()
-                                    .frame(width: 96, height: 96)
-                                    .clipShape(Circle())
-                            } else {
-                                personFallback
-                            }
-                        }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 34) {
+                    GeometryReader { geometry in
+                        Color.clear
+                            .preference(
+                                key: CompanyBrowseScrollOffsetKey.self,
+                                value: geometry.frame(in: .named("person-browse-scroll")).minY
+                            )
+                    }
+                    .frame(height: 0)
+
+                    hero
+
+                    if isLoading {
+                        ProgressView()
+                            .scaleEffect(1.6)
+                            .frame(maxWidth: .infinity, minHeight: 260)
+                    } else if rails.isEmpty {
+                        Text(L10n.format("details_no_titles_found_for_person", fallback: "No movies or series found for %@", displayName))
+                            .font(.system(size: 30, weight: .medium))
+                            .foregroundColor(.white.opacity(0.7))
+                            .frame(maxWidth: .infinity, minHeight: 260)
                     } else {
-                        personFallback
-                    }
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(person.name)
-                            .font(.system(size: 42, weight: .bold))
-                            .foregroundColor(.white)
-                        if let role = person.role {
-                            Text(role)
-                                .font(.system(size: 26, weight: .medium))
-                                .foregroundColor(.white.opacity(0.55))
-                        }
-                        if !isLoading {
-                            Text(L10n.format("details_titles_count", fallback: "%d titles", titles.count))
-                                .font(.system(size: 24, weight: .regular))
-                                .foregroundColor(.white.opacity(0.4))
+                        ForEach(rails) { rail in
+                            NetworkBrowseRail(rail: rail, externalFocus: $focusedCardID, onSelect: onSelect)
                         }
                     }
-                    Spacer()
                 }
-                .padding(.horizontal, 60)
-
-                if isLoading {
-                    Spacer()
-                    ProgressView()
-                        .scaleEffect(1.6)
-                        .frame(maxWidth: .infinity)
-                    Spacer()
-                } else if titles.isEmpty {
-                    Spacer()
-                    Text(L10n.format("details_no_titles_found_for_person", fallback: "No movies or series found for %@", person.name))
-                        .font(.system(size: 30, weight: .medium))
-                        .foregroundColor(.white.opacity(0.7))
-                        .frame(maxWidth: .infinity)
-                    Spacer()
-                } else {
-                    ScrollView {
-                        LazyVGrid(columns: columns, alignment: .leading, spacing: TmdbBrowseGridMetrics.posterGap) {
-                            ForEach(titles) { title in
-                                ProductionBrowseCard(title: title) {
-                                    onSelect(title)
-                                }
-                                .focused($focusedId, equals: title.id)
-                            }
-                        }
-                        .padding(.top, 16)
-                        .padding(.horizontal, 60)
-                        .padding(.bottom, 60)
-                    }
-                    .focusSection()
-                    .defaultFocusIfAvailable($focusedId, titles.first?.id)
-                }
+                .padding(.bottom, 70)
             }
-            .padding(.top, 48)
+            .focusSection()
+            .coordinateSpace(name: "person-browse-scroll")
+            .modifier(CompanyBrowseScrollTracker(offset: $scrollOffset))
 
-            if titles.isEmpty {
+            CompanyBrowseScrollTransitionShadow(progress: scrollShadowProgress)
+
+            if isLoading || rails.isEmpty {
                 placeholderFocusAnchor
             }
         }
+        .defaultFocusIfAvailable($focusedCardID, rails.first?.items.first?.id)
+        .onChange(of: rails.first?.items.first?.id) { _, newFirstID in
+            if focusedCardID == nil, let newFirstID {
+                focusedCardID = newFirstID
+            }
+        }
+        .ignoresSafeArea(edges: .top)
         .onExitCommand(perform: onBack)
         .task(id: person.id) {
             isLoading = true
-            titles = await TmdbDetailsService.discoverTitles(person: person)
+            let provider = TmdbSceneCastProvider()
+            detail = await provider.fetchPersonDetail(for: person)
             isLoading = false
-            focusedId = titles.first?.id
+            if focusedCardID == nil, let firstID = rails.first?.items.first?.id {
+                focusedCardID = firstID
+            }
         }
     }
 
+    private var backdrop: some View {
+        let backdropColor = Color.nuvioBackground(amoled: amoled, body: bodyColor)
+
+        return ZStack(alignment: .top) {
+            backdropColor
+                .ignoresSafeArea()
+
+            if let backdropURL {
+                ZStack {
+                    AsyncImage(url: backdropURL) { phase in
+                        if case .success(let image) = phase {
+                            image
+                                .resizable()
+                                .scaledToFill()
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: 520)
+                    .clipped()
+                    .blur(radius: 8, opaque: true)
+
+                    GeometryReader { proxy in
+                        LinearGradient(
+                            stops: [
+                                .init(color: backdropColor.opacity(0.96), location: 0),
+                                .init(color: backdropColor.opacity(0.86), location: 0.25),
+                                .init(color: backdropColor.opacity(0.64), location: 0.50),
+                                .init(color: backdropColor.opacity(0.34), location: 0.70),
+                                .init(color: backdropColor.opacity(0.10), location: 0.88),
+                                .init(color: .clear, location: 1)
+                            ],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                        .frame(width: proxy.size.width * 0.76)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                    }
+
+                    LinearGradient(
+                        stops: [
+                            .init(color: .clear, location: 0.0),
+                            .init(color: backdropColor.opacity(0.4), location: 0.35),
+                            .init(color: backdropColor.opacity(0.85), location: 0.7),
+                            .init(color: backdropColor, location: 1.0)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                }
+                .frame(maxWidth: .infinity, maxHeight: 520)
+                .clipped()
+            }
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+    }
+
+    private var hero: some View {
+        HStack(alignment: .bottom, spacing: 50) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(categoryLabel)
+                    .font(.system(size: 32, weight: .medium))
+                    .foregroundColor(.white.opacity(0.72))
+
+                Text(displayName)
+                    .font(.system(size: 64, weight: .bold))
+                    .foregroundColor(.white)
+                    .lineLimit(2)
+
+                let metaParts = [
+                    detail?.birthInfo,
+                    detail?.placeOfBirth
+                ].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+
+                if !metaParts.isEmpty {
+                    Text(metaParts.joined(separator: " • "))
+                        .font(.system(size: 26, weight: .regular))
+                        .foregroundColor(.white.opacity(0.68))
+                        .lineLimit(2)
+                }
+
+                if let bio = detail?.biography, !bio.isEmpty {
+                    Text(bio)
+                        .font(.system(size: 20, weight: .regular))
+                        .foregroundColor(.white.opacity(0.82))
+                        .lineSpacing(4)
+                        .lineLimit(4)
+                        .padding(.top, 4)
+                }
+            }
+
+            Spacer(minLength: 20)
+
+            // Right-side portrait card matching streaming service logo / hero style
+            ZStack {
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .fill(Color.white.opacity(0.08))
+                    .frame(width: 200, height: 280)
+
+                let profileURL = detail?.profileURL ?? person.profileURL.flatMap(URL.init)
+                if let profileURL {
+                    AsyncImage(url: profileURL) { phase in
+                        switch phase {
+                        case .success(let image):
+                            image
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 200, height: 280)
+                                .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                        case .failure, .empty:
+                            personFallback
+                        @unknown default:
+                            personFallback
+                        }
+                    }
+                } else {
+                    personFallback
+                }
+            }
+            .overlay(
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .stroke(Color.white.opacity(0.18), lineWidth: 1.5)
+            )
+            .shadow(color: Color.black.opacity(0.55), radius: 20, y: 8)
+        }
+        .padding(.horizontal, 80)
+        .padding(.top, 72)
+        .frame(maxWidth: .infinity, minHeight: 390, alignment: .bottom)
+    }
+
+    private var categoryLabel: String {
+        if let role = person.role, !role.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return role
+        }
+        return "Cast & Crew"
+    }
+
     private var personFallback: some View {
-        Text(person.name.split(separator: " ").prefix(2).compactMap(\.first).map(String.init).joined())
-            .font(.system(size: 30, weight: .semibold))
-            .foregroundColor(.white)
-            .frame(width: 96, height: 96)
-            .background(Color.white.opacity(0.16))
-            .clipShape(Circle())
+        Image(systemName: "person.fill")
+            .resizable()
+            .scaledToFit()
+            .frame(width: 80, height: 80)
+            .foregroundColor(.white.opacity(0.35))
     }
 
     private var placeholderFocusAnchor: some View {
@@ -485,7 +639,7 @@ struct PersonBrowseView: View {
     }
 }
 
-private enum TmdbBrowseGridMetrics {
+enum TmdbBrowseGridMetrics {
     static let posterWidth: CGFloat = 210
     static let posterHeight: CGFloat = 315
     static let posterGap: CGFloat = 28
@@ -499,9 +653,10 @@ private enum TmdbBrowseGridMetrics {
     }
 }
 
-private struct ProductionBrowseCard: View {
+struct ProductionBrowseCard: View {
     let title: RelatedTitle
     let alwaysShowLabels: Bool
+    var externalFocus: FocusState<String?>.Binding?
     let onSelect: () -> Void
 
     @FocusState private var isFocused: Bool
@@ -522,14 +677,25 @@ private struct ProductionBrowseCard: View {
     init(
         title: RelatedTitle,
         alwaysShowLabels: Bool = false,
+        externalFocus: FocusState<String?>.Binding? = nil,
         onSelect: @escaping () -> Void
     ) {
         self.title = title
         self.alwaysShowLabels = alwaysShowLabels
+        self.externalFocus = externalFocus
         self.onSelect = onSelect
     }
 
     var body: some View {
+        if let externalFocus {
+            cardButton
+                .focused(externalFocus, equals: title.id)
+        } else {
+            cardButton
+        }
+    }
+
+    private var cardButton: some View {
         Button(action: onSelect) {
             VStack(alignment: .leading, spacing: 12) {
                 ZStack {

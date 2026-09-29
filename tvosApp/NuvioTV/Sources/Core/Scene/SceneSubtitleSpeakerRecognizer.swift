@@ -116,7 +116,7 @@ struct SceneSubtitleSpeakerRecognizer: Sendable {
     }
     
     static func generateCharacterAliases(_ raw: String) -> [String] {
-        var cleaned = raw
+        let cleaned = raw
             .replacingOccurrences(of: "(voice)", with: "", options: .caseInsensitive)
             .replacingOccurrences(of: "(uncredited)", with: "", options: .caseInsensitive)
             .trimmingCharacters(in: .whitespacesAndNewlines)

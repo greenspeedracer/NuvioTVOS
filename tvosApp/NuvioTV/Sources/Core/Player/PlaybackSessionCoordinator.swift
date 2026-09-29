@@ -311,8 +311,33 @@ final class PlaybackSessionCoordinator: ObservableObject {
             return
         }
 
-        // Hybrid disk cache disabled: dispatch directly to the playback engine.
-        dispatchToEngine(request, on: backend, generation: generation)
+        let isDiskCacheEnabled = (ProfileSettings.current.object(forKey: SettingsKey.hybridDiskCacheEnabled) as? Bool) ?? false
+        let isHTTP = PlaybackBackendPolicy.isRemoteHTTP(request.videoURL.absoluteString)
+        let isHLS = request.videoURL.pathExtension.lowercased() == "m3u8"
+
+        if isDiskCacheEnabled && isHTTP && !isHLS {
+            Task { @MainActor [weak self] in
+                guard let self, !self.userStopped, self.loadGeneration == generation else { return }
+                var effectiveRequest = request
+                if let localURL = await PlaybackStreamCacheManager.shared.prepareCacheServer(
+                    for: request.videoURL,
+                    headers: request.httpHeaders,
+                    canonicalMediaKey: request.canonicalMediaKey,
+                    cacheFileIdentity: request.cacheFileIdentity,
+                    filename: request.filename,
+                    targetLeadSeconds: request.cacheProfile.hybridCacheTargetLeadSeconds
+                ) {
+                    effectiveRequest.videoURL = localURL
+                }
+                guard !self.userStopped, self.loadGeneration == generation else {
+                    await PlaybackStreamCacheManager.shared.stopActiveSession()
+                    return
+                }
+                self.dispatchToEngine(effectiveRequest, on: backend, generation: generation)
+            }
+        } else {
+            dispatchToEngine(request, on: backend, generation: generation)
+        }
     }
 
     private func dispatchToEngine(_ request: PlaybackLoadRequest, on backend: PlayerBackendKind, generation: UInt64) {

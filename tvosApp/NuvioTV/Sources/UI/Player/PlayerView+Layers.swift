@@ -168,15 +168,15 @@ extension PlayerView {
                     && viewModel.pendingSeekDelta == 0
             },
             onBegan: {
-                print("[ScreensaverDebug][Input] RemoteTouchCatcher onBegan: isWaking=\(isWakingFromBackground), status=\(viewModel.status), pos=\(viewModel.time.current)")
+                screensaverDebugLog("[ScreensaverDebug][Input] RemoteTouchCatcher onBegan: isWaking=\(isWakingFromBackground), status=\(viewModel.status), pos=\(viewModel.time.current)")
                 viewModel.remoteTouchBegan()
             },
             onMoved: { dx, dy in
-                print("[ScreensaverDebug][Input] RemoteTouchCatcher onMoved dx=\(dx) dy=\(dy): isWaking=\(isWakingFromBackground), status=\(viewModel.status)")
+                screensaverDebugLog("[ScreensaverDebug][Input] RemoteTouchCatcher onMoved dx=\(dx) dy=\(dy): isWaking=\(isWakingFromBackground), status=\(viewModel.status)")
                 viewModel.remoteTouchMoved(dx: dx, dy: dy)
             },
             onEnded: { dx, dy in
-                print("[ScreensaverDebug][Input] RemoteTouchCatcher onEnded dx=\(dx) dy=\(dy): isWaking=\(isWakingFromBackground), status=\(viewModel.status)")
+                screensaverDebugLog("[ScreensaverDebug][Input] RemoteTouchCatcher onEnded dx=\(dx) dy=\(dy): isWaking=\(isWakingFromBackground), status=\(viewModel.status)")
                 viewModel.remoteTouchEnded(dx: dx, dy: dy)
             }
         )
@@ -196,15 +196,15 @@ extension PlayerView {
                 && !viewModel.isScrubbing
                 && !viewModel.postPlayState.isVisible,
             onBeginBackward: {
-                print("[ScreensaverDebug][Input] RemoteSeekPressCatcher onBeginBackward: isWaking=\(isWakingFromBackground)")
+                screensaverDebugLog("[ScreensaverDebug][Input] RemoteSeekPressCatcher onBeginBackward: isWaking=\(isWakingFromBackground)")
                 viewModel.beginRepeatingSkipBackward()
             },
             onBeginForward: {
-                print("[ScreensaverDebug][Input] RemoteSeekPressCatcher onBeginForward: isWaking=\(isWakingFromBackground)")
+                screensaverDebugLog("[ScreensaverDebug][Input] RemoteSeekPressCatcher onBeginForward: isWaking=\(isWakingFromBackground)")
                 viewModel.beginRepeatingSkipForward()
             },
             onEnd: {
-                print("[ScreensaverDebug][Input] RemoteSeekPressCatcher onEnd: isWaking=\(isWakingFromBackground)")
+                screensaverDebugLog("[ScreensaverDebug][Input] RemoteSeekPressCatcher onEnd: isWaking=\(isWakingFromBackground)")
                 viewModel.stopRepeatingSkip()
             }
         )
@@ -267,9 +267,9 @@ extension PlayerView {
             .focused($remoteInputFocused)
             .onTapGesture {
                 let elapsedWake = Date().timeIntervalSince(lastBecameActiveAt)
-                print("[ScreensaverDebug][Input] onTapGesture: isWakingFromBg=\(isWakingFromBackground) (elapsedWake=\(String(format: "%.3f", elapsedWake))s), isScrubbing=\(viewModel.isScrubbing), showPauseOverlay=\(viewModel.showPauseOverlay), status=\(viewModel.status), pos=\(viewModel.time.current)")
+                screensaverDebugLog("[ScreensaverDebug][Input] onTapGesture: isWakingFromBg=\(isWakingFromBackground) (elapsedWake=\(String(format: "%.3f", elapsedWake))s), isScrubbing=\(viewModel.isScrubbing), showPauseOverlay=\(viewModel.showPauseOverlay), status=\(viewModel.status), pos=\(viewModel.time.current)")
                 guard !isWakingFromBackground else {
-                    print("[ScreensaverDebug][Input] onTapGesture suppressed by isWakingFromBackground")
+                    screensaverDebugLog("[ScreensaverDebug][Input] onTapGesture suppressed by isWakingFromBackground")
                     return
                 }
                 if viewModel.isScrubbing {
@@ -282,9 +282,9 @@ extension PlayerView {
             }
             .onMoveCommand { direction in
                 let elapsedWake = Date().timeIntervalSince(lastBecameActiveAt)
-                print("[ScreensaverDebug][Input] onMoveCommand direction=\(direction): isWakingFromBg=\(isWakingFromBackground) (elapsedWake=\(String(format: "%.3f", elapsedWake))s), showPauseOverlay=\(viewModel.showPauseOverlay), showControls=\(viewModel.showControls), status=\(viewModel.status)")
+                screensaverDebugLog("[ScreensaverDebug][Input] onMoveCommand direction=\(direction): isWakingFromBg=\(isWakingFromBackground) (elapsedWake=\(String(format: "%.3f", elapsedWake))s), showPauseOverlay=\(viewModel.showPauseOverlay), showControls=\(viewModel.showControls), status=\(viewModel.status)")
                 guard !isWakingFromBackground else {
-                    print("[ScreensaverDebug][Input] onMoveCommand suppressed by isWakingFromBackground")
+                    screensaverDebugLog("[ScreensaverDebug][Input] onMoveCommand suppressed by isWakingFromBackground")
                     return
                 }
                 if viewModel.moveSuppressed { return }
@@ -340,7 +340,9 @@ extension PlayerView {
             SceneDetailView(
                 item: item,
                 onDismiss: {
-                    viewModel.closeSceneDetail()
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        viewModel.closeSceneDetail()
+                    }
                 }
             )
             .transition(.opacity)
