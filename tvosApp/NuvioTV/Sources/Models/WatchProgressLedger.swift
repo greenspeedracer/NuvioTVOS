@@ -178,8 +178,7 @@ enum WatchProgressLedger {
     static func upsert(_ record: WatchProgressRecord) -> Bool {
         var current = records().filter { $0.progressKey != record.progressKey }
         current.append(record)
-        print("[WatchProgressLedger] upsert: key=\(record.progressKey), id=\(record.contentId), S\(record.season.map(String.init) ?? "nil")E\(record.episode.map(String.init) ?? "nil"), pos=\(record.position)/\(record.duration), isPendingPush=\(record.isPendingPush), totalRecords=\(current.count)")
-        return persist(current)
+        continueWatchingLog.notice("[diag] upsert: key=\(record.progressKey, privacy: .public), id=\(record.contentId, privacy: .public), S\(record.season.map(String.init) ?? "nil", privacy: .public)E\(record.episode.map(String.init) ?? "nil", privacy: .public), pos=\(record.position)/\(record.duration), isPendingPush=\(record.isPendingPush), totalRecords=\(current.count)")        return persist(current)
     }
 
     @discardableResult
@@ -188,7 +187,7 @@ enum WatchProgressLedger {
         let removing = Set(keys)
         let remaining = records().filter { !removing.contains($0.progressKey) }
         guard remaining.count != records().count else { return true }
-        print("[WatchProgressLedger] remove: keys=\(keys), remainingRecords=\(remaining.count)")
+        continueWatchingLog.notice("[diag] remove: keys=\(keys, privacy: .public), remainingRecords=\(remaining.count)")
         return persist(remaining)
     }
 
@@ -197,7 +196,7 @@ enum WatchProgressLedger {
     @discardableResult
     static func removeContent(id: String) -> Bool {
         let remaining = records().filter { $0.contentId != id }
-        print("[WatchProgressLedger] removeContent: id=\(id), remainingRecords=\(remaining.count)")
+        continueWatchingLog.notice("[diag] removeContent: id=\(id, privacy: .public), remainingRecords=\(remaining.count)")
         return persist(remaining)
     }
 
@@ -213,7 +212,7 @@ enum WatchProgressLedger {
     static func mergeRemote(_ remote: [WatchProgressRecord]) -> Bool {
         guard !remote.isEmpty else { return true }
         let mergedResult = Array(merged(remote, into: records()).values)
-        print("[WatchProgressLedger] mergeRemote: received \(remote.count) remote records -> total \(mergedResult.count) records")
+        continueWatchingLog.notice("[diag] mergeRemote: received \(remote.count) remote records -> total \(mergedResult.count) records")
         return persist(mergedResult)
     }
 
@@ -242,7 +241,7 @@ enum WatchProgressLedger {
         // mismatch. Never turn that ambiguity into destructive local data loss.
         // Explicit removals are still reconciled from non-empty snapshots.
         guard !remote.isEmpty else {
-            print("[WatchProgressLedger] reconcileRemote: remote snapshot is empty -> skipping reconciliation")
+            continueWatchingLog.notice("[diag] reconcileRemote: remote snapshot is empty -> skipping reconciliation")
             return (true, [], false)
         }
 
@@ -258,11 +257,10 @@ enum WatchProgressLedger {
                 survivors.append(record)
             } else {
                 removedKeys.append(record.progressKey)
-                print("[WatchProgressLedger] reconcileRemote: DROPPING record \(record.progressKey) (contentId=\(record.contentId), pos=\(record.position)/\(record.duration)) - not in remoteKeys, isPendingPush=\(record.isPendingPush), lastWatchedAt=\(record.lastWatchedAt) <= syncStartedAt=\(syncStartedAt)")
-            }
+                continueWatchingLog.notice("[diag] reconcileRemote: DROPPING record \(record.progressKey, privacy: .public) (contentId=\(record.contentId, privacy: .public), pos=\(record.position)/\(record.duration)) - not in remoteKeys, isPendingPush=\(record.isPendingPush), lastWatchedAt=\(record.lastWatchedAt.timeIntervalSince1970) <= syncStartedAt=\(syncStartedAt.timeIntervalSince1970)")            }
         }
 
-        print("[WatchProgressLedger] reconcileRemote: remote=\(remote.count), local=\(records().count), survivors=\(survivors.count), removed=\(removedKeys.count)")
+        continueWatchingLog.notice("[diag] reconcileRemote: remote=\(remote.count), local=\(records().count), survivors=\(survivors.count), removed=\(removedKeys.count)")
 
         // A refresh that did not change the merged ledger (the common case on
         // a background pull of an account that has been quiet) must not
@@ -324,7 +322,7 @@ enum WatchProgressLedger {
             return copy
         }
         guard changed else { return }
-        print("[WatchProgressLedger] markPushed: cleared isPendingPush for \(keys.count) keys: \(keys)")
+        continueWatchingLog.notice("[diag] markPushed: cleared isPendingPush for \(keys.count) keys: \(keys, privacy: .public)")
         _ = persist(updated)
     }
 
