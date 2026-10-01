@@ -1162,5 +1162,94 @@ final class StreamQualityTagsTests: XCTestCase {
         // Legacy UserDefaults key must now be deleted to free up cfprefsd quota
         XCTAssertNil(store.object(forKey: SettingsKey.streamBadgeRules), "Legacy key in UserDefaults must be removed upon migration")
     }
+
+    func testPreserveAddonStreamsKeepsPriorityModeZeroResolutionAndTicketStreamsInOriginalOrder() {
+        let usenetPriorityModeStream = NuvioStream(
+            url: "https://usenet.example/stream/priority",
+            name: "Usenet Ultimate 🎫 [Priority Mode]",
+            description: "Dynamic auto-select stream",
+            addonName: "AIOStreams"
+        )
+        let stream1080p = NuvioStream(
+            url: "https://usenet.example/stream/1080p",
+            name: "1080p WEB-DL",
+            description: "5 GB",
+            addonName: "AIOStreams"
+        )
+        let stream4k = NuvioStream(
+            url: "https://usenet.example/stream/4k",
+            name: "4K Remux",
+            description: "30 GB",
+            addonName: "AIOStreams"
+        )
+
+        let addonStreams = [usenetPriorityModeStream, stream1080p, stream4k]
+
+        // Default behavior (preserveAddonStreams == false):
+        // 0-res / ticket streams are filtered out when valid >= 720p streams exist
+        let defaultPlayable = SmartPlaybackSelector.playableStreams(
+            from: addonStreams,
+            includeDebrid: false,
+            cachedOnly: false,
+            preserveAddonStreams: false
+        )
+        XCTAssertFalse(defaultPlayable.contains(where: { $0.id == usenetPriorityModeStream.id }))
+
+        let defaultDisplayed = StreamPickerListBuilder.displayedStreams(
+            streams: addonStreams,
+            groups: [],
+            selectedAddonId: nil,
+            sortOption: .default,
+            includeDebrid: false,
+            cachedOnly: false,
+            preserveAddonStreams: false
+        )
+        XCTAssertFalse(defaultDisplayed.contains(where: { $0.id == usenetPriorityModeStream.id }))
+
+        // Enabled behavior (preserveAddonStreams == true):
+        // All playable results are kept and exact add-on ordering is preserved as the source of truth
+        let preservedPlayable = SmartPlaybackSelector.playableStreams(
+            from: addonStreams,
+            includeDebrid: false,
+            cachedOnly: false,
+            preserveAddonStreams: true
+        )
+        XCTAssertEqual(preservedPlayable.count, 3)
+        XCTAssertEqual(preservedPlayable[0].id, usenetPriorityModeStream.id)
+
+        let preservedDisplayed = StreamPickerListBuilder.displayedStreams(
+            streams: addonStreams,
+            groups: [],
+            selectedAddonId: nil,
+            sortOption: .default,
+            includeDebrid: false,
+            cachedOnly: false,
+            preserveAddonStreams: true
+        )
+        XCTAssertEqual(preservedDisplayed.count, 3)
+        XCTAssertEqual(preservedDisplayed[0].id, usenetPriorityModeStream.id)
+        XCTAssertEqual(preservedDisplayed[1].id, stream1080p.id)
+        XCTAssertEqual(preservedDisplayed[2].id, stream4k.id)
+    }
+
+    func testStreamPickerListCacheKeyIncludesPreserveAddonStreams() {
+        let keyA = StreamPickerListBuilder.cacheKey(
+            revision: 1,
+            selectedAddonId: nil,
+            sortOption: .default,
+            includeDebrid: true,
+            cachedOnly: false,
+            preserveAddonStreams: false
+        )
+        let keyB = StreamPickerListBuilder.cacheKey(
+            revision: 1,
+            selectedAddonId: nil,
+            sortOption: .default,
+            includeDebrid: true,
+            cachedOnly: false,
+            preserveAddonStreams: true
+        )
+        XCTAssertNotEqual(keyA, keyB)
+    }
 }
 

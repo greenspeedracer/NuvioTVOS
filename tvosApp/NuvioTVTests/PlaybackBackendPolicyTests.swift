@@ -248,6 +248,22 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertEqual(viewModel.activeEngineKind, .mpv)
     }
 
+    @MainActor
+    func testAetherControllerSupportsScrubThumbnailsWhenHybridDiskCacheActive() throws {
+        guard let aetherVC = AetherPlaybackController() else {
+            throw XCTSkip("AetherPlaybackController unavailable in current test environment")
+        }
+        let localCacheRequest = PlaybackLoadRequest(
+            videoURL: URL(string: "http://127.0.0.1:54321/stream/test-session-id")!,
+            canonicalMediaKey: "canon_test_movie"
+        )
+        aetherVC.load(localCacheRequest, generation: 1)
+        XCTAssertTrue(
+            aetherVC.supportsScrubThumbnails,
+            "Aether controller must report supportsScrubThumbnails = true when stream is backed by local hybrid disk cache"
+        )
+    }
+
     func testLiveStreamFailoverRetriesCurrentURLOnceBeforeExcludingIt() {
         let url = "https://sports.example/live.m3u8"
         let first = LiveStreamFailoverPolicy.decide(

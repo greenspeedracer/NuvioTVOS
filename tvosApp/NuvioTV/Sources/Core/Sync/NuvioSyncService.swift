@@ -653,10 +653,19 @@ final class NuvioSyncManager: ObservableObject {
                 continue
             }
             do {
-                let remoteProfiles = try await client.pullProfiles(session: session)
-                guard !remoteProfiles.isEmpty else {
-                    lastError = nil
-                    continue
+                var remoteProfiles = try await client.pullProfiles(session: session)
+                if remoteProfiles.isEmpty {
+                    if attempt == 0 {
+                        lastError = nil
+                        continue
+                    }
+                    let initialProfiles = defaultInitialProfiles()
+                    try await client.pushProfiles(session: session, profiles: initialProfiles)
+                    remoteProfiles = try await client.pullProfiles(session: session)
+                    guard !remoteProfiles.isEmpty else {
+                        lastError = nil
+                        continue
+                    }
                 }
                 let merged = ProfileSyncIndexStore.localProfiles(
                     from: remoteProfiles,
@@ -916,6 +925,31 @@ final class NuvioSyncManager: ObservableObject {
         }
     }
 
+    /// Returns the default profile payload to initialize on a new or empty account.
+    /// Preserves existing local non-placeholder profiles if available, or seeds
+    /// the primary "Nuvio User" profile.
+    private func defaultInitialProfiles() -> [Profile] {
+        if let profiles = profileViewModel?.profiles {
+            let nonPlaceholders = profiles.filter { !Self.isPlaceholderProfile($0) }
+            if !nonPlaceholders.isEmpty {
+                var result = nonPlaceholders
+                result[0].isAdmin = true
+                return result
+            }
+        }
+        return [
+            Profile(
+                id: "1",
+                name: "Nuvio User",
+                isPinProtected: false,
+                isAdmin: true,
+                avatarId: "",
+                usesPrimaryAddons: false,
+                usesPrimaryPlugins: false
+            )
+        ]
+    }
+
     /// A freshly exchanged TV token can become visible to Auth before the sync
     /// RPCs can read the account rows. Retry session validation and the profile
     /// RPC as one bootstrap operation, reacquiring the session every time. The
@@ -967,11 +1001,32 @@ final class NuvioSyncManager: ObservableObject {
             do {
                 let profiles = try await client.pullProfiles(session: session)
                 try ensureStillSyncing()
-                guard !profiles.isEmpty else {
+                if !profiles.isEmpty {
+                    return (session, profiles)
+                }
+
+                // If profiles are empty on the first immediate read, retry once
+                // with delay in case a newly issued token is racing replica
+                // visibility of an existing account.
+                if attempt == 0 {
                     lastError = AuthError(message: "Nuvio has not returned the account profiles yet.")
                     continue
                 }
-                return (session, profiles)
+
+                // If remote profiles are still empty, this is a new or empty account
+                // (e.g. created on Apple TV or web without a server profile row).
+                // Create and push the default primary profile so account sync and
+                // subsequent mutations are unblocked.
+                print("Nuvio sync: account has no remote profiles; creating default primary profile.")
+                let initialProfiles = defaultInitialProfiles()
+                try await client.pushProfiles(session: session, profiles: initialProfiles)
+                try ensureStillSyncing()
+                let createdProfiles = try await client.pullProfiles(session: session)
+                try ensureStillSyncing()
+                if !createdProfiles.isEmpty {
+                    return (session, createdProfiles)
+                }
+                lastError = AuthError(message: "Could not initialize default account profile.")
             } catch is CancellationError {
                 throw CancellationError()
             } catch let error as AuthError {
@@ -1323,7 +1378,13 @@ final class NuvioSyncManager: ObservableObject {
             guard (try? ensureStillSyncing()) != nil else { return false }
             let remote: [RemoteProfile]
             do {
-                remote = try await client.pullProfiles(session: session)
+                var pulled = try await client.pullProfiles(session: session)
+                if pulled.isEmpty {
+                    let initialProfiles = defaultInitialProfiles()
+                    try await client.pushProfiles(session: session, profiles: initialProfiles)
+                    pulled = try await client.pullProfiles(session: session)
+                }
+                remote = pulled
             } catch let error as AuthError where error.statusCode == 401 {
                 _ = await authManager.refreshSessionForSync()
                 continue
@@ -1450,7 +1511,6 @@ final class NuvioSyncManager: ObservableObject {
             // the launch window, before profile selection had settled.
             guard WatchedStore.activeProfileId == activeProfile.id else { return }
 
-            let profileStore = ProfileSettings.store(for: activeProfile.id)
             let ownsLibrary = Self.ownsLibrary(for: activeProfile.id)
             if scopes.contains(.library) && ownsLibrary {
                 try ensureStillSyncing(profileId: activeProfile.id)
@@ -2024,6 +2084,8 @@ enum PlayerSettingsSyncMapper {
         ("stream_auto_play_reuse_binge_group", SettingsKey.streamAutoPlayReuseBingeGroup),
         ("stream_cached_only", SettingsKey.cachedOnlyStreams),
         ("cached_only_streams", SettingsKey.cachedOnlyStreams),
+        ("preserve_addon_stream_order", SettingsKey.preserveAddonStreamOrder),
+        ("stream_preserve_addon_order", SettingsKey.preserveAddonStreamOrder),
         ("stream_sort_mode", SettingsKey.streamSortOption),
         ("smart_stream_selection", SettingsKey.smartStreamSelection),
         ("smart_stream_use_top_result", SettingsKey.smartStreamUseTopResult),
@@ -2050,6 +2112,7 @@ enum PlayerSettingsSyncMapper {
         (SettingsKey.streamAutoPlayPreferBingeGroup, "stream_auto_play_prefer_binge_group"),
         (SettingsKey.streamAutoPlayReuseBingeGroup, "stream_auto_play_reuse_binge_group"),
         (SettingsKey.cachedOnlyStreams, "stream_cached_only"),
+        (SettingsKey.preserveAddonStreamOrder, "preserve_addon_stream_order"),
         (SettingsKey.streamSortOption, "stream_sort_mode"),
         (SettingsKey.smartStreamSelection, "smart_stream_selection"),
         (SettingsKey.smartStreamUseTopResult, "smart_stream_use_top_result"),

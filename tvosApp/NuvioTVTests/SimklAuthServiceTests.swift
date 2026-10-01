@@ -35,6 +35,9 @@ final class SimklAuthServiceTests: XCTestCase {
 
     func testStartPINAuthPersistsFlowAndRequiredRequestMetadata() async throws {
         SimklURLProtocolStub.handler = { request in
+            if request.url?.path == "/oauth2/device" {
+                return Self.response(for: request, status: 404, json: #"{"error":"not_found"}"#)
+            }
             let components = try XCTUnwrap(URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false))
             let query: [String: String] = Dictionary(
                 uniqueKeysWithValues: (components.queryItems ?? []).compactMap {
@@ -85,6 +88,8 @@ final class SimklAuthServiceTests: XCTestCase {
     func testPollPendingKeepsPINFlow() async throws {
         SimklURLProtocolStub.handler = { request in
             switch request.url?.path {
+            case "/oauth2/device":
+                return Self.response(for: request, status: 404, json: #"{"error":"not_found"}"#)
             case "/oauth/pin":
                 return Self.pinResponse(for: request)
             case "/oauth/pin/ABC123":
@@ -111,6 +116,8 @@ final class SimklAuthServiceTests: XCTestCase {
     func testApprovedPINStoresTokenAndLoadsAccount() async throws {
         SimklURLProtocolStub.handler = { request in
             switch request.url?.path {
+            case "/oauth2/device":
+                return Self.response(for: request, status: 404, json: #"{"error":"not_found"}"#)
             case "/oauth/pin":
                 return Self.pinResponse(for: request)
             case "/oauth/pin/ABC123":
@@ -160,6 +167,8 @@ final class SimklAuthServiceTests: XCTestCase {
     func testFreshPINResponseWhilePollingInvalidatesOriginalFlow() async throws {
         SimklURLProtocolStub.handler = { request in
             switch request.url?.path {
+            case "/oauth2/device":
+                return Self.response(for: request, status: 404, json: #"{"error":"not_found"}"#)
             case "/oauth/pin":
                 return Self.pinResponse(for: request)
             case "/oauth/pin/ABC123":
@@ -1261,6 +1270,39 @@ final class SimklAuthServiceTests: XCTestCase {
         )
     }
 
+    private static func extractFormBody(from request: URLRequest) throws -> [String: String] {
+        let data: Data
+        if let body = request.httpBody {
+            data = body
+        } else {
+            let stream = try XCTUnwrap(request.httpBodyStream)
+            stream.open()
+            defer { stream.close() }
+            var result = Data()
+            var buffer = [UInt8](repeating: 0, count: 1_024)
+            while stream.hasBytesAvailable {
+                let count = stream.read(&buffer, maxLength: buffer.count)
+                guard count >= 0 else {
+                    throw stream.streamError ?? URLError(.cannotDecodeContentData)
+                }
+                if count == 0 { break }
+                result.append(buffer, count: count)
+            }
+            data = result
+        }
+        guard let bodyString = String(data: data, encoding: .utf8) else { return [:] }
+        var result: [String: String] = [:]
+        for pair in bodyString.components(separatedBy: "&") {
+            let parts = pair.components(separatedBy: "=")
+            if parts.count == 2 {
+                let key = parts[0].removingPercentEncoding ?? parts[0]
+                let value = parts[1].replacingOccurrences(of: "+", with: " ").removingPercentEncoding ?? parts[1]
+                result[key] = value
+            }
+        }
+        return result
+    }
+
     private static func pinResponse(for request: URLRequest) -> (HTTPURLResponse, Data) {
         response(
             for: request,
@@ -1317,6 +1359,29 @@ final class SimklAuthServiceTests: XCTestCase {
 
         // Clean up
         storage.setAccessToken(nil, for: testScope)
+    }
+
+    func testSimklKeychainRefreshTokenStorageMirrorsAndRecoversFromProfileSettings() {
+        let storage = SimklKeychainTokenStorage()
+        let testScope = "test-profile-\(UUID().uuidString)"
+        let profileStore = ProfileSettings.store(for: testScope)
+
+        storage.setRefreshToken(nil, for: testScope)
+        XCTAssertNil(storage.refreshToken(for: testScope))
+        XCTAssertNil(profileStore.string(forKey: SettingsKey.simklRefreshToken))
+
+        storage.setRefreshToken("test-refresh-token-12345", for: testScope)
+        XCTAssertEqual(profileStore.string(forKey: SettingsKey.simklRefreshToken), "test-refresh-token-12345")
+        XCTAssertEqual(storage.refreshToken(for: testScope), "test-refresh-token-12345")
+
+        storage.setRefreshToken(nil, for: testScope)
+        XCTAssertNil(storage.refreshToken(for: testScope))
+        XCTAssertNil(profileStore.string(forKey: SettingsKey.simklRefreshToken))
+
+        profileStore.set("cloud-synced-refresh-token", forKey: SettingsKey.simklRefreshToken)
+        XCTAssertEqual(storage.refreshToken(for: testScope), "cloud-synced-refresh-token")
+
+        storage.setRefreshToken(nil, for: testScope)
     }
 
     @MainActor
@@ -1701,6 +1766,269 @@ final class SimklAuthServiceTests: XCTestCase {
         XCTAssertEqual(response.shows?.first?.title, "Example Show")
         XCTAssertEqual(response.movies?.count, 1)
         XCTAssertEqual(response.movies?.first?.title, "Example Movie")
+    }
+
+    func testStartPINAuthV2DeviceFlow() async throws {
+        SimklURLProtocolStub.handler = { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.url?.path, "/oauth2/device")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/x-www-form-urlencoded")
+            let form = try Self.extractFormBody(from: request)
+            XCTAssertEqual(form["client_id"], "client-id")
+            XCTAssertEqual(form["scope"], "media:read media:write")
+
+            return Self.response(
+                for: request,
+                json: """
+                {
+                  "device_code": "DEV_CODE_V2",
+                  "user_code": "USER_V2",
+                  "verification_uri": "https://simkl.com/pin",
+                  "verification_uri_complete": "https://simkl.com/pin?user_code=USER_V2",
+                  "expires_in": 900,
+                  "interval": 5
+                }
+                """
+            )
+        }
+
+        let service = makeService()
+        let response = try await service.startPINAuth()
+        let state = service.currentState()
+
+        XCTAssertEqual(response.userCode, "USER_V2")
+        XCTAssertEqual(response.verificationURIComplete, "https://simkl.com/pin?user_code=USER_V2")
+        XCTAssertEqual(state.userCode, "USER_V2")
+        XCTAssertEqual(state.deviceCode, "DEV_CODE_V2")
+        XCTAssertEqual(state.verificationURIComplete, "https://simkl.com/pin?user_code=USER_V2")
+        XCTAssertTrue(state.isV2Flow)
+        XCTAssertTrue(state.hasActivePINFlow(in: defaults))
+    }
+
+    func testPollPINTokenV2ApprovedWithRefreshTokens() async throws {
+        SimklURLProtocolStub.handler = { request in
+            switch request.url?.path {
+            case "/oauth2/device":
+                return Self.response(
+                    for: request,
+                    json: """
+                    {
+                      "device_code": "DEV_CODE_V2",
+                      "user_code": "USER_V2",
+                      "verification_uri": "https://simkl.com/pin",
+                      "verification_uri_complete": "https://simkl.com/pin?user_code=USER_V2",
+                      "expires_in": 900,
+                      "interval": 5
+                    }
+                    """
+                )
+            case "/oauth2/token":
+                XCTAssertEqual(request.httpMethod, "POST")
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/x-www-form-urlencoded")
+                let form = try Self.extractFormBody(from: request)
+                XCTAssertEqual(form["client_id"], "client-id")
+                XCTAssertEqual(form["device_code"], "DEV_CODE_V2")
+                XCTAssertEqual(form["grant_type"], "urn:ietf:params:oauth:grant-type:device_code")
+
+                return Self.response(
+                    for: request,
+                    json: """
+                    {
+                      "access_token": "simkl_at_new_token_123",
+                      "token_type": "Bearer",
+                      "expires_in": 604800,
+                      "refresh_token": "simkl_rt_new_token_456",
+                      "scope": "media:read media:write"
+                    }
+                    """
+                )
+            case "/users/settings":
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer simkl_at_new_token_123")
+                return Self.response(
+                    for: request,
+                    json: """
+                    {
+                      "user": {"name": "v2-approved-user", "avatar": "https://example.com/avatar.jpg"},
+                      "account": {"id": 100, "type": "pro"}
+                    }
+                    """
+                )
+            default:
+                XCTFail("Unexpected URL: \(request.url?.absoluteString ?? "")")
+                return Self.response(for: request, status: 404, json: #"{"error":"not_found"}"#)
+            }
+        }
+
+        let service = makeService()
+        _ = try await service.startPINAuth()
+        let result = await service.pollPINToken()
+
+        guard case .approved(let username) = result else {
+            return XCTFail("Expected approved, got \(result)")
+        }
+        XCTAssertEqual(username, "v2-approved-user")
+
+        let state = service.currentState()
+        XCTAssertTrue(state.isV2)
+        XCTAssertEqual(state.accessToken, "simkl_at_new_token_123")
+        XCTAssertEqual(state.refreshToken, "simkl_rt_new_token_456")
+        XCTAssertNotNil(state.tokenExpiresAt)
+        XCTAssertEqual(tokenStorage.accessToken(for: "profile-1"), "simkl_at_new_token_123")
+        XCTAssertEqual(tokenStorage.refreshToken(for: "profile-1"), "simkl_rt_new_token_456")
+    }
+
+    func testPollPINTokenV2ErrorCases() async throws {
+        SimklAuthStore.savePINFlow(
+            SimklPINCodeResponse(
+                deviceCode: "DEV_V2",
+                userCode: "CODE_V2",
+                verificationURI: "https://simkl.com/pin",
+                expiresIn: 900,
+                interval: 5
+            ),
+            isV2Flow: true,
+            clientID: "client-id",
+            store: defaults
+        )
+
+        let service = makeService()
+
+        // 1. authorization_pending
+        SimklURLProtocolStub.handler = { request in
+            Self.response(for: request, status: 400, json: #"{"error":"authorization_pending"}"#)
+        }
+        let pendingResult = await service.pollPINToken()
+        guard case .pending = pendingResult else { return XCTFail("Expected pending") }
+
+        // 2. slow_down adds 5s
+        SimklURLProtocolStub.handler = { request in
+            Self.response(for: request, status: 400, json: #"{"error":"slow_down"}"#)
+        }
+        let rateLimitedResult = await service.pollPINToken()
+        guard case .rateLimited(let nextInterval) = rateLimitedResult else { return XCTFail("Expected rateLimited") }
+        XCTAssertEqual(nextInterval, 10)
+
+        // 3. expired_token
+        SimklURLProtocolStub.handler = { request in
+            Self.response(for: request, status: 400, json: #"{"error":"expired_token"}"#)
+        }
+        let expiredResult = await service.pollPINToken()
+        guard case .expired = expiredResult else { return XCTFail("Expected expired") }
+    }
+
+    func testRefreshTokenV2Flow() async throws {
+        SimklAuthStore.saveToken(
+            "simkl_at_old",
+            refreshToken: "simkl_rt_old",
+            expiresIn: 3600,
+            clientID: "client-id",
+            profileScope: "profile-1",
+            store: defaults,
+            tokenStorage: tokenStorage
+        )
+
+        SimklURLProtocolStub.handler = { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.url?.path, "/oauth2/token")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/x-www-form-urlencoded")
+            let form = try Self.extractFormBody(from: request)
+            XCTAssertEqual(form["grant_type"], "refresh_token")
+            XCTAssertEqual(form["client_id"], "client-id")
+            XCTAssertEqual(form["refresh_token"], "simkl_rt_old")
+
+            return Self.response(
+                for: request,
+                json: """
+                {
+                  "access_token": "simkl_at_refreshed_999",
+                  "token_type": "Bearer",
+                  "expires_in": 604800,
+                  "refresh_token": "simkl_rt_refreshed_888",
+                  "scope": "media:read media:write"
+                }
+                """
+            )
+        }
+
+        let service = makeService()
+        let refreshed = await service.refreshTokenIfNeeded(force: true)
+        XCTAssertTrue(refreshed)
+
+        let state = service.currentState()
+        XCTAssertEqual(state.accessToken, "simkl_at_refreshed_999")
+        XCTAssertEqual(state.refreshToken, "simkl_rt_refreshed_888")
+        XCTAssertEqual(tokenStorage.accessToken(for: "profile-1"), "simkl_at_refreshed_999")
+        XCTAssertEqual(tokenStorage.refreshToken(for: "profile-1"), "simkl_rt_refreshed_888")
+    }
+
+    func testLogoutV2RevokesToken() async throws {
+        SimklAuthStore.saveToken(
+            "simkl_at_v2_to_revoke",
+            refreshToken: "simkl_rt_v2_to_revoke",
+            expiresIn: 604800,
+            clientID: "client-id",
+            profileScope: "profile-1",
+            store: defaults,
+            tokenStorage: tokenStorage
+        )
+
+        let revocationExpectation = expectation(description: "Revocation request sent")
+
+        SimklURLProtocolStub.handler = { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.url?.path, "/oauth2/revoke")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/x-www-form-urlencoded")
+            let form = try Self.extractFormBody(from: request)
+            XCTAssertEqual(form["client_id"], "client-id")
+            XCTAssertEqual(form["token"], "simkl_rt_v2_to_revoke")
+            revocationExpectation.fulfill()
+            return Self.response(for: request, json: #"{"result":"OK"}"#)
+        }
+
+        let service = makeService()
+        service.logout()
+
+        await fulfillment(of: [revocationExpectation], timeout: 2.0)
+        XCTAssertFalse(service.currentState().isAuthenticated(in: defaults))
+        XCTAssertNil(tokenStorage.accessToken(for: "profile-1"))
+        XCTAssertNil(tokenStorage.refreshToken(for: "profile-1"))
+    }
+
+    func testV1LegacyTokenDoesNotAttemptRefresh() async throws {
+        authorize()
+
+        var tokenEndpointCalled = false
+        SimklURLProtocolStub.handler = { request in
+            if request.url?.path == "/oauth2/token" {
+                tokenEndpointCalled = true
+            }
+            return Self.response(for: request, json: #"{"result":"OK"}"#)
+        }
+
+        let service = makeService()
+        XCTAssertFalse(service.currentState().isV2)
+        let refreshed = await service.refreshTokenIfNeeded(force: true)
+        XCTAssertTrue(refreshed)
+        XCTAssertFalse(tokenEndpointCalled)
+    }
+
+    func testStartPINAuthFallbackToV1WhenV2FailsInvalidClient() async throws {
+        SimklURLProtocolStub.handler = { request in
+            switch request.url?.path {
+            case "/oauth2/device":
+                return Self.response(for: request, status: 401, json: #"{"error":"invalid_client","error_description":"Client ID not enabled for OAuth 2.0"}"#)
+            case "/oauth/pin":
+                return Self.pinResponse(for: request)
+            default:
+                XCTFail("Unexpected path: \(request.url?.path ?? "")")
+                return Self.response(for: request, status: 404, json: #"{"error":"not_found"}"#)
+            }
+        }
+
+        let service = makeService()
+        let response = try await service.startPINAuth()
+        XCTAssertEqual(response.userCode, "ABC123")
+        XCTAssertFalse(service.currentState().isV2Flow)
     }
 }
 

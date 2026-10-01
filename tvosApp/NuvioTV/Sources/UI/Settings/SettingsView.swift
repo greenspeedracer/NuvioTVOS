@@ -253,6 +253,7 @@ enum SettingsKey {
     static let smartSubtitleMatching = "nuvio.tv.settings.playback.smartSubtitleMatching"
     static let cachedOnlyStreams = "nuvio.tv.settings.playback.cachedOnlyStreams"
     static let preferHardwareDecodedStreams = "nuvio.tv.settings.playback.preferHardwareDecodedStreams"
+    static let preserveAddonStreamOrder = "nuvio.tv.settings.playback.preserveAddonStreamOrder"
     static let streamSortOption = "nuvio.tv.settings.playback.streamSortOption"
     static let streamBadgeRules = "nuvio.tv.settings.playback.streamBadgeRules"
     static let showFileSizeBadges = "nuvio.tv.settings.playback.showFileSizeBadges"
@@ -300,6 +301,7 @@ enum SettingsKey {
     static let iCloudSyncEnabled = "nuvio.tv.settings.advanced.iCloudSyncEnabled"
     static let iCloudLastSyncDate = "nuvio.tv.settings.advanced.iCloudLastSyncDate"
     static let simklAccessToken = "nuvio.tv.settings.integrations.simklAccessToken"
+    static let simklRefreshToken = "nuvio.tv.settings.integrations.simklRefreshToken"
 
     /// Credentials and device acknowledgements must remain on this Apple TV
     /// and never enter the account settings payload.
@@ -321,7 +323,7 @@ enum SettingsKey {
         traktContinueWatchingDaysCap, traktShowMetaComments,
         traktWatchProgressSource, watchProgressSourceChosenByUser,
         traktLibrarySourceMode, traktMoreLikeThisSource,
-        simklClientID, simklAccessToken, simklPlanToWatchHomeCatalogs,
+        simklClientID, simklAccessToken, simklRefreshToken, simklPlanToWatchHomeCatalogs,
         tmdbEnabled, tmdbApiKey, tmdbLanguage,
         tmdbUseTrailers, tmdbUseArtwork, tmdbUseBasicInfo, tmdbUseDetails, tmdbUseCredits,
         tmdbUseProductions, tmdbUseNetworks, tmdbUseEpisodes, tmdbUseSeasonPosters,
@@ -341,7 +343,7 @@ enum SettingsKey {
         smbServers, smbLibraryIndex, smbLocalRowEnabled,
         jellyfinServers, jellyfinLibraryIndex, jellyfinLocalRowEnabled,
         playerEngine, trickplayServer, externalPlayer, smartStreamSelection, smartStreamUseTopResult, smartStreamQuality, smartSubtitleMatching,
-        cachedOnlyStreams, preferHardwareDecodedStreams, streamSortOption, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
+        cachedOnlyStreams, preferHardwareDecodedStreams, preserveAddonStreamOrder, streamSortOption, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
         autoPlayNext, autoPlayNextCountdown, streamAutoPlayPreferBingeGroup, streamAutoPlayReuseBingeGroup, postPlayRecommendationsEnabled, trailersEnabled, backgroundTrailersEnabled, trailerPreviewSound, trailerDelay,
         focusedPosterBackdropEnabled, focusedPosterBackdropDelay, audioLanguage,
         subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
@@ -3792,7 +3794,17 @@ private struct IntegrationSettingsView: View {
                 .modifier(ClearPresentationBackgroundIfAvailable())
         }
         .sheet(isPresented: $showingSimklSettings) {
-            SimklConnectedSettingsSheet(viewModel: simklViewModel, accentColor: accentColor)
+            SimklConnectedSettingsSheet(
+                viewModel: simklViewModel,
+                accentColor: accentColor,
+                onReconnect: {
+                    showingSimklSettings = false
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 350_000_000)
+                        connectSimkl()
+                    }
+                }
+            )
                 .modifier(ClearPresentationBackgroundIfAvailable())
         }
         .sheet(isPresented: $showingMdbListLogin, onDismiss: {
@@ -5510,6 +5522,12 @@ private struct SimklConnectionSettingsCard: View {
                 )
             }
 
+            if viewModel.mode == .connected && viewModel.isLegacyV1 {
+                Text("Using legacy V1 Client ID. Register a V2 app at simkl.com/settings/developer and enter its Client ID above to enable OAuth 2.0.")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundColor(Color(red: 1.0, green: 0.75, blue: 0.2))
+            }
+
             if let message = viewModel.statusMessage,
                !message.isEmpty,
                viewModel.mode == .connected {
@@ -5935,6 +5953,7 @@ private struct MdbListDeviceLoginSheet: View {
 private struct SimklConnectedSettingsSheet: View {
     @ObservedObject var viewModel: SimklSettingsViewModel
     let accentColor: Color
+    var onReconnect: (() -> Void)? = nil
 
     @Environment(\.dismiss) private var dismiss
     @AppStorage(SettingsKey.amoled) private var amoled = false
@@ -5977,6 +5996,16 @@ private struct SimklConnectedSettingsSheet: View {
                             }
                             if let accountID = viewModel.accountID, !accountID.isEmpty {
                                 SettingsInfoRow(title: L10n.string("account_id", fallback: "Account ID"), value: accountID)
+                            }
+                            SettingsInfoRow(
+                                title: "Auth Protocol",
+                                value: viewModel.isLegacyV1 ? "OAuth 1.0 (Legacy)" : "OAuth 2.0 (RFC 8628)"
+                            )
+                            if viewModel.isLegacyV1 {
+                                SettingsInfoRow(
+                                    title: "V1 Client ID",
+                                    value: "Simkl requires a new V2 Client ID (simkl.com/settings/developer) to upgrade."
+                                )
                             }
                         }
 
@@ -6188,6 +6217,24 @@ private struct SimklConnectedSettingsSheet: View {
                             title: L10n.string("account_login", fallback: "Account Login"),
                             subtitle: L10n.string("tvos_settings_simkl_account_login_subtitle", fallback: "Manage the Simkl connection for this Nuvio profile")
                         ) {
+                            if viewModel.isLegacyV1, let onReconnect {
+                                SettingsActionRow(
+                                    title: "Upgrade to OAuth 2.0",
+                                    subtitle: "Reconnect your Simkl account using the new QR device flow",
+                                    value: "Reconnect",
+                                    accentColor: accentColor
+                                ) {
+                                    viewModel.disconnect()
+                                    onReconnect()
+                                }
+                                .disabled(
+                                    viewModel.isLoading
+                                        || viewModel.isTransferringHistory
+                                        || viewModel.isTransferringLibrary
+                                        || viewModel.isTransferringProgress
+                                )
+                            }
+
                             SettingsActionRow(
                                 title: L10n.string("debrid_disconnect", fallback: "Disconnect"),
                                 subtitle: L10n.string("tvos_settings_simkl_disconnect_subtitle", fallback: "Remove this profile's Simkl token from this Apple TV"),
@@ -6390,6 +6437,14 @@ private struct SimklPINLoginSheet: View {
         return value.isEmpty ? SimklConfig.pinVerificationURL : value
     }
 
+    private var qrURI: String {
+        if let complete = viewModel.verificationURIComplete?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !complete.isEmpty {
+            return complete
+        }
+        return verificationURI
+    }
+
     var body: some View {
         VStack(spacing: 28) {
             Text(viewModel.mode == .connected ? "Simkl Connected" : "Connect Simkl")
@@ -6425,13 +6480,15 @@ private struct SimklPINLoginSheet: View {
                     dismiss()
                 }
             } else if let code = viewModel.deviceUserCode, !code.isEmpty {
-                Text("Scan the QR on your phone, then enter the PIN shown below.")
+                Text(viewModel.verificationURIComplete != nil
+                    ? "Scan the QR code on your phone to authorize instantly, or visit the link below and enter the PIN."
+                    : "Scan the QR on your phone, then enter the PIN shown below.")
                     .font(.system(size: 23, weight: .medium))
                     .foregroundColor(.white.opacity(0.68))
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
 
-                if let image = QRCode.image(from: verificationURI, scale: 10) {
+                if let image = QRCode.image(from: qrURI, scale: 10) {
                     Image(uiImage: image)
                         .interpolation(.none)
                         .resizable()
@@ -6616,6 +6673,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.smartSubtitleMatching) private var smartSubtitleMatching = true
     @AppStorage(SettingsKey.cachedOnlyStreams) private var cachedOnlyStreams = false
     @AppStorage(SettingsKey.preferHardwareDecodedStreams) private var preferHardwareDecodedStreams = true
+    @AppStorage(SettingsKey.preserveAddonStreamOrder) private var preserveAddonStreamOrder = false
     @AppStorage(SettingsKey.streamSortOption) private var streamSortOption = StreamSortOption.quality.rawValue
     @AppStorage(SettingsKey.showFileSizeBadges) private var showFileSizeBadges = true
     @AppStorage(SettingsKey.showAddonLogo) private var showAddonLogo = false
@@ -6930,6 +6988,13 @@ private struct PlaybackSettingsView: View {
                     subtitle: L10n.string("tvos_settings_stream_sort_subtitle", fallback: "Default ordering when opening sources (Quality merges all add-ons and ranks by 4K/1080p)"),
                     selection: $streamSortOption,
                     options: streamSortModes,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_preserve_addon_order", fallback: "Preserve Addon Results & Order"),
+                    subtitle: L10n.string("tvos_settings_preserve_addon_order_subtitle", fallback: "Use add-on stream results directly without quality-based filtering or reordering (ideal for AIOStreams and pre-filtered setups)"),
+                    isOn: $preserveAddonStreamOrder,
                     accentColor: accentColor
                 )
             }
@@ -9161,7 +9226,7 @@ private struct JellyfinServerEditSheet: View {
                 switch authKind {
                 case .apiKey:
                     token = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-                    userId = try await JellyfinClient.currentUserId(baseURL: baseURL, apiKey: token)
+                    userId = try await JellyfinClient.currentUserId(baseURL: baseURL, apiKey: token, username: username)
                 case .login:
                     let result = try await JellyfinSessionManager.login(baseURL: baseURL, username: username, password: password)
                     token = result.accessToken

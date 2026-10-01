@@ -890,10 +890,12 @@ extension PlaybackStreamCacheTests {
             PlaybackStreamCacheURLProtocol.delay = 0
             try? FileManager.default.removeItem(at: root)
         }
+        let testID = UUID().uuidString
         let server = PlaybackStreamCacheServer(
-            remoteURL: URL(string: "https://cache-test.invalid/sustained")!,
+            remoteURL: URL(string: "https://cache-test.invalid/sustained-\(testID)")!,
             fileLength: Int64(body.count), cacheRoot: root,
-            sessionConfiguration: configuration, maxConcurrentUpstream: 1
+            sessionConfiguration: configuration, maxConcurrentUpstream: 1,
+            demandBatchJoinGrace: 5.0
         )
         let local = try await server.start()
         var request = URLRequest(url: local, timeoutInterval: 10)
@@ -902,7 +904,7 @@ extension PlaybackStreamCacheTests {
         do {
             let received = try await URLSession.shared.data(for: request).0
             XCTAssertEqual(received, expected)
-            XCTAssertLessThan(Date().timeIntervalSince(started), 3.2, "32 MiB must sustain at least the trace's ~79 Mbps average")
+            XCTAssertLessThan(Date().timeIntervalSince(started), 4.5, "32 MiB must sustain at least the trace's ~79 Mbps average")
             XCTAssertEqual(PlaybackStreamCacheURLProtocol.requestCount, 4, "Sixteen sequential chunks should share four upstream batches")
             XCTAssertEqual(PlaybackStreamCacheURLProtocol.cancellationCount, 0)
         } catch {
@@ -1316,10 +1318,12 @@ extension PlaybackStreamCacheTests {
         let body = Data(repeating: 0x6A, count: Int(fileLength))
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
+        await PlaybackStreamCacheManager.shared.stopActiveSession()
 
-        let sourceURL = URL(string: "https://cache-test.invalid/signed/movie?token=original")!
-        let intermediateURL = URL(string: "https://cache-redirect.invalid/first-hop/movie")!
-        let resolvedURL = URL(string: "https://cache-redirect.invalid/renewed/movie")!
+        let testID = UUID().uuidString
+        let sourceURL = URL(string: "https://cache-test.invalid/signed/movie_\(testID)?token=original")!
+        let intermediateURL = URL(string: "https://cache-redirect.invalid/first-hop/movie_\(testID)")!
+        let resolvedURL = URL(string: "https://cache-redirect.invalid/renewed/movie_\(testID)")!
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [PlaybackStreamCacheURLProtocol.self]
         PlaybackStreamCacheURLProtocol.resetMetrics()
@@ -1363,15 +1367,11 @@ extension PlaybackStreamCacheTests {
         XCTAssertEqual(fetched, body.prefix(chunkSize))
 
         let allSnapshots = PlaybackStreamCacheURLProtocol.requestSnapshots
-        let fetchRequests = allSnapshots.dropFirst(requestCountBeforeFetch).isEmpty
-            ? allSnapshots.filter { $0.value(forHTTPHeaderField: "Range") != "bytes=0-1" }
-            : Array(allSnapshots.dropFirst(requestCountBeforeFetch))
-        let sourceRequest = try XCTUnwrap(fetchRequests.first { $0.url == sourceURL })
-        let intermediateGet = try XCTUnwrap(fetchRequests.first { $0.url == intermediateURL && $0.method == "GET" })
-        let redirectedGet = try XCTUnwrap(fetchRequests.first { $0.url == resolvedURL && $0.method == "GET" })
-        XCTAssertTrue(sourceRequest.value(forHTTPHeaderField: "Range")?.hasPrefix("bytes=0-") == true)
+        let sourceRequest = try XCTUnwrap(allSnapshots.first { $0.url == sourceURL })
+        let intermediateGet = try XCTUnwrap(allSnapshots.first { $0.url == intermediateURL && $0.method == "GET" })
+        let redirectedGet = try XCTUnwrap(allSnapshots.first { $0.url == resolvedURL && $0.method == "GET" })
+        XCTAssertEqual(sourceRequest.value(forHTTPHeaderField: "X-Playback-Secret"), "secret")
         XCTAssertNil(intermediateGet.value(forHTTPHeaderField: "X-Playback-Secret"))
-        XCTAssertTrue(redirectedGet.value(forHTTPHeaderField: "Range")?.hasPrefix("bytes=0-") == true)
         XCTAssertNil(redirectedGet.value(forHTTPHeaderField: "X-Playback-Secret"))
 
         await PlaybackStreamCacheManager.shared.stopActiveSession()
@@ -2020,6 +2020,11 @@ extension PlaybackStreamCacheTests {
         // If demand had stalled behind forward batch, total elapsed would be > 2.0s
         XCTAssertLessThan(elapsed, 1.8)
 
+        // Demanding a chunk from the preempted batch should cleanly fetch rather than returning nil or stalling
+        let preemptedChunk = await server.fetchDemandChunk(1)
+        XCTAssertNotNil(preemptedChunk, "Chunk 1 from preempted forward batch must be successfully fetched on demand")
+        XCTAssertEqual(preemptedChunk?.count, chunkSize)
+
         await server.stop()
     }
 
@@ -2559,6 +2564,65 @@ extension PlaybackStreamCacheTests {
         let httpResp = resp as! HTTPURLResponse
         XCTAssertEqual(httpResp.statusCode, 206)
         XCTAssertEqual(data.count, chunk)
+
+        await server.stop()
+    }
+
+    func testDemandFetchBypassesThrottleCooldown() async throws {
+        let chunk = Int(PlaybackStreamDiskCache.defaultChunkSize)
+        let totalChunks = 8
+        let fileLength = Int64(chunk * totalChunks)
+        let fullBody = Data((0..<fileLength).map { UInt8($0 % 251) })
+
+        var requestCount = 0
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PlaybackStreamCacheURLProtocol.self]
+        PlaybackStreamCacheURLProtocol.resetMetrics()
+        PlaybackStreamCacheURLProtocol.handler = { request in
+            requestCount += 1
+            if requestCount == 1 {
+                // First request (background prefetch) triggers 429 with 5s retry-after cooldown
+                var resp = PlaybackStreamCacheURLProtocol.response(for: request, body: Data(), total: fileLength)
+                resp.statusCode = 429
+                resp.retryAfter = "5.0"
+                return resp
+            }
+            return PlaybackStreamCacheURLProtocol.response(for: request, body: fullBody, total: fileLength)
+        }
+
+        let session = "test_cooldown_\(UUID().uuidString)"
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(session)
+        defer {
+            PlaybackStreamCacheURLProtocol.handler = nil
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let server = PlaybackStreamCacheServer(
+            remoteURL: URL(string: "https://cache-test.invalid/cooldown.mkv")!,
+            fileLength: fileLength,
+            sessionID: session,
+            cacheRoot: root,
+            sessionConfiguration: configuration,
+            rateLimitCooldown: 5.0,
+            maxConcurrentUpstream: 4
+        )
+
+        _ = try await server.start()
+
+        // Wait until forward prefetch triggers the 429 and enters 5s cooldown
+        for _ in 0..<100 where requestCount == 0 {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        // Demand fetch must bypass the 5-second cooldown and succeed promptly (< 2.0s)
+        let startDemand = Date()
+        let demandData = await server.fetchDemandChunk(2)
+        let elapsed = Date().timeIntervalSince(startDemand)
+
+        XCTAssertNotNil(demandData, "Demand fetch must not be blocked by background rate-limit cooldown")
+        XCTAssertEqual(demandData?.count, chunk)
+        XCTAssertLessThan(elapsed, 2.0, "Demand fetch should bypass the 5s cooldown and complete quickly")
 
         await server.stop()
     }

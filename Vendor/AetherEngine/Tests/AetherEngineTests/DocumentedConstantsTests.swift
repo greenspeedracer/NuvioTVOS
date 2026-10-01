@@ -19,6 +19,16 @@ import AetherLibavcodec
 @MainActor
 final class DocumentedConstantsTests: XCTestCase {
 
+    func testItemDiagnosticBoundsMatchDocumentation() throws {
+        let docs = try documentation()
+        XCTAssertEqual(ItemDiagnosticReadPool.maximumConcurrentReads, 2)
+        XCTAssertEqual(AVPlayerItemDiagnostics.maximumPendingRetirements, 1)
+        XCTAssertEqual(AVPlayerItemDiagnostics.accessLogLimit, 5)
+        assertDocumented("**two concurrent diagnostic reads**", docs)
+        assertDocumented("**one pending retirement\nread**", docs)
+        assertDocumented("five entries per item", docs)
+    }
+
     func testPartialCompositionHoldBoundsMatchDocumentation() throws {
         let docs = try documentation()
         XCTAssertEqual(H264PartialCompositionRepair.maximumReorderDepth, 16)
@@ -116,6 +126,17 @@ final class DocumentedConstantsTests: XCTestCase {
     }
 
     // MARK: - Probe budgets
+
+    func testWholeProbeDefaultsMatchDocumentation() throws {
+        let docs = try documentation()
+        let limits = ProbeLimits()
+        XCTAssertEqual(limits.maxInputBytes, 8 * 1024 * 1024)
+        XCTAssertEqual(limits.maxPackets, 128)
+        XCTAssertEqual(limits.maxPacketBytes, 2 * 1024 * 1024)
+        XCTAssertEqual(limits.timeBudget, 5)
+        assertDocumented("`maxInputBytes` (8 MiB), `maxPackets` (128)", docs)
+        assertDocumented("`maxPacketBytes` (2 MiB), `timeBudget` (5 s)", docs)
+    }
 
     /// docs/api.md states the defaults a host overrides with `probesize` / `maxAnalyzeDuration`.
     func testProbeBudgetDefaultsAreWhatTheDocsSay() throws {

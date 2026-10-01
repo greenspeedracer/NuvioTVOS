@@ -6854,6 +6854,7 @@ enum ProfileSettings {
         // Simkl
         SettingsKey.simklClientID,
         SettingsKey.simklAccessToken,
+        SettingsKey.simklRefreshToken,
         SettingsKey.simklPlanToWatchHomeCatalogs,
         // MDBList
         SettingsKey.mdbListApiKey,
@@ -6955,7 +6956,7 @@ enum ProfileSettings {
         if NSClassFromString("XCTestCase") != nil {
             return true
         }
-        guard let activeID = activeProfileID else { return true }
+        guard activeProfileID != nil else { return true }
         return store === current || store === UserDefaults.standard
     }
 
@@ -7105,6 +7106,7 @@ enum ProfileSettings {
 
     private static func clearSimklProfileState(in store: UserDefaults, profileScope: String) {
         store.removeObject(forKey: SettingsKey.simklAccessToken)
+        store.removeObject(forKey: SettingsKey.simklRefreshToken)
         store.removeObject(forKey: SettingsKey.simklClientID)
         store.removeObject(forKey: SettingsKey.simklPlanToWatchHomeCatalogs)
         SimklAuthStore.clearAuth(

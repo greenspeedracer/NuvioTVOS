@@ -4,7 +4,7 @@ struct SceneSongCard: View {
     let song: SceneRecognizedSong
     let onSelect: () -> Void
     
-    @FocusState private var isFocused: Bool
+    @Environment(\.isFocused) private var isFocused: Bool
     
     init(song: SceneRecognizedSong, onSelect: @escaping () -> Void) {
         self.song = song
@@ -88,7 +88,6 @@ struct SceneSongCard: View {
             .shadow(color: isFocused ? Color.white.opacity(0.25) : Color.black.opacity(0.3), radius: isFocused ? 14 : 6, y: 3)
         }
         .buttonStyle(PosterCardButtonStyle())
-        .focused($isFocused)
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.05 : 1.0)
         .animation(.easeOut(duration: 0.14), value: isFocused)

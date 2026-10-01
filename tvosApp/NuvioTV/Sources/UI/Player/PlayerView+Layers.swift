@@ -157,7 +157,8 @@ extension PlayerView {
 
     @ViewBuilder
     var remoteTouchCatcherLayer: some View {
-        // Window-level trackpad capture for scrubbing.
+        // Window-level trackpad capture for scrubbing. Active only during bare video / scrubbing,
+        // never while transport controls or native menus are active so the Focus Engine can navigate.
         RemoteTouchCatcher(
             isActive: {
                 !isWakingFromBackground
@@ -166,19 +167,12 @@ extension PlayerView {
                     && !viewModel.postPlayState.isVisible
                     && !viewModel.isHoldingSeek
                     && viewModel.pendingSeekDelta == 0
+                    && (!viewModel.showControls || viewModel.isScrubbing || viewModel.isTimelineFocused)
+                    && !viewModel.controlsAutoHideSuspended
             },
-            onBegan: {
-                screensaverDebugLog("[ScreensaverDebug][Input] RemoteTouchCatcher onBegan: isWaking=\(isWakingFromBackground), status=\(viewModel.status), pos=\(viewModel.time.current)")
-                viewModel.remoteTouchBegan()
-            },
-            onMoved: { dx, dy in
-                screensaverDebugLog("[ScreensaverDebug][Input] RemoteTouchCatcher onMoved dx=\(dx) dy=\(dy): isWaking=\(isWakingFromBackground), status=\(viewModel.status)")
-                viewModel.remoteTouchMoved(dx: dx, dy: dy)
-            },
-            onEnded: { dx, dy in
-                screensaverDebugLog("[ScreensaverDebug][Input] RemoteTouchCatcher onEnded dx=\(dx) dy=\(dy): isWaking=\(isWakingFromBackground), status=\(viewModel.status)")
-                viewModel.remoteTouchEnded(dx: dx, dy: dy)
-            }
+            onBegan: { viewModel.remoteTouchBegan() },
+            onMoved: { dx, dy in viewModel.remoteTouchMoved(dx: dx, dy: dy) },
+            onEnded: { dx, dy in viewModel.remoteTouchEnded(dx: dx, dy: dy) }
         )
         .allowsHitTesting(false)
         .frame(width: 0, height: 0)
@@ -187,14 +181,23 @@ extension PlayerView {
     @ViewBuilder
     var remoteSeekPressCatcherLayer: some View {
         RemoteSeekPressCatcher(
-            // Hold left/right continuous seek is active during video playback,
-            // whether controls are shown or hidden and regardless of button focus.
+            // Tap or hold left/right seek is active during video playback,
+            // when controls are hidden or when the timeline is focused.
             isActive: !isWakingFromBackground
                 && viewModel.currentErrorDiagnostic == nil
                 && !viewModel.showSettingsPanel
                 && viewModel.sidePanel == nil
                 && !viewModel.isScrubbing
-                && !viewModel.postPlayState.isVisible,
+                && !viewModel.postPlayState.isVisible
+                && (!viewModel.showControls || viewModel.isTimelineFocused),
+            onTapBackward: {
+                screensaverDebugLog("[ScreensaverDebug][Input] RemoteSeekPressCatcher onTapBackward: isWaking=\(isWakingFromBackground)")
+                viewModel.handleMoveSeek(direction: .left)
+            },
+            onTapForward: {
+                screensaverDebugLog("[ScreensaverDebug][Input] RemoteSeekPressCatcher onTapForward: isWaking=\(isWakingFromBackground)")
+                viewModel.handleMoveSeek(direction: .right)
+            },
             onBeginBackward: {
                 screensaverDebugLog("[ScreensaverDebug][Input] RemoteSeekPressCatcher onBeginBackward: isWaking=\(isWakingFromBackground)")
                 viewModel.beginRepeatingSkipBackward()
@@ -295,9 +298,10 @@ extension PlayerView {
                 guard !viewModel.showControls else { return }
                 switch direction {
                 case .left, .right:
-                    if viewModel.status == .playing {
-                        viewModel.handleMoveSeek(direction: direction)
-                    }
+                    // Swipes on the remote touchpad trigger onMoveCommand (.left / .right).
+                    // We do NOT seek on swipe gestures while playing.
+                    // Discrete seeking is exclusively triggered by physical button / D-pad taps via RemoteSeekPressCatcher.
+                    break
                 case .down:
                     if viewModel.isSceneEnabled {
                         viewModel.openScene()
@@ -526,10 +530,11 @@ extension PlayerView {
                     && !viewModel.showSettingsPanel
                     && !viewModel.showPauseOverlay
             )
-            .disabled(viewModel.showScenePanel)
+            .disabled(!isSeekingOrControlsVisible || viewModel.showScenePanel)
             .animation(.playerControls, value: viewModel.showControls)
             .animation(.playerControls, value: didReportPlaybackStarted)
             .animation(.playerControls, value: viewModel.isSwitchingSource)
+            .animation(.playerControls, value: viewModel.isAdvancingEpisode)
             .animation(.playerControls, value: viewModel.showSettingsPanel)
             .animation(.playerControls, value: viewModel.isScrubbing)
             .animation(.playerControls, value: viewModel.isHoldingSeek)

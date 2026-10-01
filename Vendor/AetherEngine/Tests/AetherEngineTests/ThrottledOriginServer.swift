@@ -30,6 +30,9 @@ final class ThrottledOriginServer: @unchecked Sendable {
         /// ended SHORT of its Content-Length - the observable behind the sequential reader's
         /// EIO-not-EOF distinction (a lost source must not read as end-of-media).
         case serveThenDrop(afterBytes: Int64)
+        /// Audit DMX-5: a 206 that starts `start` rather than where it was asked, the way an edge
+        /// that aligns ranges to its own chunk boundary answers. The body is that range's.
+        case serve206From(start: Int64)
     }
 
     let port: UInt16
@@ -43,6 +46,16 @@ final class ThrottledOriginServer: @unchecked Sendable {
     /// its own chunk boundary does this. Default off keeps every existing test on the historical
     /// behaviour.
     private let ignoreRangeEnd: Bool
+    /// AE#619: serve `patternByte(at:)` instead of a constant, so a test can check that the bytes
+    /// the reader returns are the bytes at the offset it claims. Default off keeps every existing
+    /// test on the historical constant body.
+    private let patternedBody: Bool
+
+    /// The byte a `patternedBody` origin serves at `offset`. Varies within every 256-byte run and
+    /// between runs, so a shifted or reordered read cannot match by accident.
+    static func patternByte(at offset: Int64) -> UInt8 {
+        UInt8(truncatingIfNeeded: offset ^ (offset >> 8) ^ (offset >> 16) ^ (offset >> 24))
+    }
     private let chunkBytes: Int
     private let throttleUs: useconds_t
     private let firstByteDelayUs: @Sendable (_ isSuffix: Bool) -> useconds_t
@@ -57,6 +70,9 @@ final class ThrottledOriginServer: @unchecked Sendable {
     private var _requestedRanges: [(start: Int64, end: Int64?)] = []
     private var _requestLog: [(path: String, start: Int64, end: Int64?)] = []
     private var _rangeHeaderPresent: [Bool] = []
+    /// #551 round 2: the headers each request arrived with, lowercased names. A credential that
+    /// must not reach a target is only provably absent at the target.
+    private var _requestHeaders: [[String: String]] = []
     private var _inflight = 0
     private var _peakInflight = 0
     private var _refusedForConcurrency = 0
@@ -104,6 +120,12 @@ final class ThrottledOriginServer: @unchecked Sendable {
         return _requestLog
     }
 
+    /// #551 round 2: every request's headers, in `requestLog` order, names lowercased.
+    var requestHeaders: [[String: String]] {
+        lock.lock(); defer { lock.unlock() }
+        return _requestHeaders
+    }
+
     /// Whether each logged request carried a Range header at all. A range-less GET is logged in
     /// `requestLog` as (start 0, end nil), indistinguishable from `bytes=0-`; the sequential-origin
     /// reader's whole contract is that it never sends Range, so its tests assert on THIS.
@@ -124,10 +146,12 @@ final class ThrottledOriginServer: @unchecked Sendable {
     init?(totalSize: Int64, chunkBytes: Int = 256 * 1024, throttleUs: useconds_t = 5000,
           refuseAboveConcurrency: Int? = nil,
           ignoreRangeEnd: Bool = false,
+          patternedBody: Bool = false,
           firstByteDelayUs: @escaping @Sendable (_ isSuffix: Bool) -> useconds_t = { _ in 0 },
           respond: @escaping @Sendable (_ requestIndex: Int, _ offset: Int64, _ path: String) -> Directive = { _, _, _ in .serve206 }) {
         self.totalSize = totalSize
         self.ignoreRangeEnd = ignoreRangeEnd
+        self.patternedBody = patternedBody
         self.chunkBytes = chunkBytes
         self.throttleUs = throttleUs
         self.refuseAboveConcurrency = refuseAboveConcurrency
@@ -263,6 +287,7 @@ final class ThrottledOriginServer: @unchecked Sendable {
         _requestedRanges.append((offset, rangeEnd))
         _requestLog.append((path, offset, rangeEnd))
         _rangeHeaderPresent.append(hadRangeHeader)
+        _requestHeaders.append(Self.parseHeaders(request))
         let requestIndex = _requestLog.count - 1
         // #388: in flight from the moment this origin has a request to answer until its body is
         // written. A request parked in `readRequestHeader` on a kept-alive socket is not one.
@@ -292,6 +317,8 @@ final class ThrottledOriginServer: @unchecked Sendable {
         switch respond(requestIndex, offset, path) {
         case .serve206:
             break
+        case .serve206From(let start):
+            offset = max(0, min(start, totalSize - 1))
         case .serveThenGoSilent(let afterBytes):
             silentAfter = max(0, afterBytes)
         case .serveThenDrop(let afterBytes):
@@ -360,11 +387,26 @@ final class ThrottledOriginServer: @unchecked Sendable {
             var n = Int(min(Int64(chunkBytes), remaining - served))
             if let silentAfter { n = Int(min(Int64(n), silentAfter - served)) }
             if let dropAfter { n = Int(min(Int64(n), dropAfter - served)) }
-            guard writeBody(fd, Array(chunk[0..<n])) else { return false }
+            let body = patternedBody
+                ? (0..<n).map { Self.patternByte(at: offset + served + Int64($0)) }
+                : Array(chunk[0..<n])
+            guard writeBody(fd, body) else { return false }
             served += Int64(n)
             if throttleUs > 0 { usleep(throttleUs) }
         }
         return true
+    }
+
+    private static func parseHeaders(_ request: String) -> [String: String] {
+        var headers: [String: String] = [:]
+        for line in request.components(separatedBy: "\r\n").dropFirst() {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let name = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            guard !name.isEmpty else { continue }
+            headers[name] = value
+        }
+        return headers
     }
 
     private func readRequestHeader(_ fd: Int32) -> String? {

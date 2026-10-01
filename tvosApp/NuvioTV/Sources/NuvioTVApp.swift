@@ -1987,6 +1987,7 @@ struct ContentView: View {
 
         let debrid = DebridResolver(store: store)
         let useTopResult = (store.object(forKey: SettingsKey.smartStreamUseTopResult) as? Bool) ?? false
+        let preserveAddonOrder = (store.object(forKey: SettingsKey.preserveAddonStreamOrder) as? Bool) ?? false
         let preferBingeGroup = (store.object(forKey: SettingsKey.streamAutoPlayPreferBingeGroup) as? Bool) ?? true
         let reuseBingeGroup = (store.object(forKey: SettingsKey.streamAutoPlayReuseBingeGroup) as? Bool) ?? true
         let sortRaw = store.string(forKey: SettingsKey.streamSortOption)
@@ -1994,13 +1995,14 @@ struct ContentView: View {
 
         let ranked: [NuvioStream]
         let includeDebridOrTorrent = debrid.isEnabled || TorrentSettings.isEnabled()
-        if useTopResult {
+        if useTopResult || preserveAddonOrder {
             let playable = SmartPlaybackSelector.playableStreams(
                 from: streams,
                 includeDebrid: includeDebridOrTorrent,
-                cachedOnly: cachedOnly
+                cachedOnly: cachedOnly,
+                preserveAddonStreams: preserveAddonOrder
             )
-            let sortedPlayable = StreamPickerListBuilder.sorted(playable, by: sortOption)
+            let sortedPlayable = StreamPickerListBuilder.sorted(playable, by: sortOption, preserveAddonStreams: preserveAddonOrder)
             // Prioritize preferred binge group or release fingerprint before taking top result
             if (preferBingeGroup || reuseBingeGroup), let preferredTags, preferredTags.bingeGroup != nil || preferredTags.releaseFingerprint != nil {
                 let matching = sortedPlayable.first { candidate in
@@ -2142,6 +2144,7 @@ struct ContentView: View {
         let store = ProfileSettings.store(for: profileId)
         let debrid = DebridResolver(store: store)
         let cachedOnly = (store.object(forKey: SettingsKey.cachedOnlyStreams) as? Bool) ?? false
+        let preserveAddonOrder = (store.object(forKey: SettingsKey.preserveAddonStreamOrder) as? Bool) ?? false
         let sortRaw = store.string(forKey: SettingsKey.streamSortOption)
         let sortOption = sortRaw.flatMap(StreamSortOption.init(rawValueOrSync:)) ?? .quality
         return StreamPickerListBuilder.displayedStreams(
@@ -2150,7 +2153,8 @@ struct ContentView: View {
             selectedAddonId: nil,
             sortOption: sortOption,
             includeDebrid: debrid.isEnabled || TorrentSettings.isEnabled(),
-            cachedOnly: cachedOnly
+            cachedOnly: cachedOnly,
+            preserveAddonStreams: preserveAddonOrder
         )
     }
 

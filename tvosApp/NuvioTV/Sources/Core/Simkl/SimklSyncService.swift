@@ -670,6 +670,21 @@ private struct SimklAuthorizedClient {
         self.profileScope = resolvedProfileScope
     }
 
+    private func tryRefreshToken() async -> String? {
+        let authService = SimklAuthService(
+            client: client,
+            store: store,
+            profileScope: profileScope,
+            tokenStorage: tokenStorage
+        )
+        guard await authService.refreshTokenIfNeeded(force: true) else { return nil }
+        return SimklRuntimeSession.authenticatedState(
+            store: store,
+            tokenStorage: tokenStorage,
+            profileScope: profileScope
+        )?.accessToken
+    }
+
     func get<T: Decodable>(
         _ type: T.Type,
         path: String,
@@ -682,6 +697,17 @@ private struct SimklAuthorizedClient {
             queryItems: query
         )
         if result.statusCode == 401 {
+            if let refreshedToken = await tryRefreshToken() {
+                let retry: SimklHTTPResult<T> = try await client.get(
+                    path: path,
+                    clientID: clientID,
+                    accessToken: refreshedToken,
+                    queryItems: query
+                )
+                if retry.statusCode != 401 {
+                    return try retry.valueOrThrow()
+                }
+            }
             SimklAuthStore.clearAuth(
                 profileScope: profileScope,
                 store: store,
@@ -703,6 +729,16 @@ private struct SimklAuthorizedClient {
             queryItems: query
         ) else { return nil }
         if result.statusCode == 401 {
+            if let refreshedToken = await tryRefreshToken() {
+                if let retry: SimklHTTPResult<T> = try? await client.get(
+                    path: path,
+                    clientID: clientID,
+                    accessToken: refreshedToken,
+                    queryItems: query
+                ), (200..<300).contains(retry.statusCode) {
+                    return retry.value
+                }
+            }
             SimklAuthStore.clearAuth(
                 profileScope: profileScope,
                 store: store,
@@ -729,6 +765,17 @@ private struct SimklAuthorizedClient {
             queryItems: query
         )
         if result.statusCode == 401 {
+            if let refreshedToken = await tryRefreshToken() {
+                let retry = try await client.delete(
+                    path: path,
+                    clientID: clientID,
+                    accessToken: refreshedToken,
+                    queryItems: query
+                )
+                if retry.statusCode != 401 {
+                    return retry.statusCode
+                }
+            }
             SimklAuthStore.clearAuth(
                 profileScope: profileScope,
                 store: store,
@@ -754,6 +801,18 @@ private struct SimklAuthorizedClient {
             body: body
         )
         if result.statusCode == 401 {
+            if let refreshedToken = await tryRefreshToken() {
+                let retry = try await client.post(
+                    path: path,
+                    clientID: clientID,
+                    accessToken: refreshedToken,
+                    queryItems: query,
+                    body: body
+                )
+                if retry.statusCode != 401 {
+                    return (retry.statusCode, retry.rawData)
+                }
+            }
             SimklAuthStore.clearAuth(
                 profileScope: profileScope,
                 store: store,
@@ -865,15 +924,33 @@ struct SimklHistoryService {
         if previousRecords.isEmpty || oldWatermark == nil || hadRemovals {
             records = []
             var anySucceeded = false
-            for type in ["shows", "movies", "anime"] {
-                if let response = await service.getOptional(
-                    SimklAllItemsResponse.self,
-                    path: "sync/all-items/\(type)",
-                    query: historyQuery()
-                ) {
-                    records = mergeHistory(records, response: response)
-                    anySucceeded = true
-                }
+            async let showsResponse = service.getOptional(
+                SimklAllItemsResponse.self,
+                path: "sync/all-items/shows",
+                query: historyQuery()
+            )
+            async let moviesResponse = service.getOptional(
+                SimklAllItemsResponse.self,
+                path: "sync/all-items/movies",
+                query: historyQuery()
+            )
+            async let animeResponse = service.getOptional(
+                SimklAllItemsResponse.self,
+                path: "sync/all-items/anime",
+                query: historyQuery()
+            )
+            let (shows, movies, anime) = await (showsResponse, moviesResponse, animeResponse)
+            if let shows {
+                records = mergeHistory(records, response: shows)
+                anySucceeded = true
+            }
+            if let movies {
+                records = mergeHistory(records, response: movies)
+                anySucceeded = true
+            }
+            if let anime {
+                records = mergeHistory(records, response: anime)
+                anySucceeded = true
             }
             guard anySucceeded || previousRecords.isEmpty else { return false }
         } else {
@@ -1887,7 +1964,7 @@ struct SimklProgressService {
     /// Bounded metadata fetch concurrency. Matches the Continue Watching
     /// builder's limit so a large paused list fans out without flooding the
     /// upstream metadata hosts with one request per title at once.
-    private static let metadataConcurrency = 4
+    private static let metadataConcurrency = 6
 
     static func fetchContinueWatching(
         repository: CatalogRepository,
@@ -2065,14 +2142,41 @@ struct SimklProgressService {
         // title. This also keeps the one-card-per-title rule in Home from
         // hiding a resume row behind its Up Next counterpart.
         if results.count < 20 {
-            for seed in upNextSeeds where !playbackMetas.contains(where: {
-                WatchedStore.sameContent($0, seed.meta)
-            }) {
-                guard results.count < 20,
-                      !Task.isCancelled,
-                      let item = await makeUpNextItem(from: seed, repository: repository) else {
-                    continue
+            let needed = 20 - results.count
+            let candidateSeeds = upNextSeeds.filter { seed in
+                !playbackMetas.contains(where: {
+                    WatchedStore.sameContent($0, seed.meta)
+                })
+            }
+            let seedsToInspect = Array(candidateSeeds.prefix(min(needed * 2, 24)))
+
+            let upNextRows = await withTaskGroup(of: (Int, ContinueWatchingItem?).self) { group in
+                var taskResults: [Int: ContinueWatchingItem] = [:]
+                var iterator = seedsToInspect.enumerated().makeIterator()
+                var inFlight = 0
+
+                func addNext() {
+                    guard let (index, seed) = iterator.next() else { return }
+                    inFlight += 1
+                    group.addTask {
+                        guard !Task.isCancelled else { return (index, nil) }
+                        let item = await makeUpNextItem(from: seed, repository: repository)
+                        return (index, item)
+                    }
                 }
+
+                for _ in 0..<min(metadataConcurrency, seedsToInspect.count) { addNext() }
+                while inFlight > 0 {
+                    guard let (index, item) = await group.next() else { break }
+                    inFlight -= 1
+                    if let item { taskResults[index] = item }
+                    addNext()
+                }
+                return taskResults.sorted { $0.key < $1.key }.compactMap(\.value)
+            }
+
+            for item in upNextRows {
+                guard results.count < 20 else { break }
                 results.append(item)
             }
         }
@@ -2135,14 +2239,26 @@ struct SimklProgressService {
         from seed: UpNextSeed,
         repository: CatalogRepository
     ) async -> ContinueWatchingItem? {
-        let meta = (try? await repository.refreshMetadata(
+        var meta = (try? await repository.getMetadata(
             id: seed.meta.id,
             type: "series"
         )) ?? seed.meta
-        guard let next = nextEpisode(
+
+        var next = nextEpisode(
             after: (season: seed.season, episode: seed.episode),
             in: meta
-        ), EpisodeReleasePolicy.shouldSurfaceNextEpisode(
+        )
+        if next == nil, let refreshed = try? await repository.refreshMetadata(
+            id: seed.meta.id,
+            type: "series"
+        ) {
+            meta = refreshed
+            next = nextEpisode(
+                after: (season: seed.season, episode: seed.episode),
+                in: meta
+            )
+        }
+        guard let next, EpisodeReleasePolicy.shouldSurfaceNextEpisode(
             watchedSeason: seed.season,
             candidateSeason: next.season,
             released: next.released

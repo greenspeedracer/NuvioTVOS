@@ -63,15 +63,7 @@ extension PlayerView {
         } else {
             switch viewModel.status {
             case .buffering, .idle:
-                if viewModel.isSwitchingSource || viewModel.isReloadingStream || viewModel.didDetectReplacementStream {
-                    PlayerLoadingOverlay(
-                        backdropUrl: meta.backgroundUrl ?? meta.posterUrl,
-                        logoUrl: meta.logoUrl,
-                        title: meta.name,
-                        message: viewModel.loadingStepMessage
-                    )
-                    .transition(.opacity)
-                } else if !didReportPlaybackStarted {
+                if viewModel.isSwitchingSource || viewModel.isReloadingStream || viewModel.didDetectReplacementStream || viewModel.isAdvancingEpisode || !didReportPlaybackStarted || (!viewModel.hasRenderedFirstFrame && !viewModel.isLiveStream) {
                     PlayerLoadingOverlay(
                         backdropUrl: meta.backgroundUrl ?? meta.posterUrl,
                         logoUrl: meta.logoUrl,
@@ -87,7 +79,7 @@ extension PlayerView {
                         .glassCircle()
                 }
             case .playing, .paused:
-                if viewModel.isSwitchingSource || viewModel.isReloadingStream || viewModel.didDetectReplacementStream || !didReportPlaybackStarted {
+                if viewModel.isSwitchingSource || viewModel.isReloadingStream || viewModel.didDetectReplacementStream || viewModel.isAdvancingEpisode || !didReportPlaybackStarted || (!viewModel.hasRenderedFirstFrame && !viewModel.isLiveStream) {
                     PlayerLoadingOverlay(
                         backdropUrl: meta.backgroundUrl ?? meta.posterUrl,
                         logoUrl: meta.logoUrl,

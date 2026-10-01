@@ -88,6 +88,7 @@ struct ScenePanelView: View {
                 .focusEffectDisabledIfAvailable()
                 .scaleEffect(isTabFocused ? 1.05 : 1.0)
                 .animation(.easeOut(duration: 0.14), value: isTabFocused)
+                .onExitCommand(perform: onDismiss)
                 .onMoveCommand { direction in
                     switch direction {
                     case .up:
@@ -118,8 +119,10 @@ struct ScenePanelView: View {
                         viewModel.openDetail(.song(song))
                     }
                     .focused($focusedCardID, equals: "song-\(song.id)")
+                    .onExitCommand(perform: onDismiss)
                     .onMoveCommand { direction in
                         if direction == .up {
+                            focusedCardID = nil
                             focusedTab = viewModel.selectedTab
                         }
                     }
@@ -133,8 +136,10 @@ struct ScenePanelView: View {
                             viewModel.openDetail(.actor(actor, detail: nil))
                         }
                         .focused($focusedCardID, equals: "actor-\(actor.id)")
+                        .onExitCommand(perform: onDismiss)
                         .onMoveCommand { direction in
                             if direction == .up {
+                                focusedCardID = nil
                                 focusedTab = viewModel.selectedTab
                             }
                         }
@@ -146,8 +151,10 @@ struct ScenePanelView: View {
                             viewModel.openDetail(.song(song))
                         }
                         .focused($focusedCardID, equals: "song-\(song.id)")
+                        .onExitCommand(perform: onDismiss)
                         .onMoveCommand { direction in
                             if direction == .up {
+                                focusedCardID = nil
                                 focusedTab = viewModel.selectedTab
                             }
                         }
@@ -309,8 +316,10 @@ struct ScenePanelView: View {
             .focusEffectDisabledIfAvailable()
             .scaleEffect(focusedCardID == "upNext" ? 1.03 : 1.0)
             .animation(.easeOut(duration: 0.14), value: focusedCardID == "upNext")
+            .onExitCommand(perform: onDismiss)
             .onMoveCommand { direction in
                 if direction == .up {
+                    focusedCardID = nil
                     focusedTab = viewModel.selectedTab
                 }
             }
@@ -334,13 +343,17 @@ struct ScenePanelView: View {
                 focusedCardID = "actor-\(firstActor.id)"
             } else if let song = viewModel.snapshot.song {
                 focusedCardID = "song-\(song.id)"
+            } else {
+                focusedTab = viewModel.selectedTab
             }
         case .upNext:
             if viewModel.nextEpisode != nil {
                 focusedCardID = "upNext"
+            } else {
+                focusedTab = viewModel.selectedTab
             }
         case .info:
-            break
+            focusedTab = viewModel.selectedTab
         }
     }
 }

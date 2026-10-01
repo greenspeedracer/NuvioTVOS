@@ -461,6 +461,22 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     let subtitleTranslationState = MPVSubtitleTranslationState()
     private var isMPVSubtitleRendererHiddenForTranslation = false
 
+    // MARK: - Seek Watchdog Diagnostics
+    private struct ActiveSeekWatchdog {
+        let id: Int
+        let targetMs: Int64
+        let initialPositionMs: Int64
+        let startTime: CFAbsoluteTime
+        var seekingStartTime: CFAbsoluteTime?
+        var seekingEndTime: CFAbsoluteTime?
+        var cacheWaitStartTime: CFAbsoluteTime?
+        var totalCacheWaitDuration: Double = 0
+        var reported = false
+    }
+    private var activeSeekWatchdog: ActiveSeekWatchdog?
+    private var seekWatchdogSequence: Int = 0
+    private var isLocalOrDiskCacheStream: Bool = false
+
     var currentSubtitleText: String? {
         if let subText = getString("sub-text"), !subText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return subText
@@ -622,8 +638,13 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         checkError(mpv_set_option_string(mpv, "demuxer-readahead-secs", "120"), context: "demuxer-readahead-secs")
         checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", cache.forwardBuffer), context: "demuxer-max-bytes")
         checkError(mpv_set_option_string(mpv, "demuxer-max-back-bytes", cache.backBuffer), context: "demuxer-max-back-bytes")
+        checkError(mpv_set_option_string(mpv, "vd-lavc-threads", "3"), context: "vd-lavc-threads")
         checkError(mpv_set_option_string(mpv, "video-rotate", "no"), context: "video-rotate")
+        checkError(mpv_set_option_string(mpv, "hr-seek", "no"), context: "hr-seek")
+        checkError(mpv_set_option_string(mpv, "hr-seek-framedrop", "yes"), context: "hr-seek-framedrop")
+        checkError(mpv_set_option_string(mpv, "demuxer-seekable-cache", "yes"), context: "demuxer-seekable-cache")
         checkError(mpv_set_option_string(mpv, "demuxer-mkv-subtitle-preroll", "yes"), context: "demuxer-mkv-subtitle-preroll")
+        checkError(mpv_set_option_string(mpv, "demuxer-mkv-subtitle-preroll-secs", "2"), context: "demuxer-mkv-subtitle-preroll-secs")
         checkError(mpv_set_option_string(mpv, "sub-fix-timing", "no"), context: "sub-fix-timing")
         if let audioLanguage = SubtitleLanguagePreferences.preferredAudioLanguage(),
            let alang = SubtitleLanguagePreferences.mpvLanguageList(for: [audioLanguage]) {
@@ -888,6 +909,27 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         clearDisplayCriteria()
         isPlayerLoading = true
         isPlayerEnded = false
+        // Adjust demuxer RAM buffers: when reading from local disk cache (127.0.0.1) or local file,
+        // 32 MiB is ample runway with zero latency, preventing 256+ MiB duplicate RAM allocation on tvOS.
+        let isLocalOrDiskCache = url.hasPrefix("http://127.0.0.1:") || url.hasPrefix("http://localhost:") || url.hasPrefix("file://")
+        self.isLocalOrDiskCacheStream = isLocalOrDiskCache
+        if isLocalOrDiskCache {
+            setStringProperty("demuxer-max-bytes", "32MiB")
+            setStringProperty("demuxer-max-back-bytes", "16MiB")
+            setStringProperty("cache-secs", "30")
+            setStringProperty("demuxer-readahead-secs", "30")
+        } else {
+            #if targetEnvironment(simulator)
+            let cache = PlaybackCacheSettings(forwardBuffer: "64MiB", backBuffer: "16MiB")
+            #else
+            let cache = PlaybackCacheSettings.current
+            #endif
+            setStringProperty("demuxer-max-bytes", cache.forwardBuffer)
+            setStringProperty("demuxer-max-back-bytes", cache.backBuffer)
+            setStringProperty("cache-secs", "120")
+            setStringProperty("demuxer-readahead-secs", "120")
+        }
+
         // Commit seek, tracks, controls and autoplay together at FILE_LOADED.
         setFlag("pause", true)
         command("loadfile", args: [url, "replace"])
@@ -910,17 +952,24 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 
     func seekToMs(_ ms: Int64) {
         guard mpv != nil else { return }
+        seekWatchdogSequence &+= 1
+        let seekId = seekWatchdogSequence
+        let now = CFAbsoluteTimeGetCurrent()
+        activeSeekWatchdog = ActiveSeekWatchdog(
+            id: seekId,
+            targetMs: ms,
+            initialPositionMs: positionMs,
+            startTime: now
+        )
         screensaverDebugLog("[ScreensaverDebug][MPVController] seekToMs(\(ms)) called: currentPos=\(positionMs)ms")
+        print("[SeekWatchdog][#\(seekId)] ⏩ Seek started -> target: \(ms)ms (current: \(positionMs)ms, duration: \(durationMs)ms, isLocalCache: \(isLocalOrDiskCacheStream))")
         subtitleTranslationState.cancelPendingTranslations()
         rememberExplicitSeek(to: ms)
-        command("seek", args: [String(format: "%.3f", Double(ms) / 1000.0), "absolute"])
+        command("seek", args: [String(format: "%.3f", Double(ms) / 1000.0), "absolute+keyframes"])
     }
 
     func seekByMs(_ ms: Int64) {
-        guard mpv != nil else { return }
-        subtitleTranslationState.cancelPendingTranslations()
-        rememberExplicitSeek(to: positionMs + ms)
-        command("seek", args: [String(format: "%.3f", Double(ms) / 1000.0), "relative"])
+        seekToMs(positionMs + ms)
     }
 
     private func rememberExplicitSeek(to requestedMs: Int64) {
@@ -1510,6 +1559,49 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
             self.bufferedMs = max(positionMs + cachedMs, 0)
         }
         currentSpeed = Float(speed > 0 ? speed : 1.0)
+
+        // Update Seek Watchdog
+        if var watchdog = activeSeekWatchdog {
+            let now = CFAbsoluteTimeGetCurrent()
+            if seeking, watchdog.seekingStartTime == nil {
+                watchdog.seekingStartTime = now
+                let elapsed = (now - watchdog.startTime) * 1000
+                print("[SeekWatchdog][#\(watchdog.id)] 🔄 MPV seeking=true (+\(String(format: "%.1f", elapsed))ms from command)")
+            }
+            if !seeking, let start = watchdog.seekingStartTime, watchdog.seekingEndTime == nil {
+                watchdog.seekingEndTime = now
+                let seekDuration = (now - start) * 1000
+                print("[SeekWatchdog][#\(watchdog.id)] ⏸️ MPV seeking=false (seeking state lasted \(String(format: "%.1f", seekDuration))ms)")
+            }
+            if bufferingCache {
+                if watchdog.cacheWaitStartTime == nil {
+                    watchdog.cacheWaitStartTime = now
+                    let elapsed = (now - watchdog.startTime) * 1000
+                    print("[SeekWatchdog][#\(watchdog.id)] ⏳ paused-for-cache=true (+\(String(format: "%.1f", elapsed))ms from seek start)")
+                }
+            } else if let cacheStart = watchdog.cacheWaitStartTime {
+                let cacheDuration = now - cacheStart
+                watchdog.totalCacheWaitDuration += cacheDuration
+                watchdog.cacheWaitStartTime = nil
+                print("[SeekWatchdog][#\(watchdog.id)] ⚡ paused-for-cache=false (waited for cache: \(String(format: "%.1f", cacheDuration * 1000))ms)")
+            }
+            if !watchdog.reported, !seeking, !bufferingCache, !idle, (positionMs > 0 || watchdog.targetMs == 0) {
+                let posDiff = abs(positionMs - watchdog.targetMs)
+                if posDiff <= 5000 || watchdog.seekingEndTime != nil {
+                    watchdog.reported = true
+                    let totalElapsed = (now - watchdog.startTime) * 1000
+                    let cacheMs = (watchdog.totalCacheWaitDuration + (watchdog.cacheWaitStartTime.map { now - $0 } ?? 0)) * 1000
+                    let seekStateMs = (watchdog.seekingEndTime.flatMap { end in watchdog.seekingStartTime.map { (end - $0) * 1000 } }) ?? 0
+                    print("[SeekWatchdog][#\(watchdog.id)] ✅ Seek completed in \(String(format: "%.1f", totalElapsed))ms (seeking: \(String(format: "%.1f", seekStateMs))ms, cacheWait: \(String(format: "%.1f", cacheMs))ms) -> landed at \(positionMs)ms (target: \(watchdog.targetMs)ms, demuxerCached: \(cached)s)")
+                    activeSeekWatchdog = nil
+                } else {
+                    activeSeekWatchdog = watchdog
+                }
+            } else {
+                activeSeekWatchdog = watchdog
+            }
+        }
+
         #if os(tvOS) || os(iOS)
         updateMPVNowPlayingInfo()
         #endif

@@ -174,7 +174,7 @@ extension AetherEngine {
         // `loadedOptions` field by field at reload time and never takes a struct. One write covers
         // both, and the didSet's route recompute cannot move (`nativeRemoteHLS` is refused above).
         applySessionOptionCorrection(proposed)
-        print("[ScreensaverDebug][AetherEngine] reloadAtCurrentPosition(applying:) proceeding to reloadAtCurrentPosition()")
+        endRecordingIfRunning(reason: .sourceReset)
         try await reloadAtCurrentPosition()
         return SessionOptionCorrectionOutcome(
             applied: applied, sessionOwned: sessionOwned, rebuilt: true)
@@ -394,6 +394,6 @@ enum SessionOptionCorrection {
         "declaredDurationSeconds", "probesize", "maxAnalyzeDuration", "preferredAudioLanguages",
         "preferredSubtitleLanguages", "externalSubtitles", "forwardBufferSegments", "autoplay",
         "audioDelaySeconds", "teletextPage", "deinterlaceMode", "deinterlaceFieldRate", "preferredDecodePath",
-        "isLiveRejoin", "subtitleSessionCarryover",
+        "escalatesToSoftwarePath", "isLiveRejoin", "subtitleSessionCarryover",
     ]
 }

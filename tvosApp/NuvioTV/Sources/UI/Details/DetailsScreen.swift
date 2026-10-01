@@ -65,6 +65,7 @@ struct DetailsScreen: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
     @AppStorage(SettingsKey.smartStreamUseTopResult) private var smartStreamUseTopResult = false
+    @AppStorage(SettingsKey.preserveAddonStreamOrder) private var preserveAddonOrder = false
     @AppStorage(SettingsKey.smartStreamQuality) private var smartStreamQuality = "Highest"
     @AppStorage(SettingsKey.smartSubtitleMatching) private var smartSubtitleMatching = true
     @AppStorage(SettingsKey.subtitleLanguages) private var subtitleLanguages = ""
@@ -448,9 +449,10 @@ struct DetailsScreen: View {
 
         let activeProfileId = ProfileSettings.activeProfileID
         let preferredTags = LastStreamQualityStore.load(metaId: meta.id, profileId: activeProfileId)
+        let preserveAddonOrder = (ProfileSettings.current.object(forKey: SettingsKey.preserveAddonStreamOrder) as? Bool) ?? false
 
         let candidateStream: NuvioStream?
-        if smartStreamUseTopResult {
+        if smartStreamUseTopResult || preserveAddonOrder {
             let sortRaw = ProfileSettings.current.string(forKey: SettingsKey.streamSortOption)
             let sortOption = sortRaw.flatMap(StreamSortOption.init(rawValueOrSync:)) ?? .quality
             let displayed = StreamPickerListBuilder.displayedStreams(
@@ -459,13 +461,19 @@ struct DetailsScreen: View {
                 selectedAddonId: nil,
                 sortOption: sortOption,
                 includeDebrid: debrid.isEnabled || TorrentSettings.isEnabled(),
-                cachedOnly: cachedOnly
+                cachedOnly: cachedOnly,
+                preserveAddonStreams: preserveAddonOrder
             )
-            // Filter out 0-res / ticket streams if valid streams exist
-            let valid = displayed.filter {
-                !SmartPlaybackSelector.isLowQualityOrTicketStream($0) && StreamPickerListBuilder.resolution(for: $0) >= 720
+            let pool: [NuvioStream]
+            if preserveAddonOrder {
+                pool = displayed
+            } else {
+                // Filter out 0-res / ticket streams if valid streams exist
+                let valid = displayed.filter {
+                    !SmartPlaybackSelector.isLowQualityOrTicketStream($0) && StreamPickerListBuilder.resolution(for: $0) >= 720
+                }
+                pool = valid.isEmpty ? displayed : valid
             }
-            let pool = valid.isEmpty ? displayed : valid
             let preferBingeGroup = (ProfileSettings.current.object(forKey: SettingsKey.streamAutoPlayPreferBingeGroup) as? Bool) ?? true
             let reuseBingeGroup = (ProfileSettings.current.object(forKey: SettingsKey.streamAutoPlayReuseBingeGroup) as? Bool) ?? true
             if (preferBingeGroup || reuseBingeGroup), let preferredTags, preferredTags.bingeGroup != nil || preferredTags.releaseFingerprint != nil {
@@ -500,6 +508,12 @@ struct DetailsScreen: View {
         if let stream = candidateStream {
             let isIdealMatch: Bool = {
                 if !viewModel.uiState.isLoadingStreams { return true }
+                if preserveAddonOrder {
+                    if debrid.isEnabled, cachedOnly {
+                        return stream.isLikelyCached
+                    }
+                    return true
+                }
                 if SmartPlaybackSelector.isLowQualityOrTicketStream(stream) { return false }
                 let tags = StreamQualityTags.parse(stream: stream)
                 let res = tags.resolution > 0 ? tags.resolution : SmartPlaybackSelector.inferredResolution(for: stream)
@@ -1965,7 +1979,8 @@ enum SmartPlaybackSelector {
     static func playableStreams(
         from streams: [NuvioStream],
         includeDebrid: Bool = false,
-        cachedOnly: Bool = false
+        cachedOnly: Bool = false,
+        preserveAddonStreams: Bool = false
     ) -> [NuvioStream] {
         let playable = streams.filter { stream in
             if let url = stream.directURL?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty {
@@ -1978,6 +1993,9 @@ enum SmartPlaybackSelector {
         var result = nonPromotional.isEmpty ? compatible : nonPromotional
         if cachedOnly {
             result = result.filter(\.isLikelyCached)
+        }
+        if preserveAddonStreams {
+            return result
         }
         let valid = result.filter { stream in
             let tags = StreamQualityTags.parse(stream: stream)
@@ -2224,13 +2242,15 @@ enum StreamPickerListBuilder {
         groups: [AddonStreamGroup],
         selectedAddonId: String?,
         includeDebrid: Bool,
-        cachedOnly: Bool = false
+        cachedOnly: Bool = false,
+        preserveAddonStreams: Bool = false
     ) -> [NuvioStream] {
         let source = sourceStreams(streams: streams, groups: groups, selectedAddonId: selectedAddonId)
         return SmartPlaybackSelector.playableStreams(
             from: source,
             includeDebrid: includeDebrid,
-            cachedOnly: cachedOnly
+            cachedOnly: cachedOnly,
+            preserveAddonStreams: preserveAddonStreams
         )
     }
 
@@ -2241,16 +2261,18 @@ enum StreamPickerListBuilder {
         selectedAddonId: String?,
         sortOption: StreamSortOption,
         includeDebrid: Bool,
-        cachedOnly: Bool = false
+        cachedOnly: Bool = false,
+        preserveAddonStreams: Bool = false
     ) -> [NuvioStream] {
         let playable = playableStreams(
             streams: streams,
             groups: groups,
             selectedAddonId: selectedAddonId,
             includeDebrid: includeDebrid,
-            cachedOnly: cachedOnly
+            cachedOnly: cachedOnly,
+            preserveAddonStreams: preserveAddonStreams
         )
-        return sorted(playable, by: sortOption)
+        return sorted(playable, by: sortOption, preserveAddonStreams: preserveAddonStreams)
     }
 
     /// Constant-size cache key. Repository revision captures every publication,
@@ -2260,26 +2282,36 @@ enum StreamPickerListBuilder {
         selectedAddonId: String?,
         sortOption: StreamSortOption,
         includeDebrid: Bool,
-        cachedOnly: Bool = false
+        cachedOnly: Bool = false,
+        preserveAddonStreams: Bool = false
     ) -> StreamPickerListCacheKey {
         StreamPickerListCacheKey(
             revision: revision,
             selectedAddonId: selectedAddonId,
             sortOption: sortOption,
             includeDebrid: includeDebrid,
-            cachedOnly: cachedOnly
+            cachedOnly: cachedOnly,
+            preserveAddonStreams: preserveAddonStreams
         )
     }
 
     /// Re-orders streams for the chosen sort matching Android TV's `DirectDebridStreamFilter.compareFacts`.
-    /// `.default` preserves the add-on's own order for valid streams while sinking unknown/0-res items.
+    /// `.default` preserves the add-on's own order for valid streams while sinking unknown/0-res items
+    /// unless `preserveAddonStreams` is true, which strictly preserves the add-on's exact output order.
     /// `.quality` (Android's QUALITY_DESC) orders:
     ///   1. Resolution DESC (2160 > 1440 > 1080 > 720 > 576 > 480 > 360 > 0)
     ///   2. Release Quality DESC (Remux > BluRay > Web-DL > WebRip > HDRip > HD-Rip > DVDRip > HDTV > Cam/TS/TC/SCR > UNKNOWN)
     ///   3. Size bytes DESC
     ///   4. Apple TV hardware acceleration (AV1 check for 4K)
     ///   5. Stable original offset
-    static func sorted(_ streams: [NuvioStream], by option: StreamSortOption) -> [NuvioStream] {
+    static func sorted(
+        _ streams: [NuvioStream],
+        by option: StreamSortOption,
+        preserveAddonStreams: Bool = false
+    ) -> [NuvioStream] {
+        if preserveAddonStreams && option == .default {
+            return streams
+        }
         switch option {
         case .default:
             return streams.enumerated().sorted {
@@ -2294,10 +2326,12 @@ enum StreamPickerListBuilder {
             return streams.enumerated().sorted {
                 let res0 = resolution(for: $0.element)
                 let res1 = resolution(for: $1.element)
-                let bad0 = SmartPlaybackSelector.isLowQualityOrTicketStream($0.element) || res0 == 0
-                let bad1 = SmartPlaybackSelector.isLowQualityOrTicketStream($1.element) || res1 == 0
-                if bad0 != bad1 {
-                    return !bad0 && bad1
+                if !preserveAddonStreams {
+                    let bad0 = SmartPlaybackSelector.isLowQualityOrTicketStream($0.element) || res0 == 0
+                    let bad1 = SmartPlaybackSelector.isLowQualityOrTicketStream($1.element) || res1 == 0
+                    if bad0 != bad1 {
+                        return !bad0 && bad1
+                    }
                 }
                 // Tier 1: Resolution DESC (Android DebridStreamSortKey.RESOLUTION)
                 if res0 != res1 {
@@ -2330,10 +2364,12 @@ enum StreamPickerListBuilder {
             return streams.enumerated().sorted {
                 let res0 = resolution(for: $0.element)
                 let res1 = resolution(for: $1.element)
-                let bad0 = SmartPlaybackSelector.isLowQualityOrTicketStream($0.element) || res0 == 0
-                let bad1 = SmartPlaybackSelector.isLowQualityOrTicketStream($1.element) || res1 == 0
-                if bad0 != bad1 {
-                    return !bad0 && bad1
+                if !preserveAddonStreams {
+                    let bad0 = SmartPlaybackSelector.isLowQualityOrTicketStream($0.element) || res0 == 0
+                    let bad1 = SmartPlaybackSelector.isLowQualityOrTicketStream($1.element) || res1 == 0
+                    if bad0 != bad1 {
+                        return !bad0 && bad1
+                    }
                 }
                 let s0 = sizeBytes(for: $0.element)
                 let s1 = sizeBytes(for: $1.element)
@@ -2346,10 +2382,12 @@ enum StreamPickerListBuilder {
             return streams.enumerated().sorted {
                 let res0 = resolution(for: $0.element)
                 let res1 = resolution(for: $1.element)
-                let bad0 = SmartPlaybackSelector.isLowQualityOrTicketStream($0.element) || res0 == 0
-                let bad1 = SmartPlaybackSelector.isLowQualityOrTicketStream($1.element) || res1 == 0
-                if bad0 != bad1 {
-                    return !bad0 && bad1
+                if !preserveAddonStreams {
+                    let bad0 = SmartPlaybackSelector.isLowQualityOrTicketStream($0.element) || res0 == 0
+                    let bad1 = SmartPlaybackSelector.isLowQualityOrTicketStream($1.element) || res1 == 0
+                    if bad0 != bad1 {
+                        return !bad0 && bad1
+                    }
                 }
                 let c = ($0.element.name ?? "").localizedCaseInsensitiveCompare($1.element.name ?? "")
                 if c != .orderedSame {
@@ -2408,6 +2446,7 @@ struct StreamPickerListCacheKey: Equatable {
     let sortOption: StreamSortOption
     let includeDebrid: Bool
     var cachedOnly: Bool = false
+    var preserveAddonStreams: Bool = false
 }
 
 private enum TvDetailsFocusSection: Hashable {
@@ -5533,6 +5572,7 @@ private struct TvStreamPickerOverlay: View {
     @AppStorage(SettingsKey.streamSortOption) private var sortOption: StreamSortOption = .quality
     @State private var showSortOptions = false
     @AppStorage(SettingsKey.cachedOnlyStreams) private var cachedOnly = false
+    @AppStorage(SettingsKey.preserveAddonStreamOrder) private var preserveAddonOrder = false
     /// Cached filter+sort result. Rebuilt only when derivation inputs change —
     /// never when focus moves between cards.
     @State private var displayedStreams: [NuvioStream] = []
@@ -5569,7 +5609,8 @@ private struct TvStreamPickerOverlay: View {
             selectedAddonId: selectedAddonId,
             sortOption: sortOption,
             includeDebrid: includeDebrid,
-            cachedOnly: cachedOnly
+            cachedOnly: cachedOnly,
+            preserveAddonStreams: preserveAddonOrder
         )
     }
 
@@ -5748,7 +5789,8 @@ private struct TvStreamPickerOverlay: View {
             selectedAddonId: selectedAddonId,
             sortOption: sortOption,
             includeDebrid: includeDebrid,
-            cachedOnly: cachedOnly
+            cachedOnly: cachedOnly,
+            preserveAddonStreams: preserveAddonOrder
         )
         displayedStreams = refreshedStreams
         displayedStreamsCacheKey = key

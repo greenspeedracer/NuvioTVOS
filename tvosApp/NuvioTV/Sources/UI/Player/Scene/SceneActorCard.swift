@@ -5,7 +5,7 @@ struct SceneActorCard: View {
     let isLiveRecognized: Bool
     let onSelect: () -> Void
     
-    @FocusState private var isFocused: Bool
+    @Environment(\.isFocused) private var isFocused: Bool
     
     init(actor: SceneRecognizedActor, isLiveRecognized: Bool = false, onSelect: @escaping () -> Void) {
         self.actor = actor
@@ -78,7 +78,6 @@ struct SceneActorCard: View {
             .shadow(color: isFocused ? Color.white.opacity(0.25) : Color.black.opacity(0.3), radius: isFocused ? 14 : 6, y: 3)
         }
         .buttonStyle(PosterCardButtonStyle())
-        .focused($isFocused)
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.05 : 1.0)
         .animation(.easeOut(duration: 0.14), value: isFocused)

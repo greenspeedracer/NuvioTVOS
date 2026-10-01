@@ -547,39 +547,58 @@ final class StreamsRepository: ObservableObject {
             )
         ]
 
-        var endpoints: [(name: String, subtitleURL: URL)] = builtIn.compactMap { item in
-            guard let subtitleURL = AddonTransportUrls.buildSubtitleURL(
+        var endpoints: [(name: String, subtitleURL: URL)] = []
+        for item in builtIn {
+            if let baseURL = AddonTransportUrls.buildResourceURL(
+                manifestURL: item.url,
+                resource: "subtitles",
+                type: subtitleType,
+                id: videoId
+            ) {
+                endpoints.append((item.name, baseURL))
+            }
+            if let extraURL = AddonTransportUrls.buildSubtitleURL(
                 manifestURL: item.url,
                 type: subtitleType,
                 id: videoId,
                 videoHash: videoHash,
                 videoSize: videoSize,
                 filename: filename
-            ) else { return nil }
-            return (item.name, subtitleURL)
+            ), !endpoints.contains(where: { $0.subtitleURL == extraURL }) {
+                endpoints.append((item.name, extraURL))
+            }
         }
 
         let enabledURLs = CinemetaCatalogRepository.configuredStreamAddonManifestURLs
         let manifests = await Self.loadManifestsConcurrently(urls: enabledURLs)
         for url in enabledURLs {
             guard let manifest = manifests[url],
-                  manifest.supportsResource("subtitles", type: subtitleType, id: videoId),
-                  let subtitleURL = AddonTransportUrls.buildSubtitleURL(
-                      manifestURL: url,
-                      type: subtitleType,
-                      id: videoId,
-                      videoHash: videoHash,
-                      videoSize: videoSize,
-                      filename: filename
-                  ) else {
+                  manifest.supportsResource("subtitles", type: subtitleType, id: videoId) else {
                 continue
             }
             let name = manifest.displayName ?? CinemetaCatalogRepository.streamAddonName(for: url)
-            endpoints.append((name, subtitleURL))
+            if let baseURL = AddonTransportUrls.buildResourceURL(
+                manifestURL: url,
+                resource: "subtitles",
+                type: subtitleType,
+                id: videoId
+            ) {
+                endpoints.append((name, baseURL))
+            }
+            if let extraURL = AddonTransportUrls.buildSubtitleURL(
+                manifestURL: url,
+                type: subtitleType,
+                id: videoId,
+                videoHash: videoHash,
+                videoSize: videoSize,
+                filename: filename
+            ), !endpoints.contains(where: { $0.subtitleURL == extraURL }) {
+                endpoints.append((name, extraURL))
+            }
         }
 
         var accumulated: [NuvioSubtitle] = []
-        var seen = Set<String>()
+        var indexByURL: [String: Int] = [:]
         await withTaskGroup(of: [NuvioSubtitle].self) { group in
             for endpoint in endpoints {
                 group.addTask {
@@ -587,8 +606,13 @@ final class StreamsRepository: ObservableObject {
                 }
             }
             for await batch in group {
-                for subtitle in batch where seen.insert(subtitle.url).inserted {
-                    accumulated.append(subtitle)
+                for subtitle in batch {
+                    if let index = indexByURL[subtitle.url] {
+                        accumulated[index] = subtitle
+                    } else {
+                        indexByURL[subtitle.url] = accumulated.count
+                        accumulated.append(subtitle)
+                    }
                 }
             }
         }
@@ -598,7 +622,7 @@ final class StreamsRepository: ObservableObject {
     private static func fetchSubtitles(from url: URL, source: String) async -> [NuvioSubtitle] {
         do {
             var request = URLRequest(url: url)
-            request.timeoutInterval = 15
+            request.timeoutInterval = 8
             request.setValue("Mozilla/5.0 (AppleTV; tvOS 18.0) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode else {

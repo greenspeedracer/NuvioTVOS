@@ -35,16 +35,11 @@ struct PlayerControls: View {
                 Spacer()
                 bottomControls
             }
+            .onExitCommand(perform: handleExit)
         }
-        .onExitCommand {
-            if viewModel.isScrubbing {
-                viewModel.cancelScrub()
-            } else {
-                viewModel.hideControls()
-            }
-        }
+        .onExitCommand(perform: handleExit)
         .onChange(of: requestedFocus) { _, target in
-            guard let target, viewModel.showControls else { return }
+            guard let target, viewModel.showControls, !viewModel.controlsAutoHideSuspended else { return }
             DispatchQueue.main.async {
                 if target == .timeline {
                     focusedControl = .timeline
@@ -71,6 +66,7 @@ struct PlayerControls: View {
             }
         }
         .onChange(of: viewModel.status) { _, status in
+            guard !viewModel.controlsAutoHideSuspended else { return }
             if status == .paused,
                viewModel.showControls,
                !viewModel.showPauseOverlay,
@@ -93,6 +89,7 @@ struct PlayerControls: View {
             }
         }
         .onChange(of: viewModel.showControls) { _, isVisible in
+            guard !viewModel.controlsAutoHideSuspended else { return }
             // Don't steal focus while the pause metadata sheet, loading, or post play owns the remote.
             if isVisible,
                isPlaybackStarted,
@@ -105,12 +102,11 @@ struct PlayerControls: View {
                     focusedControl = viewModel.isLiveStream ? (transportFocusOrder.first ?? .settings) : .timeline
                 }
             } else if !isVisible {
-                DispatchQueue.main.async {
-                    focusedControl = nil
-                }
+                focusedControl = nil
             }
         }
         .onChange(of: viewModel.isTimelineFocused) { _, isTimelineFocused in
+            guard !viewModel.controlsAutoHideSuspended else { return }
             if isTimelineFocused,
                viewModel.showControls,
                !viewModel.showPauseOverlay,
@@ -141,27 +137,44 @@ struct PlayerControls: View {
             if isFocused { focusedControl = nil }
         }
         .onChange(of: viewModel.isHoldingSeek) { _, isHolding in
+            guard !viewModel.controlsAutoHideSuspended else { return }
             if isHolding, viewModel.showControls {
                 DispatchQueue.main.async {
                     focusedControl = .timeline
                 }
             }
         }
-        .onChange(of: focusedControl) { _, newControl in
+        .onChange(of: focusedControl) { oldControl, newControl in
             // Keep this in lockstep with focus so hold-to-seek gating is correct
             // even before the next render cycle.
             let onTimeline = (newControl == .timeline)
             viewModel.setTimelineFocused(onTimeline)
-            viewModel.setControlsAutoHideSuspended(false)
             if onTimeline {
+                viewModel.setControlsAutoHideSuspended(false)
                 viewModel.scheduleControlsHide(after: 5.0)
+            } else if newControl == .subtitles || newControl == .audio {
+                // Focus is on a native Menu button or inside its presented menu.
+                // Suspend auto-hide so controls don't disappear while the user browses the menu.
+                viewModel.setControlsAutoHideSuspended(true)
             } else if newControl != nil {
+                viewModel.setControlsAutoHideSuspended(false)
                 viewModel.scheduleControlsHide(after: 10.0)
+            } else if let old = oldControl, old == .subtitles || old == .audio {
+                // Focus transitioned from a native Menu button into the presented menu items.
+                viewModel.setControlsAutoHideSuspended(true)
             }
         }
         .onDisappear {
             viewModel.setTimelineFocused(false)
             viewModel.setControlsAutoHideSuspended(false)
+        }
+    }
+
+    private func handleExit() {
+        if viewModel.isScrubbing {
+            viewModel.cancelScrub()
+        } else {
+            viewModel.hideControls()
         }
     }
 
@@ -228,21 +241,14 @@ struct PlayerControls: View {
     /// again so left/right still walks the full row.
     private func isTransportButtonFocusable(_ key: PlayerControlFocus) -> Bool {
         guard controlsInteractable else { return false }
-        if focusedControl == .timeline || focusedControl == nil {
+        if focusedControl == .timeline {
             return key == (transportFocusOrder.first ?? .settings)
         }
         return true
     }
 
     private func moveFocus(to control: PlayerControlFocus) {
-        // tvOS often applies spatial focus *before* `onMoveCommand` runs (and
-        // may also apply it after). Force the intended control now and re-assert
-        // on the next runloop so native geometry cannot keep a wrong target
-        // (e.g. episodes → settings skipping sources).
         focusedControl = control
-        DispatchQueue.main.async {
-            focusedControl = control
-        }
     }
 
     /// Navigate from the control that *received* the move — not `focusedControl`,
@@ -250,6 +256,7 @@ struct PlayerControls: View {
     private func handleMove(_ direction: MoveCommandDirection, from origin: PlayerControlFocus) {
         guard !isSkipSegmentFocused, !isNextEpisodeFocused else { return }
         guard controlsInteractable else { return }
+        guard focusedControl != nil, !viewModel.controlsAutoHideSuspended else { return }
 
         // If we are currently holding to seek, stay on timeline and extend hold
         if viewModel.isHoldingSeek {
@@ -286,8 +293,6 @@ struct PlayerControls: View {
             if origin == .timeline, !viewModel.isLiveStream {
                 if viewModel.isScrubbing {
                     viewModel.scrubJump(-Double(max(viewModel.seekStepSeconds * 4, 60)))
-                } else if viewModel.status == .playing {
-                    viewModel.handleMoveSeek(direction: .left)
                 }
                 moveFocus(to: .timeline)
             } else if let index = transportFocusOrder.firstIndex(of: origin),
@@ -300,8 +305,6 @@ struct PlayerControls: View {
             if origin == .timeline, !viewModel.isLiveStream {
                 if viewModel.isScrubbing {
                     viewModel.scrubJump(Double(max(viewModel.seekStepSeconds * 4, 60)))
-                } else if viewModel.status == .playing {
-                    viewModel.handleMoveSeek(direction: .right)
                 }
                 moveFocus(to: .timeline)
             } else if let index = transportFocusOrder.firstIndex(of: origin),
@@ -412,11 +415,48 @@ struct PlayerControls: View {
             }
 
             if canShowSubtitlePicker && playerShowSubtitles {
-                subtitleMenuButton
+                PlayerSubtitleMenuButton(
+                    noneOption: subtitleNoneOption,
+                    languageGroups: subtitleLanguageGroups,
+                    isFocused: focusedControl == .subtitles,
+                    onSelect: { selectSubtitlePickerOption($0) }
+                )
+                .equatable()
+                .focused($focusedControl, equals: .subtitles)
+                .disabled(!isTransportButtonFocusable(.subtitles))
+                .onMoveCommand { direction in
+                    handleMove(direction, from: .subtitles)
+                }
             }
 
             if canShowAudioPicker && playerShowAudio {
-                audioMenuButton
+                PlayerAudioMenuButton(
+                    orderedTracks: orderedAudioTracks,
+                    enhanceDialogueMode: viewModel.enhanceDialogueMode,
+                    isReduceLoudSoundsActive: viewModel.isReduceLoudSoundsActive,
+                    isFocused: focusedControl == .audio,
+                    onSelectTrack: { track in
+                        viewModel.selectAudio(track)
+                        viewModel.setControlsAutoHideSuspended(false)
+                        viewModel.scheduleControlsHide(after: 10.0)
+                    },
+                    onSetEnhanceDialogueMode: { mode in
+                        viewModel.setEnhanceDialogueMode(mode)
+                        viewModel.setControlsAutoHideSuspended(false)
+                        viewModel.scheduleControlsHide(after: 10.0)
+                    },
+                    onToggleReduceLoudSounds: {
+                        viewModel.toggleReduceLoudSounds()
+                        viewModel.setControlsAutoHideSuspended(false)
+                        viewModel.scheduleControlsHide(after: 10.0)
+                    }
+                )
+                .equatable()
+                .focused($focusedControl, equals: .audio)
+                .disabled(!isTransportButtonFocusable(.audio))
+                .onMoveCommand { direction in
+                    handleMove(direction, from: .audio)
+                }
             }
 
             glassIconButton(
@@ -468,6 +508,7 @@ struct PlayerControls: View {
         .focused($focusedControl, equals: focusKey)
         .disabled(!isTransportButtonFocusable(focusKey))
         .focusEffectDisabledIfAvailable()
+        .onExitCommand(perform: handleExit)
         .onMoveCommand { direction in
             // Route from this button's key so a native spatial jump across the
             // row Spacer cannot make us advance from the wrong origin (which
@@ -513,28 +554,160 @@ struct PlayerControls: View {
         }
     }
 
-    private var subtitleMenuButton: some View {
-        let isFocused = focusedControl == .subtitles
+    private func selectSubtitlePickerOption(_ option: SubtitlePanelOption) {
+        switch option.kind {
+        case .track(let track):
+            viewModel.selectSubtitle(track)
+        case .external(let subtitle):
+            viewModel.selectExternalSubtitle(subtitle)
+        }
+        viewModel.setControlsAutoHideSuspended(false)
+        viewModel.scheduleControlsHide(after: 10.0)
+    }
 
-        return Menu {
-            if let none = subtitleNoneOption {
+    private var orderedAudioTracks: [AudioTrack] {
+        let preferred = SubtitleLanguagePreferences.preferredAudioLanguage(meta: viewModel.activeMeta)
+        return viewModel.audioTracks.enumerated().sorted { lhs, rhs in
+            let lhsPreferred = preferred.map { audioTrack(lhs.element, matches: $0) } ?? false
+            let rhsPreferred = preferred.map { audioTrack(rhs.element, matches: $0) } ?? false
+            if lhsPreferred != rhsPreferred { return lhsPreferred }
+
+            let lhsLanguage = lhs.element.languageName.isEmpty ? lhs.element.name : lhs.element.languageName
+            let rhsLanguage = rhs.element.languageName.isEmpty ? rhs.element.name : rhs.element.languageName
+            let comparison = lhsLanguage.localizedCaseInsensitiveCompare(rhsLanguage)
+            if comparison != .orderedSame { return comparison == .orderedAscending }
+            return lhs.offset < rhs.offset
+        }
+        .map(\.element)
+    }
+
+    private func audioTrack(_ track: AudioTrack, matches language: String) -> Bool {
+        SubtitleLanguagePreferences.matches(track.language, target: language) ||
+        SubtitleLanguagePreferences.matches(track.languageName, target: language) ||
+        SubtitleLanguagePreferences.matches(track.name, target: language)
+    }
+
+    // MARK: - Timeline
+
+    private var isTimelineFocused: Bool {
+        focusedControl == .timeline || viewModel.isHoldingSeek
+    }
+
+    @ViewBuilder
+    private var timelineBar: some View {
+        if viewModel.isLiveStream {
+            liveStatusBar
+        } else {
+            finiteTimelineBar
+        }
+    }
+
+    private var liveStatusBar: some View {
+        HStack(spacing: 11) {
+            Circle()
+                .fill(Color.red)
+                .frame(width: 12, height: 12)
+                .shadow(color: .red.opacity(0.65), radius: 7)
+            Text(L10n.string("player_live", fallback: "LIVE"))
+                .font(.system(size: 22, weight: .bold))
+                .foregroundColor(.white.opacity(0.9))
+            Spacer()
+        }
+        .frame(height: 44)
+        .shadow(color: .black.opacity(0.82), radius: 16, x: 0, y: 7)
+    }
+
+    private var finiteTimelineBar: some View {
+        PlayerTimelineBar(
+            clock: viewModel.clock,
+            isTimelineFocused: isTimelineFocused,
+            isScrubbing: viewModel.isScrubbing,
+            isHoldingSeek: viewModel.isHoldingSeek,
+            pendingSeekDelta: viewModel.pendingSeekDelta,
+            speedMultiplier: viewModel.seekSpeedMultiplier,
+            seekStepSeconds: viewModel.seekStepSeconds
+        )
+        .overlay(alignment: .top) {
+            // Keep the geometry mounted even while a still is unavailable so
+            // its first frame is positioned directly over the target. The
+            // overlay never participates in controls layout or hit testing.
+            SeekPreviewTimelineCard(
+                clock: viewModel.clock,
+                isScrubbing: viewModel.isScrubbing,
+                isHoldingSeek: viewModel.isHoldingSeek,
+                pendingSeekDelta: viewModel.pendingSeekDelta,
+                image: ((viewModel.isHoldingSeek || viewModel.isScrubbing) && viewModel.isSeekPreviewEnabled) ? viewModel.scrubThumbnail : nil,
+                naturalSize: viewModel.videoNaturalSize,
+                speedMultiplier: viewModel.seekSpeedMultiplier,
+                wheelEngaged: viewModel.wheelEngaged
+            )
+            .offset(y: -(270 + 16))
+            .allowsHitTesting(false)
+            .transaction { transaction in transaction.animation = nil }
+        }
+        .focusable(
+            (viewModel.showControls || viewModel.isScrubbing)
+                && !viewModel.showSettingsPanel
+                && !viewModel.showPauseOverlay
+                && !viewModel.showScenePanel
+        )
+        .focused($focusedControl, equals: .timeline)
+        .focusEffectDisabledIfAvailable()
+        .onExitCommand(perform: handleExit)
+        .onTapGesture {
+            if viewModel.isScrubbing {
+                viewModel.commitScrub()
+            } else {
+                viewModel.togglePlayPause()
+            }
+        }
+        .onMoveCommand { direction in
+            // Timeline owns move while focused so hold-to-seek cannot promote
+            // focus onto the transport buttons. Always route from `.timeline`
+            // even if spatial focus already hopped to a transport button.
+            handleMove(direction, from: .timeline)
+        }
+        .shadow(color: .black.opacity(0.82), radius: 16, x: 0, y: 7)
+        .animation(.easeOut(duration: 0.14), value: focusedControl)
+        .animation(.easeOut(duration: 0.12), value: viewModel.pendingSeekDelta)
+        .animation(.easeOut(duration: 0.16), value: viewModel.isScrubbing)
+    }
+}
+
+// MARK: - Native Subtitle & Audio Menu Buttons (Isolated EquatableViews)
+
+private struct PlayerSubtitleMenuButton: View, Equatable {
+    let noneOption: SubtitlePanelOption?
+    let languageGroups: [SubtitleLanguageGroup]
+    let isFocused: Bool
+    let onSelect: (SubtitlePanelOption) -> Void
+
+    static func == (lhs: PlayerSubtitleMenuButton, rhs: PlayerSubtitleMenuButton) -> Bool {
+        lhs.isFocused == rhs.isFocused
+            && lhs.noneOption == rhs.noneOption
+            && lhs.languageGroups == rhs.languageGroups
+    }
+
+    var body: some View {
+        Menu {
+            if let none = noneOption {
                 Button {
-                    selectSubtitlePickerOption(none)
+                    onSelect(none)
                 } label: {
-                        subtitleMenuItem(
-                            title: L10n.string("action_none", fallback: "None"),
-                            isSelected: none.isSelected
-                        )
+                    subtitleMenuItem(
+                        title: L10n.string("action_none", fallback: "None"),
+                        isSelected: none.isSelected
+                    )
                 }
             }
 
-            ForEach(subtitleLanguageGroups) { group in
+            ForEach(languageGroups) { group in
                 Menu {
                     if !group.builtInOptions.isEmpty {
                         Section(L10n.string("tvos_settings_option_built_in", fallback: "Built-In")) {
                             ForEach(group.builtInOptions) { option in
                                 Button {
-                                    selectSubtitlePickerOption(option)
+                                    onSelect(option)
                                 } label: {
                                     subtitleMenuItem(
                                         title: builtInMenuTitle(option: option),
@@ -549,7 +722,7 @@ struct PlayerControls: View {
                         Section(L10n.string("player_external_subtitles", fallback: "External Subtitles")) {
                             ForEach(group.externalOptions) { option in
                                 Button {
-                                    selectSubtitlePickerOption(option)
+                                    onSelect(option)
                                 } label: {
                                     subtitleMenuItem(
                                         title: groupedExternalMenuTitle(option: option),
@@ -581,11 +754,7 @@ struct PlayerControls: View {
                 .contentShape(Circle())
         }
         .menuStyle(.borderlessButton)
-        .focused($focusedControl, equals: .subtitles)
         .focusEffectDisabledIfAvailable()
-        .onMoveCommand { direction in
-            handleMove(direction, from: .subtitles)
-        }
         .scaleEffect(isFocused ? 1.06 : 1.0)
         .animation(.easeOut(duration: 0.14), value: isFocused)
         .id("subtitles_button")
@@ -593,11 +762,16 @@ struct PlayerControls: View {
 
     private func sanitizeSubtitleLabel(_ raw: String?) -> String? {
         guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
-        // Filter out hashes, OpenSubtitles v3 file tokens (e.g. v3_e1_...), UUIDs, or long alphanumeric keys
-        if raw.hasPrefix("v3_") || raw.hasPrefix("sub_") || raw.contains("AfAB") || raw.count > 25 {
+        if raw.hasPrefix("v3_") || raw.hasPrefix("sub_") || raw.hasPrefix("sub-") || raw.contains("AfAB") {
             return nil
         }
-        if raw.range(of: #"[a-zA-Z0-9_-]{15,}"#, options: .regularExpression) != nil {
+        if UUID(uuidString: raw) != nil {
+            return nil
+        }
+        if raw.range(of: #"^[0-9a-fA-F]{24,}$"#, options: .regularExpression) != nil {
+            return nil
+        }
+        if raw.range(of: #"^\d{5,}$"#, options: .regularExpression) != nil {
             return nil
         }
         let stripped = raw.replacingOccurrences(
@@ -639,45 +813,60 @@ struct PlayerControls: View {
             }
         }
     }
+}
 
-    private var audioMenuButton: some View {
-        let isFocused = focusedControl == .audio
+private struct PlayerAudioMenuButton: View, Equatable {
+    let orderedTracks: [AudioTrack]
+    let enhanceDialogueMode: EnhanceDialogueMode
+    let isReduceLoudSoundsActive: Bool
+    let isFocused: Bool
+    let onSelectTrack: (AudioTrack) -> Void
+    let onSetEnhanceDialogueMode: (EnhanceDialogueMode) -> Void
+    let onToggleReduceLoudSounds: () -> Void
 
-        return Menu {
+    static func == (lhs: PlayerAudioMenuButton, rhs: PlayerAudioMenuButton) -> Bool {
+        lhs.isFocused == rhs.isFocused
+            && lhs.enhanceDialogueMode == rhs.enhanceDialogueMode
+            && lhs.isReduceLoudSoundsActive == rhs.isReduceLoudSoundsActive
+            && lhs.orderedTracks == rhs.orderedTracks
+    }
+
+    var body: some View {
+        Menu {
             Section(L10n.string("player_audio_adjustments", fallback: "Audio Adjustments")) {
                 Menu {
                     ForEach(EnhanceDialogueMode.allCases) { mode in
                         Button {
-                            viewModel.setEnhanceDialogueMode(mode)
+                            onSetEnhanceDialogueMode(mode)
                         } label: {
                             audioMenuItem(
                                 title: mode.title,
-                                isSelected: viewModel.enhanceDialogueMode == mode
+                                isSelected: enhanceDialogueMode == mode
                             )
                         }
                     }
                 } label: {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(L10n.string("player_enhance_dialogue", fallback: "Enhance Dialogue"))
-                        Text(viewModel.enhanceDialogueMode.title)
+                        Text(enhanceDialogueMode.title)
                     }
                 }
 
                 Button {
-                    viewModel.toggleReduceLoudSounds()
+                    onToggleReduceLoudSounds()
                 } label: {
                     audioMenuItem(
                         title: L10n.string("player_reduce_loud_sounds", fallback: "Reduce Loud Sounds"),
-                        isSelected: viewModel.isReduceLoudSoundsActive
+                        isSelected: isReduceLoudSoundsActive
                     )
                 }
             }
 
-            if !viewModel.audioTracks.isEmpty {
+            if !orderedTracks.isEmpty {
                 Section(L10n.string("player_audio_tracks", fallback: "Audio Tracks")) {
-                    ForEach(orderedAudioTracks) { track in
+                    ForEach(orderedTracks) { track in
                         Button {
-                            viewModel.selectAudio(track)
+                            onSelectTrack(track)
                         } label: {
                             audioMenuItem(
                                 title: audioMenuTrackTitle(for: track),
@@ -699,11 +888,7 @@ struct PlayerControls: View {
                 .contentShape(Circle())
         }
         .menuStyle(.borderlessButton)
-        .focused($focusedControl, equals: .audio)
         .focusEffectDisabledIfAvailable()
-        .onMoveCommand { direction in
-            handleMove(direction, from: .audio)
-        }
         .scaleEffect(isFocused ? 1.06 : 1.0)
         .animation(.easeOut(duration: 0.14), value: isFocused)
         .id("audio_button")
@@ -773,122 +958,6 @@ struct PlayerControls: View {
         }
 
         return rawName
-    }
-
-    private var orderedAudioTracks: [AudioTrack] {
-        let preferred = SubtitleLanguagePreferences.preferredAudioLanguage(meta: viewModel.activeMeta)
-        return viewModel.audioTracks.enumerated().sorted { lhs, rhs in
-            let lhsPreferred = preferred.map { audioTrack(lhs.element, matches: $0) } ?? false
-            let rhsPreferred = preferred.map { audioTrack(rhs.element, matches: $0) } ?? false
-            if lhsPreferred != rhsPreferred { return lhsPreferred }
-
-            let lhsLanguage = lhs.element.languageName.isEmpty ? lhs.element.name : lhs.element.languageName
-            let rhsLanguage = rhs.element.languageName.isEmpty ? rhs.element.name : rhs.element.languageName
-            let comparison = lhsLanguage.localizedCaseInsensitiveCompare(rhsLanguage)
-            if comparison != .orderedSame { return comparison == .orderedAscending }
-            return lhs.offset < rhs.offset
-        }
-        .map(\.element)
-    }
-
-    private func audioTrack(_ track: AudioTrack, matches language: String) -> Bool {
-        SubtitleLanguagePreferences.matches(track.language, target: language) ||
-        SubtitleLanguagePreferences.matches(track.languageName, target: language) ||
-        SubtitleLanguagePreferences.matches(track.name, target: language)
-    }
-
-    private func selectSubtitlePickerOption(_ option: SubtitlePanelOption) {
-        switch option.kind {
-        case .track(let track):
-            viewModel.selectSubtitle(track)
-        case .external(let subtitle):
-            viewModel.selectExternalSubtitle(subtitle)
-        }
-    }
-
-    // MARK: - Timeline
-
-    private var isTimelineFocused: Bool {
-        focusedControl == .timeline || viewModel.isHoldingSeek
-    }
-
-    @ViewBuilder
-    private var timelineBar: some View {
-        if viewModel.isLiveStream {
-            liveStatusBar
-        } else {
-            finiteTimelineBar
-        }
-    }
-
-    private var liveStatusBar: some View {
-        HStack(spacing: 11) {
-            Circle()
-                .fill(Color.red)
-                .frame(width: 12, height: 12)
-                .shadow(color: .red.opacity(0.65), radius: 7)
-            Text(L10n.string("player_live", fallback: "LIVE"))
-                .font(.system(size: 22, weight: .bold))
-                .foregroundColor(.white.opacity(0.9))
-            Spacer()
-        }
-        .frame(height: 44)
-        .shadow(color: .black.opacity(0.82), radius: 16, x: 0, y: 7)
-    }
-
-    private var finiteTimelineBar: some View {
-        PlayerTimelineBar(
-            clock: viewModel.clock,
-            isTimelineFocused: isTimelineFocused,
-            isScrubbing: viewModel.isScrubbing,
-            isHoldingSeek: viewModel.isHoldingSeek,
-            pendingSeekDelta: viewModel.pendingSeekDelta,
-            speedMultiplier: viewModel.seekSpeedMultiplier,
-            seekStepSeconds: viewModel.seekStepSeconds
-        )
-        .overlay(alignment: .top) {
-            // Keep the geometry mounted even while a still is unavailable so
-            // its first frame is positioned directly over the target. The
-            // overlay never participates in controls layout or hit testing.
-            SeekPreviewTimelineCard(
-                clock: viewModel.clock,
-                isScrubbing: viewModel.isScrubbing,
-                isHoldingSeek: viewModel.isHoldingSeek,
-                pendingSeekDelta: viewModel.pendingSeekDelta,
-                image: ((viewModel.isHoldingSeek || viewModel.isScrubbing) && viewModel.isSeekPreviewEnabled) ? viewModel.scrubThumbnail : nil,
-                naturalSize: viewModel.videoNaturalSize,
-                speedMultiplier: viewModel.seekSpeedMultiplier,
-                wheelEngaged: viewModel.wheelEngaged
-            )
-            .offset(y: -(270 + 16))
-            .allowsHitTesting(false)
-            .transaction { transaction in transaction.animation = nil }
-        }
-        .focusable(
-            (viewModel.showControls || viewModel.isScrubbing)
-                && !viewModel.showSettingsPanel
-                && !viewModel.showPauseOverlay
-                && !viewModel.showScenePanel
-        )
-        .focused($focusedControl, equals: .timeline)
-        .focusEffectDisabledIfAvailable()
-        .onTapGesture {
-            if viewModel.isScrubbing {
-                viewModel.commitScrub()
-            } else {
-                viewModel.togglePlayPause()
-            }
-        }
-        .onMoveCommand { direction in
-            // Timeline owns move while focused so hold-to-seek cannot promote
-            // focus onto the transport buttons. Always route from `.timeline`
-            // even if spatial focus already hopped to a transport button.
-            handleMove(direction, from: .timeline)
-        }
-        .shadow(color: .black.opacity(0.82), radius: 16, x: 0, y: 7)
-        .animation(.easeOut(duration: 0.14), value: focusedControl)
-        .animation(.easeOut(duration: 0.12), value: viewModel.pendingSeekDelta)
-        .animation(.easeOut(duration: 0.16), value: viewModel.isScrubbing)
     }
 }
 
@@ -1345,8 +1414,8 @@ private struct PlayerGlassCircleButtonBackground: ViewModifier {
 
 /// One row of the panel's Subtitles column — an mpv track (embedded or
 /// already-loaded external) or an add-on subtitle that loads on demand.
-private struct SubtitlePanelOption: Identifiable {
-    enum Kind {
+private struct SubtitlePanelOption: Identifiable, Equatable {
+    enum Kind: Equatable {
         case track(SubtitleTrack)
         case external(NuvioSubtitle)
     }
@@ -1360,7 +1429,7 @@ private struct SubtitlePanelOption: Identifiable {
     let isSelected: Bool
 }
 
-private struct SubtitleLanguageGroup: Identifiable {
+private struct SubtitleLanguageGroup: Identifiable, Equatable {
     var id: String { language }
     let language: String
     let options: [SubtitlePanelOption]
@@ -1795,7 +1864,7 @@ struct PlayerSettingsPanel: View {
                         Text(detail)
                             .font(.system(size: 20, weight: .medium))
                             .foregroundColor(isFocused ? .black.opacity(0.52) : .white.opacity(0.5))
-                            .lineLimit(1)
+                            .lineLimit(2)
                     }
                 }
                 Spacer(minLength: 8)

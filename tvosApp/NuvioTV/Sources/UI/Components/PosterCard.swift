@@ -1177,17 +1177,21 @@ private struct TrailerPreviewPlayer: View {
 
     private func setupTimeObserver() {
         cleanupTimeObserver()
+        let metaId = meta.id
+        let source = currentPlaybackSource
         timeObserverToken = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
             queue: .main
-        ) { [weak player] time in
+        ) { time in
             let seconds = time.seconds
             if seconds > 0.1 && !seconds.isNaN && !seconds.isInfinite {
-                TrailerPlaybackHandoff.shared.recordHandoff(
-                    metaId: meta.id,
-                    time: seconds,
-                    playbackSource: currentPlaybackSource
-                )
+                MainActor.assumeIsolated {
+                    TrailerPlaybackHandoff.shared.recordHandoff(
+                        metaId: metaId,
+                        time: seconds,
+                        playbackSource: source
+                    )
+                }
             }
         }
     }

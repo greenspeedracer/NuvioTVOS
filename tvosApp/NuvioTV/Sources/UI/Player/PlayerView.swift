@@ -94,7 +94,8 @@ struct PlayerView: View {
             PlaybackIdlePolicy.preventsIdle(
                 status: viewModel.status,
                 isSwitchingSource: viewModel.isSwitchingSource,
-                isReloadingStream: viewModel.isReloadingStream
+                isReloadingStream: viewModel.isReloadingStream,
+                isAdvancingEpisode: viewModel.isAdvancingEpisode
             )
         )
     }

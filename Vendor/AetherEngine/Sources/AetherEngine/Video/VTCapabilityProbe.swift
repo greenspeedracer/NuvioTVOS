@@ -7,20 +7,6 @@ import AetherLibavutil
 /// Cached VTIsHardwareDecodeSupported probe after VTRegisterSupplementalVideoDecoderIfAvailable. Cached on first access; registration is idempotent.
 enum VTCapabilityProbe {
 
-    /// A value snapshot of the codec fields needed by the VideoToolbox probe.
-    ///
-    /// `AetherEngine` is main-actor isolated, but creating a throwaway
-    /// `VTDecompressionSession` can enter the system decoder service and block
-    /// for hundreds of milliseconds on a cold 4K device. Copy the small C
-    /// record before hopping off the actor so the expensive probe never needs
-    /// to capture an `AVCodecParameters` pointer across the concurrency hop.
-    struct HardwareDecodeSnapshot: Sendable {
-        let codecIDRawValue: Int32
-        let width: Int32
-        let height: Int32
-        let extradata: [UInt8]
-    }
-
     /// True only when AVPlayer's HLS-fMP4 pipeline can HW-decode AV1. Apple's dav1d (macOS 14+/iOS 17+) is reachable via direct file playback but NOT via AVPlayer HLS in practice (verified 2026-05-14 on M1 macOS 26.4): VTIsHardwareDecodeSupported returns false, AVURLAsset.isPlayable returns false. False routes to SoftwarePlaybackHost/dav1d.
     static let av1Available: Bool = {
         if #available(tvOS 26.2, iOS 26.2, macOS 16.0, visionOS 26.2, *) {
@@ -67,69 +53,56 @@ enum VTCapabilityProbe {
     /// wrongly forces the software path. Not the question `SoftwarePlaybackHost` asks, see
     /// `HardwareDecodeVerdict`.
     static func canHardwareDecode(codecpar: UnsafePointer<AVCodecParameters>) -> Bool {
-        canHardwareDecode(snapshot: snapshot(codecpar: codecpar))
-    }
-
-    /// Main-actor-safe input for callers that perform the actual probe from a
-    /// detached task.
-    static func snapshot(codecpar: UnsafePointer<AVCodecParameters>) -> HardwareDecodeSnapshot {
-        let extraSize = max(0, Int(codecpar.pointee.extradata_size))
-        let extra: [UInt8]
-        if extraSize > 0, let extradata = codecpar.pointee.extradata {
-            extra = Array(UnsafeBufferPointer(start: extradata, count: extraSize))
-        } else {
-            extra = []
+        if codecpar.pointee.codec_id == AV_CODEC_ID_AV1 {
+            let av1C = codecpar.pointee.extradata.map {
+                Array(UnsafeBufferPointer(start: $0, count: Int(max(0, codecpar.pointee.extradata_size))))
+            }
+            let fits = VideoRoutingPolicy.av1FitsHardwareDecoder(
+                av1C: av1C, codecparProfile: codecpar.pointee.profile)
+            EngineLog.emit(
+                "[VTProbe] canHardwareDecode codec=av01 profile=\(codecpar.pointee.profile) -> \(fits)",
+                category: .engine
+            )
+            return fits
         }
-        return HardwareDecodeSnapshot(
-            codecIDRawValue: Int32(codecpar.pointee.codec_id.rawValue),
-            width: codecpar.pointee.width,
-            height: codecpar.pointee.height,
-            extradata: extra
-        )
-    }
-
-    static func canHardwareDecode(snapshot: HardwareDecodeSnapshot) -> Bool {
-        hardwareDecodeVerdict(snapshot: snapshot).keepsNativeRoute
+        return hardwareDecodeVerdict(codecpar: codecpar).keepsNativeRoute
     }
 
     /// The throwaway session is invalidated immediately; the whole probe costs well under a millisecond and
     /// runs once per consult.
     static func hardwareDecodeVerdict(codecpar: UnsafePointer<AVCodecParameters>) -> HardwareDecodeVerdict {
-        hardwareDecodeVerdict(snapshot: snapshot(codecpar: codecpar))
-    }
-
-    static func hardwareDecodeVerdict(snapshot: HardwareDecodeSnapshot) -> HardwareDecodeVerdict {
-        let codecIDRawValue = snapshot.codecIDRawValue
+        let codecID = codecpar.pointee.codec_id
         let vtCodecType: CMVideoCodecType
         let atomKey: String
-        switch codecIDRawValue {
-        case Int32(AV_CODEC_ID_H264.rawValue): vtCodecType = kCMVideoCodecType_H264; atomKey = "avcC"
-        case Int32(AV_CODEC_ID_HEVC.rawValue): vtCodecType = kCMVideoCodecType_HEVC; atomKey = "hvcC"
+        switch codecID {
+        case AV_CODEC_ID_H264: vtCodecType = kCMVideoCodecType_H264; atomKey = "avcC"
+        case AV_CODEC_ID_HEVC: vtCodecType = kCMVideoCodecType_HEVC; atomKey = "hvcC"
         default: return .unclassifiable(reason: "codec outside the H.264 / HEVC gate")
         }
 
         func unclassifiable(_ reason: String) -> HardwareDecodeVerdict {
             EngineLog.emit(
-                "[VTProbe] hardwareDecodeVerdict codec=\(codecIDRawValue) "
-                + "\(snapshot.width)x\(snapshot.height) -> unclassifiable (\(reason))",
+                "[VTProbe] hardwareDecodeVerdict codec=\(codecID.rawValue) "
+                + "\(codecpar.pointee.width)x\(codecpar.pointee.height) -> unclassifiable (\(reason))",
                 category: .engine
             )
             return .unclassifiable(reason: reason)
         }
 
-        guard !snapshot.extradata.isEmpty else {
+        guard let extradata = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0 else {
             return unclassifiable("no extradata")
         }
         // avcC / hvcC config records start with a configurationVersion byte (0x01). Annex-B extradata starts
         // with a 0x00 00 (00) 01 start code and can't seed the atom-based format description.
-        if snapshot.extradata[0] == 0x00 { return unclassifiable("Annex-B extradata") }
+        if extradata.pointee == 0x00 { return unclassifiable("Annex-B extradata") }
 
-        let configBytes = snapshot.extradata
+        let configBytes = Array(UnsafeBufferPointer(
+            start: extradata, count: Int(codecpar.pointee.extradata_size)))
         // In-band parameter sets (`hev1` / `avc1` with an empty config record, what
         // `MP4Box ...:xps_inband` and the common Dolby-Vision MP4 recipes write): the record parses, so
         // CMVideoFormatDescriptionCreate succeeds, but VideoToolbox has no SPS to configure a decoder and
         // fails the session with -4. That says nothing about hardware support (AetherPlayer#2).
-        guard configRecordCarriesParameterSets(configBytes, codecIDRawValue: codecIDRawValue) else {
+        guard configRecordCarriesParameterSets(configBytes, codecID: codecID) else {
             return unclassifiable("in-band parameter sets")
         }
 
@@ -142,8 +115,8 @@ enum VTCapabilityProbe {
         let fdStatus = CMVideoFormatDescriptionCreate(
             allocator: kCFAllocatorDefault,
             codecType: vtCodecType,
-            width: snapshot.width,
-            height: snapshot.height,
+            width: codecpar.pointee.width,
+            height: codecpar.pointee.height,
             extensions: extensions,
             formatDescriptionOut: &formatDescription
         )
@@ -168,8 +141,8 @@ enum VTCapabilityProbe {
         if let session { VTDecompressionSessionInvalidate(session) }
         let ok = status == noErr && session != nil
         EngineLog.emit(
-            "[VTProbe] canHardwareDecode codec=\(codecIDRawValue) "
-            + "\(snapshot.width)x\(snapshot.height) -> \(ok) (status=\(status))",
+            "[VTProbe] canHardwareDecode codec=\(codecID.rawValue) "
+            + "\(codecpar.pointee.width)x\(codecpar.pointee.height) -> \(ok) (status=\(status))",
             category: .engine
         )
         return ok ? .supported : .unsupported
@@ -181,15 +154,11 @@ enum VTCapabilityProbe {
     /// hvcC: `numOfArrays` is the 23rd byte. avcC: `numOfSequenceParameterSets` is the low 5 bits of the
     /// 6th. Other codecs never reach this gate.
     static func configRecordCarriesParameterSets(_ record: [UInt8], codecID: AVCodecID) -> Bool {
-        configRecordCarriesParameterSets(record, codecIDRawValue: Int32(codecID.rawValue))
-    }
-
-    private static func configRecordCarriesParameterSets(_ record: [UInt8], codecIDRawValue: Int32) -> Bool {
-        switch codecIDRawValue {
-        case Int32(AV_CODEC_ID_HEVC.rawValue):
+        switch codecID {
+        case AV_CODEC_ID_HEVC:
             guard record.count >= 23 else { return false }
             return record[22] > 0
-        case Int32(AV_CODEC_ID_H264.rawValue):
+        case AV_CODEC_ID_H264:
             guard record.count >= 6 else { return false }
             return (record[5] & 0x1F) > 0
         default:

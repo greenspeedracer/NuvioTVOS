@@ -2403,6 +2403,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     private var coarseThumbnailUnavailable = false
     private var coarseThumbnailComplete = false
     private var isRemoteStream = false
+    private var isLocalPlaybackCache = false
 
     // MARK: PlaybackEngineControlling surface
 
@@ -2466,30 +2467,34 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
 
     /// True when the active Aether session can provide a scrub still. Native
-    /// cache-backed stills stay the first choice; software video uses one
-    /// retained independent FrameExtractor.
+    /// cache-backed stills stay the first choice; software video and local/hybrid-cached
+    /// sessions use one retained independent FrameExtractor.
     var supportsScrubThumbnails: Bool {
-        engine.supportsCacheBackedStills || (!isRemoteStream && engine.playbackBackend == .software)
+        engine.supportsCacheBackedStills
+            || isLocalPlaybackCache
+            || (!isRemoteStream && engine.playbackBackend == .software)
+    }
+
+    private func getOrCreateFrameExtractor() -> FrameExtractor? {
+        if let softwareFrameExtractor {
+            return softwareFrameExtractor
+        }
+        guard let created = engine.makeFrameExtractor() else {
+            print("[Aether] Scrub thumbnail fallback extractor unavailable")
+            return nil
+        }
+        softwareFrameExtractor = created
+        didLogSoftwareThumbnailResult = false
+        print("[Aether] Created scrub thumbnail fallback extractor")
+        return created
     }
 
     /// Lazily opens the retained extractor so the first visible scrub
     /// request does not pay the demuxer-open cost.
     func prepareScrubThumbnailExtractor() {
-        guard !isRemoteStream, engine.playbackBackend == .software else { return }
+        guard isLocalPlaybackCache || (!isRemoteStream && engine.playbackBackend == .software) else { return }
         guard !didPrewarmSoftwareFrameExtractor else { return }
-        let extractor: FrameExtractor
-        if let softwareFrameExtractor {
-            extractor = softwareFrameExtractor
-        } else {
-            guard let created = engine.makeFrameExtractor() else {
-                print("[Aether] Scrub thumbnail prewarm unavailable")
-                return
-            }
-            softwareFrameExtractor = created
-            extractor = created
-            didLogSoftwareThumbnailResult = false
-            print("[Aether] Created scrub thumbnail extractor for prewarm")
-        }
+        guard let extractor = getOrCreateFrameExtractor() else { return }
         didPrewarmSoftwareFrameExtractor = true
         let generation = loadGeneration
         Task { @MainActor [weak self] in
@@ -2523,27 +2528,15 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                 )
                 return image
             }
-            // Cache-backed playback handles stills from SegmentCache. If not resident yet,
-            // return nil immediately; never open a secondary remote demuxer.
-            return nil
+            // If cache-backed still wasn't resident in SegmentCache, allow fallback to
+            // FrameExtractor when running against the local hybrid disk cache or local files.
+            guard isLocalPlaybackCache || !isRemoteStream else { return nil }
         }
 
-        // Only allow software frame extractor on local/non-remote streams using software decoding.
-        guard !isRemoteStream, engine.playbackBackend == .software else { return nil }
+        // Allow frame extractor on local/cached streams or software decoding.
+        guard isLocalPlaybackCache || (!isRemoteStream && engine.playbackBackend == .software) else { return nil }
         guard loadGeneration == generation else { return nil }
-        let extractor: FrameExtractor
-        if let softwareFrameExtractor {
-            extractor = softwareFrameExtractor
-        } else {
-            guard let created = engine.makeFrameExtractor() else {
-                print("[Aether] Scrub thumbnail fallback extractor unavailable")
-                return nil
-            }
-            softwareFrameExtractor = created
-            extractor = created
-            didLogSoftwareThumbnailResult = false
-            print("[Aether] Created scrub thumbnail fallback extractor")
-        }
+        guard let extractor = getOrCreateFrameExtractor() else { return nil }
         let image: CGImage?
         if precise {
             image = await extractor.preciseThumbnail(at: seconds, maxWidth: maxWidth)
@@ -2650,12 +2643,12 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
 
     func advanceCoarseThumbnailIfNeeded(duration: Double) {
-        guard !isRemoteStream else { return }
+        guard !isRemoteStream || isLocalPlaybackCache else { return }
         guard duration >= HybridSeekThumbnailPolicy.coarseIntervalSeconds,
               Date() >= coarseResumeNotBefore,
               !coarseThumbnailUnavailable,
               coarseThumbnailTask == nil,
-              engine.playbackBackend == .software else { return }
+              (engine.playbackBackend == .software || isLocalPlaybackCache) else { return }
         let samples = HybridSeekThumbnailPolicy.coarseSampleTimes(duration: duration)
         guard !samples.isEmpty else { return }
         if coarseSampleTimes.count != samples.count ||
@@ -2695,17 +2688,10 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                   self.coarseThumbnailTaskToken == token,
                   self.loadGeneration == generation else { return }
             let seconds = self.coarseSampleTimes[cursor]
-            let extractor: FrameExtractor
-            if let existing = self.softwareFrameExtractor {
-                extractor = existing
-            } else {
-                guard let created = self.engine.makeFrameExtractor() else {
-                    self.coarseThumbnailUnavailable = true
-                    self.coarseResumeNotBefore = Date().addingTimeInterval(10)
-                    return
-                }
-                self.softwareFrameExtractor = created
-                extractor = created
+            guard let extractor = self.getOrCreateFrameExtractor() else {
+                self.coarseThumbnailUnavailable = true
+                self.coarseResumeNotBefore = Date().addingTimeInterval(10)
+                return
             }
             // The extractor cache keys omit output size; match the foreground
             // card so prefetch cannot leave a lower-resolution cached still.
@@ -3571,6 +3557,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         // CDN rate-limiting/throttling on both loopback and direct remote streams.
         let isLocalPlaybackCache = request.videoURL.host == "127.0.0.1"
             && request.videoURL.path.hasPrefix("/stream/")
+        self.isLocalPlaybackCache = isLocalPlaybackCache
         self.isRemoteStream = isRemote || isLocalPlaybackCache
         let streamKey = request.canonicalMediaKey
             ?? TrickplayDiskCache.streamKey(for: request.videoURL.absoluteString)

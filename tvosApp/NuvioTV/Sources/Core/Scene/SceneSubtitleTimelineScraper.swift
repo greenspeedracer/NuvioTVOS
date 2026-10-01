@@ -5,7 +5,15 @@ actor SceneSubtitleTimelineScraper {
     private var isScraping: Bool = false
     private var scrapedCanonicalId: String?
     
-    init(urlSession: URLSession = .shared) {
+    private static let defaultSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 5
+        config.timeoutIntervalForResource = 8
+        config.waitsForConnectivity = false
+        return URLSession(configuration: config)
+    }()
+
+    init(urlSession: URLSession = defaultSession) {
         self.urlSession = urlSession
     }
     
@@ -35,8 +43,8 @@ actor SceneSubtitleTimelineScraper {
         var foundMusicCues = false
         var foundSpeakerCues = false
         
-        // Inspect up to 6 candidate subtitle tracks to get a rich combined timeline
-        let inspectionLimit = min(prioritized.count, 6)
+        // Inspect up to 2 candidate subtitle tracks to get timeline intervals without congesting network
+        let inspectionLimit = min(prioritized.count, 2)
         for i in 0..<inspectionLimit {
             let sub = prioritized[i]
             guard let url = URL(string: sub.url) else { continue }

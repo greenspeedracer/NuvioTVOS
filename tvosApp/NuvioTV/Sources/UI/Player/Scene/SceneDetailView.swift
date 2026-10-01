@@ -321,6 +321,7 @@ struct SceneDetailView: View {
                         }
                         .buttonStyle(PosterCardButtonStyle())
                         .focused($focusedButton, equals: .primary)
+                        .onExitCommand(perform: onDismiss)
                     }
                     
                     Button(action: onDismiss) {
@@ -331,6 +332,7 @@ struct SceneDetailView: View {
                     }
                     .buttonStyle(PosterCardButtonStyle())
                     .focused($focusedButton, equals: .dismiss)
+                    .onExitCommand(perform: onDismiss)
                 }
             }
         }

@@ -51,10 +51,16 @@ struct JellyfinMediaItem: Equatable {
 struct JellyfinClient {
     let baseURL: URL
     let accessToken: String
+    private let session: URLSession
 
     private static let deviceId = "NuvioTV-AppleTV"
-    private static let authorizationHeader = "MediaBrowser Client=\"Nuvio\", Device=\"Apple TV\", DeviceId=\"\(deviceId)\", Version=\"1.0.0\""
     private static let itemFields = "Overview,ProductionYear,PremiereDate,CommunityRating,OfficialRating,Genres,RunTimeTicks,ProviderIds,MediaSources,ParentIndexNumber,IndexNumber,SeriesId,People"
+
+    init(baseURL: URL, accessToken: String, session: URLSession = .shared) {
+        self.baseURL = baseURL
+        self.accessToken = accessToken
+        self.session = session
+    }
 
     struct AuthResult {
         let userId: String
@@ -66,16 +72,26 @@ struct JellyfinClient {
         var errorDescription: String? { message }
     }
 
+    // MARK: - Headers
+
+    private static func authorizationHeader(token: String? = nil) -> String {
+        var header = "MediaBrowser Client=\"Nuvio\", Device=\"Apple TV\", DeviceId=\"\(deviceId)\", Version=\"1.0.0\""
+        if let token, !token.isEmpty {
+            header += ", Token=\"\(token)\""
+        }
+        return header
+    }
+
     // MARK: - Authentication (no instance needed yet)
 
-    static func authenticate(baseURL: URL, username: String, password: String) async throws -> AuthResult {
+    static func authenticate(baseURL: URL, username: String, password: String, session: URLSession = .shared) async throws -> AuthResult {
         var request = URLRequest(url: baseURL.appendingPathComponent("Users/AuthenticateByName"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(authorizationHeader, forHTTPHeaderField: "X-Emby-Authorization")
+        request.setValue(authorizationHeader(), forHTTPHeaderField: "Authorization")
         request.httpBody = try JSONEncoder().encode(["Username": username, "Pw": password])
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
         try Self.validate(response, data: data)
 
         struct Payload: Decodable {
@@ -88,14 +104,52 @@ struct JellyfinClient {
     }
 
     /// Resolves the user id for a raw API key, since every other endpoint
-    /// needs it. An API key authenticates as whichever account generated it.
-    static func currentUserId(baseURL: URL, apiKey: String) async throws -> String {
-        var request = URLRequest(url: baseURL.appendingPathComponent("Users/Me"))
-        request.setValue(apiKey, forHTTPHeaderField: "X-Emby-Token")
-        let (data, response) = try await URLSession.shared.data(for: request)
+    /// needs it. Jellyfin API keys are server-level tokens (not user-bound),
+    /// so we first check `/Users/Me` (Emby / session token behavior) and
+    /// fallback to `/Users` to find the server admin or matching user.
+    static func currentUserId(baseURL: URL, apiKey: String, username: String? = nil, session: URLSession = .shared) async throws -> String {
+        // 1. Try `/Users/Me` first (standard for Emby or user-bound tokens).
+        var meRequest = URLRequest(url: baseURL.appendingPathComponent("Users/Me"))
+        meRequest.setValue(authorizationHeader(token: apiKey), forHTTPHeaderField: "Authorization")
+        if let (data, response) = try? await session.data(for: meRequest),
+           let http = response as? HTTPURLResponse {
+            if http.statusCode == 401 {
+                throw ClientError(message: L10n.string("jellyfin_error_unauthorized", fallback: "Invalid API key or credentials"))
+            }
+            if (200...299).contains(http.statusCode) {
+                struct MePayload: Decodable { let Id: String }
+                if let payload = try? JSONDecoder().decode(MePayload.self, from: data), !payload.Id.isEmpty {
+                    return payload.Id
+                }
+            }
+        }
+
+        // 2. Fallback to `/Users` (Jellyfin admin API keys).
+        var usersRequest = URLRequest(url: baseURL.appendingPathComponent("Users"))
+        usersRequest.setValue(authorizationHeader(token: apiKey), forHTTPHeaderField: "Authorization")
+        let (data, response) = try await session.data(for: usersRequest)
         try Self.validate(response, data: data)
-        struct Payload: Decodable { let Id: String }
-        return try JSONDecoder().decode(Payload.self, from: data).Id
+
+        struct UserPayload: Decodable {
+            struct Policy: Decodable {
+                let IsAdministrator: Bool?
+            }
+            let Id: String
+            let Name: String?
+            let Policy: Policy?
+        }
+        let users = try JSONDecoder().decode([UserPayload].self, from: data)
+        if let username = username?.trimmingCharacters(in: .whitespacesAndNewlines), !username.isEmpty,
+           let matched = users.first(where: { $0.Name?.localizedCaseInsensitiveCompare(username) == .orderedSame }) {
+            return matched.Id
+        }
+        if let adminUser = users.first(where: { $0.Policy?.IsAdministrator == true }) {
+            return adminUser.Id
+        }
+        if let firstUser = users.first {
+            return firstUser.Id
+        }
+        throw ClientError(message: L10n.string("jellyfin_error_no_users", fallback: "No users found on server"))
     }
 
     // MARK: - Instance calls
@@ -232,8 +286,8 @@ struct JellyfinClient {
             throw ClientError(message: "Invalid request URL")
         }
         var request = URLRequest(url: url)
-        request.setValue(accessToken, forHTTPHeaderField: "X-Emby-Token")
-        return try await URLSession.shared.data(for: request)
+        request.setValue(Self.authorizationHeader(token: accessToken), forHTTPHeaderField: "Authorization")
+        return try await session.data(for: request)
     }
 
     private static func validate(_ response: URLResponse, data: Data) throws {

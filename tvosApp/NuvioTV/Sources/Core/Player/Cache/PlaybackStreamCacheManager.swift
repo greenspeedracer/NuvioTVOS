@@ -567,7 +567,8 @@ actor PlaybackStreamCacheManager {
     }
 
     func notifySeek(for sourceURL: URL, playheadSeconds: Double, totalDuration: Double) async {
-        guard activeSessionURL == sourceURL, let server = activeServer,
+        guard let server = activeServer,
+              activeSessionURL == sourceURL || sourceURL.host == "127.0.0.1" || sourceURL.host == "localhost" || activeSessionURL == nil,
               totalDuration.isFinite, totalDuration > 0, playheadSeconds.isFinite else { return }
         let fraction = min(1, max(0, playheadSeconds / totalDuration))
         let length = await server.fileLength

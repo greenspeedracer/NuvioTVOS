@@ -31,6 +31,8 @@ struct AetherPlayerSurface: UIViewControllerRepresentable {
 
 struct RemoteSeekPressCatcher: UIViewRepresentable {
     let isActive: Bool
+    var onTapBackward: () -> Void = {}
+    var onTapForward: () -> Void = {}
     let onBeginBackward: () -> Void
     let onBeginForward: () -> Void
     let onEnd: () -> Void
@@ -39,6 +41,8 @@ struct RemoteSeekPressCatcher: UIViewRepresentable {
         let view = SeekPressHostView()
         view.configure(
             isActive: isActive,
+            onTapBackward: onTapBackward,
+            onTapForward: onTapForward,
             onBeginBackward: onBeginBackward,
             onBeginForward: onBeginForward,
             onEnd: onEnd
@@ -49,6 +53,8 @@ struct RemoteSeekPressCatcher: UIViewRepresentable {
     func updateUIView(_ uiView: SeekPressHostView, context: Context) {
         uiView.configure(
             isActive: isActive,
+            onTapBackward: onTapBackward,
+            onTapForward: onTapForward,
             onBeginBackward: onBeginBackward,
             onBeginForward: onBeginForward,
             onEnd: onEnd
@@ -66,6 +72,8 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
         case forward
     }
 
+    private var onTapBackward: () -> Void = {}
+    private var onTapForward: () -> Void = {}
     private var onBeginBackward: () -> Void = {}
     private var onBeginForward: () -> Void = {}
     private var onEnd: () -> Void = {}
@@ -75,14 +83,20 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
     private weak var attachedWindow: UIWindow?
     private var backwardHoldRecognizer: UILongPressGestureRecognizer?
     private var forwardHoldRecognizer: UILongPressGestureRecognizer?
+    private var backwardTapRecognizer: UITapGestureRecognizer?
+    private var forwardTapRecognizer: UITapGestureRecognizer?
 
     func configure(
         isActive: Bool,
+        onTapBackward: @escaping () -> Void,
+        onTapForward: @escaping () -> Void,
         onBeginBackward: @escaping () -> Void,
         onBeginForward: @escaping () -> Void,
         onEnd: @escaping () -> Void
     ) {
         self.isActive = isActive
+        self.onTapBackward = onTapBackward
+        self.onTapForward = onTapForward
         self.onBeginBackward = onBeginBackward
         self.onBeginForward = onBeginForward
         self.onEnd = onEnd
@@ -103,9 +117,25 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
             action: #selector(handleForwardHold(_:))
         )
 
+        let backwardTap = makeTapRecognizer(
+            pressType: .leftArrow,
+            action: #selector(handleBackwardTap(_:))
+        )
+        let forwardTap = makeTapRecognizer(
+            pressType: .rightArrow,
+            action: #selector(handleForwardTap(_:))
+        )
+
+        backwardTap.require(toFail: backwardHold)
+        forwardTap.require(toFail: forwardHold)
+
+        window.addGestureRecognizer(backwardTap)
+        window.addGestureRecognizer(forwardTap)
         window.addGestureRecognizer(backwardHold)
         window.addGestureRecognizer(forwardHold)
 
+        backwardTapRecognizer = backwardTap
+        forwardTapRecognizer = forwardTap
         backwardHoldRecognizer = backwardHold
         forwardHoldRecognizer = forwardHold
         attachedWindow = window
@@ -118,6 +148,12 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
             onEnd()
         }
         if let attachedWindow {
+            if let backwardTapRecognizer {
+                attachedWindow.removeGestureRecognizer(backwardTapRecognizer)
+            }
+            if let forwardTapRecognizer {
+                attachedWindow.removeGestureRecognizer(forwardTapRecognizer)
+            }
             if let backwardHoldRecognizer {
                 attachedWindow.removeGestureRecognizer(backwardHoldRecognizer)
             }
@@ -125,9 +161,20 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
                 attachedWindow.removeGestureRecognizer(forwardHoldRecognizer)
             }
         }
+        backwardTapRecognizer = nil
+        forwardTapRecognizer = nil
         backwardHoldRecognizer = nil
         forwardHoldRecognizer = nil
         attachedWindow = nil
+    }
+
+    private func makeTapRecognizer(pressType: UIPress.PressType, action: Selector) -> UITapGestureRecognizer {
+        let recognizer = UITapGestureRecognizer(target: self, action: action)
+        recognizer.allowedPressTypes = [NSNumber(value: pressType.rawValue)]
+        recognizer.cancelsTouchesInView = false
+        recognizer.delegate = self
+        recognizer.isEnabled = false
+        return recognizer
     }
 
     private func makeHoldRecognizer(pressType: UIPress.PressType, action: Selector) -> UILongPressGestureRecognizer {
@@ -144,6 +191,18 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
         let enabled = isActive || activeDirection != nil
         backwardHoldRecognizer?.isEnabled = enabled
         forwardHoldRecognizer?.isEnabled = enabled
+        backwardTapRecognizer?.isEnabled = isActive && activeDirection == nil
+        forwardTapRecognizer?.isEnabled = isActive && activeDirection == nil
+    }
+
+    @objc private func handleBackwardTap(_ recognizer: UITapGestureRecognizer) {
+        guard isActive, activeDirection == nil else { return }
+        onTapBackward()
+    }
+
+    @objc private func handleForwardTap(_ recognizer: UITapGestureRecognizer) {
+        guard isActive, activeDirection == nil else { return }
+        onTapForward()
     }
 
     @objc private func handleBackwardHold(_ recognizer: UILongPressGestureRecognizer) {

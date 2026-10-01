@@ -488,8 +488,6 @@ final class CinemetaCatalogRepository: CatalogRepository {
         // ones Settings writes locally. Without this, hiding "Popular - Movies"
         // was the one toggle Home ignored.
         let disabledBuiltInKeys = TVHomeCatalogOrder.disabledCatalogKeys()
-        let activeHomeKeys = Set(TVHomeCatalogOrder.effectiveOrderKeys())
-        let collectionSources = CatalogHomeVisibilityResolver.activeCollectionSources()
 
         func builtInCatalogs() -> [NuvioCatalog] {
             guard cinemetaEnabled else { return [] }
@@ -524,10 +522,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
         // Publish the base rows now. Add-on catalogs can be slow or numerous;
         // they must not hold already-loaded rows off Home.
         var catalogs = builtInCatalogs()
-        let simklCatalogs = await simklPlanToWatchCatalogs(
-            collectionSources: collectionSources,
-            activeHomeKeys: activeHomeKeys
-        )
+        let simklCatalogs = await simklPlanToWatchCatalogs()
         catalogs.append(contentsOf: simklCatalogs)
         if !catalogs.isEmpty {
             onUpdate?(catalogs)
@@ -561,10 +556,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
             try Task.checkCancellation()
         }
 
-        let retriedBuiltIns = builtInCatalogs() + (await simklPlanToWatchCatalogs(
-            collectionSources: collectionSources,
-            activeHomeKeys: activeHomeKeys
-        ))
+        let retriedBuiltIns = builtInCatalogs() + (await simklPlanToWatchCatalogs())
         if retriedBuiltIns.count != catalogs.count {
             catalogs = retriedBuiltIns
             onUpdate?(catalogs)
@@ -578,10 +570,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
         var lastProgressiveUpdateAt: UInt64?
         var lastProgressiveUpdateCount = 0
         let progressiveUpdateIntervalNanoseconds: UInt64 = 1_500_000_000
-        let addonResult = await addonHomeCatalogs(
-            collectionSources: collectionSources,
-            activeHomeKeys: activeHomeKeys
-        ) { [weak self] catalog in
+        let addonResult = await addonHomeCatalogs { [weak self] catalog in
             guard let self else { return }
             progressiveAddonCatalogs.append(catalog)
             let now = DispatchTime.now().uptimeNanoseconds
@@ -615,17 +604,12 @@ final class CinemetaCatalogRepository: CatalogRepository {
         return catalogs
     }
 
-    private func simklPlanToWatchCatalogs(
-        collectionSources: [CatalogHomeVisibilityResolver.Source]? = nil,
-        activeHomeKeys: Set<String>? = nil
-    ) async -> [NuvioCatalog] {
+    private func simklPlanToWatchCatalogs() async -> [NuvioCatalog] {
         guard SimklSettingsStore.isPlanToWatchHomeCatalogsEnabled,
               SimklRuntimeSession.authenticatedState() != nil else {
             return []
         }
         let disabledKeys = TVHomeCatalogOrder.disabledCatalogKeys()
-        let activeKeys = activeHomeKeys ?? Set(TVHomeCatalogOrder.effectiveOrderKeys())
-        let sources = collectionSources ?? CatalogHomeVisibilityResolver.activeCollectionSources()
         let movieKey = TVHomeCatalogOrder.catalogSettingsKey(
             addonId: "simkl",
             contentType: "movie",
@@ -710,15 +694,11 @@ final class CinemetaCatalogRepository: CatalogRepository {
     /// only catalogs and ones needing unsupported extras are skipped; a
     /// required genre is satisfied with the catalog's first declared option.
     private func addonHomeCatalogs(
-        collectionSources: [CatalogHomeVisibilityResolver.Source]? = nil,
-        activeHomeKeys: Set<String>? = nil,
         onCatalogLoaded: ((NuvioCatalog) -> Void)? = nil
     ) async -> (catalogs: [NuvioCatalog], hadFailures: Bool) {
         // Catalogs the user hid from Home on another device (synced from the
         // account). Their key format matches the tvOS catalog id sans `addon_`.
         let disabledCatalogKeys = TVHomeCatalogOrder.disabledCatalogKeys()
-        let activeHomeKeys = activeHomeKeys ?? Set(TVHomeCatalogOrder.effectiveOrderKeys())
-        let collectionSources = collectionSources ?? CatalogHomeVisibilityResolver.activeCollectionSources()
         var catalogs: [NuvioCatalog] = []
         var reports: [String] = []
         var hadFailures = false
@@ -1371,15 +1351,26 @@ final class CinemetaCatalogRepository: CatalogRepository {
 
                 await withTaskGroup(of: [NuvioSubtitle].self) { group in
                     for addon in addons {
-                        guard let url = addon.subtitleURL(
+                        // 1. Fast base ID-query endpoint (instant cache response < 300ms)
+                        if let baseURL = addon.subtitleURL(type: subtitleType, id: id) {
+                            let name = addon.name
+                            group.addTask { await Self.fetchSubtitles(from: baseURL, source: name) }
+                        }
+
+                        // 2. If videoHash / videoSize / filename extras are present, query the extra endpoint in parallel
+                        let hasExtras = (videoHash != nil && !videoHash!.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            || (videoSize != nil && videoSize! > 0)
+                            || (filename != nil && !filename!.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        if hasExtras, let extraURL = addon.subtitleURL(
                             type: subtitleType,
                             id: id,
                             videoHash: videoHash,
                             videoSize: videoSize,
                             filename: filename
-                        ) else { continue }
-                        let name = addon.name
-                        group.addTask { await Self.fetchSubtitles(from: url, source: name) }
+                        ), extraURL != addon.subtitleURL(type: subtitleType, id: id) {
+                            let name = addon.name
+                            group.addTask { await Self.fetchSubtitles(from: extraURL, source: name) }
+                        }
                     }
 
                     for await subtitles in group {
@@ -1397,7 +1388,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
     private static func fetchSubtitles(from url: URL, source: String) async -> [NuvioSubtitle] {
         do {
             var request = URLRequest(url: url)
-            request.timeoutInterval = 15
+            request.timeoutInterval = 8
             request.setValue("Mozilla/5.0 (AppleTV; tvOS 18.0) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode else { return [] }
@@ -1409,16 +1400,36 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
     }
 
+    private func loadManifestsConcurrently(urls: [URL]) async -> [URL: AddonManifest] {
+        guard !urls.isEmpty else { return [:] }
+        return await withTaskGroup(of: (URL, AddonManifest?).self) { group in
+            for url in urls {
+                group.addTask {
+                    let manifest = await self.manifest(for: url)
+                    return (url, manifest)
+                }
+            }
+            var result: [URL: AddonManifest] = [:]
+            for await (url, manifest) in group {
+                if let manifest {
+                    result[url] = manifest
+                }
+            }
+            return result
+        }
+    }
+
     /// Built-in subtitles plus every enabled installed add-on whose manifest
     /// advertises the Stremio `subtitles` resource.
     private func configuredSubtitleAddons(id: String, type: String) async -> [StremioSubtitleAddon] {
         let subtitleType = Self.isSeriesType(type) ? "series" : "movie"
         var addons = builtInSubtitleAddons
         var seenURLs = Set(addons.map(\.manifestURL))
+        let candidateURLs = Self.configuredStreamAddonManifestURLs.filter { seenURLs.insert($0).inserted }
 
-        for manifestURL in Self.configuredStreamAddonManifestURLs {
-            guard seenURLs.insert(manifestURL).inserted,
-                  let manifest = await manifest(for: manifestURL),
+        let manifests = await loadManifestsConcurrently(urls: candidateURLs)
+        for manifestURL in candidateURLs {
+            guard let manifest = manifests[manifestURL],
                   manifest.supportsResource("subtitles", type: subtitleType, id: id) else { continue }
             addons.append(
                 StremioSubtitleAddon(
@@ -1461,7 +1472,20 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     private static func mergedSubtitles(_ lhs: [NuvioSubtitle], _ rhs: [NuvioSubtitle]) -> [NuvioSubtitle] {
-        uniqueSubtitles(lhs + rhs)
+        var result = lhs
+        var indexByURL: [String: Int] = [:]
+        for (index, sub) in result.enumerated() {
+            indexByURL[sub.url] = index
+        }
+        for sub in rhs {
+            if let index = indexByURL[sub.url] {
+                result[index] = sub
+            } else {
+                indexByURL[sub.url] = result.count
+                result.append(sub)
+            }
+        }
+        return result
     }
 
     private static func uniqueSubtitles(_ subtitles: [NuvioSubtitle]) -> [NuvioSubtitle] {

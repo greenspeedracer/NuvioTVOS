@@ -25,6 +25,7 @@ extension PlayerView {
                 // without dropping the lock during buffering or source switches.
                 PlaybackWakeLock.acquire()
                 syncPlaybackWakeLock()
+                focusRemoteInput()
                 let cachedBinge = BingeGroupStore.load(seriesId: meta.id)
                 viewModel.reloadCurrentStream = reloadCurrentStream
                 viewModel.fetchPlaybackSources = fetchPlaybackSources
@@ -97,12 +98,17 @@ extension PlayerView {
             .onChange(of: viewModel.status) { _, status in
                 syncPlaybackWakeLock()
                 if status == .playing,
+                   (viewModel.hasRenderedFirstFrame || viewModel.isLiveStream),
                    !viewModel.isSwitchingSource,
                    !viewModel.isReloadingStream,
                    !viewModel.didDetectReplacementStream,
+                   !viewModel.isAdvancingEpisode,
                    !didReportPlaybackStarted {
                     didReportPlaybackStarted = true
                     PlaybackStartupTiming.complete()
+                    if !viewModel.showControls {
+                        focusRemoteInput()
+                    }
                     onPlaybackStarted?()
                 }
                 guard status == .ended,
@@ -116,12 +122,17 @@ extension PlayerView {
             }
             .onChange(of: viewModel.hasRenderedFirstFrame) { _, ready in
                 if ready,
+                   (viewModel.status == .playing || viewModel.isLiveStream),
                    !viewModel.isSwitchingSource,
                    !viewModel.isReloadingStream,
                    !viewModel.didDetectReplacementStream,
+                   !viewModel.isAdvancingEpisode,
                    !didReportPlaybackStarted {
                     didReportPlaybackStarted = true
                     PlaybackStartupTiming.complete()
+                    if !viewModel.showControls {
+                        focusRemoteInput()
+                    }
                     onPlaybackStarted?()
                 }
             }
@@ -129,6 +140,13 @@ extension PlayerView {
                 syncPlaybackWakeLock()
                 if isSwitching {
                     PlaybackStartupTiming.start()
+                    didReportPlaybackStarted = false
+                }
+            }
+            .onChange(of: viewModel.isAdvancingEpisode) { _, isAdvancing in
+                syncPlaybackWakeLock()
+                if isAdvancing {
+                    PlaybackStartupTiming.start(title: meta.name)
                     didReportPlaybackStarted = false
                 }
             }
@@ -153,6 +171,9 @@ extension PlayerView {
                 case .active:
                     lastBecameActiveAt = Date()
                     syncPlaybackWakeLock()
+                    if !viewModel.showControls {
+                        focusRemoteInput()
+                    }
                 @unknown default:
                     break
                 }
@@ -169,6 +190,9 @@ extension PlayerView {
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
                 screensaverDebugLog("[ScreensaverDebug][PlayerView] didBecomeActiveNotification received, status=\(viewModel.status), time=\(viewModel.time.current), setting lastBecameActiveAt")
                 lastBecameActiveAt = Date()
+                if !viewModel.showControls {
+                    focusRemoteInput()
+                }
             }
     }
 
@@ -267,6 +291,16 @@ extension PlayerView {
                     focusSkipSegment()
                 } else {
                     skipSegmentFocused = false
+                    focusRemoteInput()
+                }
+            }
+            .onChange(of: viewModel.showScenePanel) { _, isVisible in
+                if isVisible {
+                    remoteInputFocused = false
+                    nextEpisodeFocused = false
+                    cancelAutoPlayFocused = false
+                    skipSegmentFocused = false
+                } else if !viewModel.showControls {
                     focusRemoteInput()
                 }
             }

@@ -39,6 +39,15 @@ struct SimklHTTPResult<T> {
     let rawData: Data
     let errorMessage: String?
 
+    var oauthError: String? {
+        guard !rawData.isEmpty,
+              let json = try? JSONSerialization.jsonObject(with: rawData) as? [String: Any],
+              let error = json["error"] as? String else {
+            return nil
+        }
+        return error
+    }
+
     func valueOrThrow() throws -> T {
         guard (200..<300).contains(statusCode) else {
             throw SimklServiceError.message(errorMessage ?? "Simkl request failed (\(statusCode)).")
@@ -159,6 +168,53 @@ final class SimklAPIClient {
             body: nil as Data?
         )
         return try await performRaw(request)
+    }
+
+    func postFormURLEncoded<T: Decodable>(
+        path: String,
+        parameters: [String: String]
+    ) async throws -> SimklHTTPResult<T> {
+        let request = try makeFormRequest(path: path, parameters: parameters)
+        return try await perform(request)
+    }
+
+    func postFormURLEncodedRaw(
+        path: String,
+        parameters: [String: String]
+    ) async throws -> SimklHTTPResult<Data> {
+        let request = try makeFormRequest(path: path, parameters: parameters)
+        return try await performRaw(request)
+    }
+
+    private func makeFormRequest(
+        path: String,
+        parameters: [String: String]
+    ) throws -> URLRequest {
+        let normalizedBase = SimklConfig.apiBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let normalizedPath = path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard let url = URL(string: "\(normalizedBase)/\(normalizedPath)") else {
+            throw SimklServiceError.message("Invalid Simkl URL.")
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 30
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("no-cache, no-store", forHTTPHeaderField: "Cache-Control")
+        request.setValue(SimklConfig.userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+
+        let bodyString = parameters
+            .sorted(by: { $0.key < $1.key })
+            .map { key, value in
+                let encodedKey = key.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed) ?? key
+                let encodedValue = value.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed) ?? value
+                return "\(encodedKey)=\(encodedValue)"
+            }
+            .joined(separator: "&")
+        request.httpBody = bodyString.data(using: .utf8)
+        return request
     }
 
     private func makeRequest(

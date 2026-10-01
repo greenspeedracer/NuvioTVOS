@@ -1,5 +1,5 @@
 // swift-tools-version: 6.0
-// Nuvio pin of AetherEngine 7.7.1 with local FFmpegBuild integrations.
+// Nuvio pin of AetherEngine 7.22.2 with local FFmpegBuild integrations.
 
 import PackageDescription
 
@@ -21,31 +21,11 @@ let package = Package(
             name: "AetherEngineSMB",
             targets: ["AetherEngineSMB"]
         ),
-        // aetherctl is intentionally not exposed as a product. The target
-        // uses Foundation.Process, which is unavailable on tvOS/iOS, so
-        // exposing it would force SPM consumers to compile it on those
-        // platforms. The target is preserved below so `swift build` on
-        // macOS still produces the CLI for upstream development.
     ],
     dependencies: [
-        // Minimal FFmpeg build (avcodec, avformat, avutil, swresample only).
-        // No network stack, we use custom AVIO + URLSession for HTTP streams.
-        // Nuvio vendors the exact FFmpegBuild release beside this package so
-        // its namespaced dynamic frameworks stay coherent with MPVKit.
         .package(path: "../FFmpegBuild"),
-        // Pure-Swift SMB2 client (MIT) that speaks the protocol over
-        // NWConnection. Replaces AMSMB2/libsmb2, which EPERMs on tvOS/iOS.
-        // Pinned to the 0.3.x minor: SMBClient is pre-1.0 with an actively
-        // moving API, so allow patch updates but not a minor bump.
         .package(url: "https://github.com/kishikawakatsumi/SMBClient", .upToNextMinor(from: "0.3.1")),
-        // libdovi (Dolby Vision RPU parser/converter). Resolved over Git like
-        // FFmpegBuild so consumers (and Xcode Cloud) build without a sibling
-        // LibDovi checkout; the prebuilt xcframework needs no Rust at build time.
-        // Pinned to the minor for the same reason as FFmpegBuild above, with a
-        // worked example: 1.1.0 shipped a tvOS floor raise as a minor, SwiftPM
-        // floated every `from: "1.0.x"` consumer onto it and then failed on the
-        // floor instead of backing off, so all of 5.x stopped resolving.
-        .package(url: "https://github.com/superuser404notfound/LibDovi", .upToNextMinor(from: "2.1.0")),  // 2.1.0: dolby_vision 3.4.0, header additive only (two new CMv4.0 metadata entry points, nothing removed); 2.0.0: visionOS (xros) device + simulator slices, declared tvOS floor corrected to 17.0 (was published as 1.1.0, withdrawn: a floor raise is breaking and broke every 5.x pin that floated onto it); 1.0.2: iOS slices + x86_64 (Intel Macs)
+        .package(url: "https://github.com/superuser404notfound/LibDovi", .upToNextMinor(from: "2.1.0")),
     ],
     targets: [
         .target(
@@ -76,11 +56,6 @@ let package = Package(
             dependencies: ["AetherEngine", "AetherEngineSMB"],
             path: "Sources/aetherctl"
         ),
-        // The samples in Examples/ are drop-in files rather than apps, so nothing used to
-        // compile them and they could rot the way prose rots, except a reader trusts them
-        // more. Compiling them as a target (never a product, so no consumer builds it)
-        // makes `swift build` and CI the guard. DemoPlayerMac is its own package and
-        // excluded here; it builds with `swift build --package-path Examples/DemoPlayerMac`.
         .target(
             name: "ExampleSources",
             dependencies: ["AetherEngine"],

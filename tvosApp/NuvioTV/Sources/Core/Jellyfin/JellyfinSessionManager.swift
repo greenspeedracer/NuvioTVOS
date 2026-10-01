@@ -86,7 +86,7 @@ final class JellyfinSessionManager: ObservableObject {
             let token = JellyfinCredentialStore.token(forServerID: server.id)
             var resolvedUserId = server.userId
             if resolvedUserId.isEmpty {
-                resolvedUserId = try await JellyfinClient.currentUserId(baseURL: baseURL, apiKey: token)
+                resolvedUserId = try await JellyfinClient.currentUserId(baseURL: baseURL, apiKey: token, username: server.username)
                 var updated = server
                 updated.userId = resolvedUserId
                 JellyfinServerStore.shared.upsert(updated)

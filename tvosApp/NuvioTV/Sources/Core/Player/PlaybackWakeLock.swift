@@ -35,9 +35,10 @@ enum PlaybackIdlePolicy {
     static func preventsIdle(
         status: PlayerStatus,
         isSwitchingSource: Bool = false,
-        isReloadingStream: Bool = false
+        isReloadingStream: Bool = false,
+        isAdvancingEpisode: Bool = false
     ) -> Bool {
-        if isSwitchingSource || isReloadingStream {
+        if isSwitchingSource || isReloadingStream || isAdvancingEpisode {
             return true
         }
         switch status {

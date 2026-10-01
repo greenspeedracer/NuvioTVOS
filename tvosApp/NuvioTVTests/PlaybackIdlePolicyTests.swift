@@ -28,5 +28,11 @@ final class PlaybackIdlePolicyTests: XCTestCase {
                 isReloadingStream: true
             )
         )
+        XCTAssertTrue(
+            PlaybackIdlePolicy.preventsIdle(
+                status: .paused,
+                isAdvancingEpisode: true
+            )
+        )
     }
 }
