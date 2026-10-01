@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 /// One synced watch-progress row, exactly as Nuvio Sync stores it.
 ///
@@ -493,23 +494,23 @@ enum WatchProgressLedger {
         let allRecords = records()
         let inProgress = allRecords.filter { record in
             guard hasStarted(record) else {
-                print("[WatchProgressLedger] continueWatchingCandidates: rejected \(record.progressKey) - hasStarted=false (pos=\(record.position))")
+                continueWatchingLog.notice("[diag] rejected \(record.progressKey, privacy: .public) - hasStarted=false (pos=\(record.position))")
                 return false
             }
             guard !isComplete(record) else {
-                print("[WatchProgressLedger] continueWatchingCandidates: rejected \(record.progressKey) - isComplete=true (pos=\(record.position)/\(record.duration))")
+                continueWatchingLog.notice("[diag] rejected \(record.progressKey, privacy: .public) - isComplete=true (pos=\(record.position)/\(record.duration))")
                 return false
             }
             // An episode or movie already marked watched in WatchedStore has been completed
             // and should not be offered as an in-progress resume row.
             if record.isEpisode, let season = record.season, let episode = record.episode {
                 if WatchedStore.containsEpisode(metaId: record.contentId, season: season, episode: episode) {
-                    print("[WatchProgressLedger] continueWatchingCandidates: rejected episode \(record.progressKey) - already in WatchedStore")
+                    continueWatchingLog.notice("[diag] rejected episode \(record.progressKey, privacy: .public) - already in WatchedStore")
                     return false
                 }
             } else if !record.isEpisode {
                 if WatchedStore.contains(metaId: record.contentId, type: record.contentType) {
-                    print("[WatchProgressLedger] continueWatchingCandidates: rejected movie \(record.progressKey) - already in WatchedStore")
+                    continueWatchingLog.notice("[diag] rejected movie \(record.progressKey, privacy: .public) - already in WatchedStore")
                     return false
                 }
             }
@@ -524,7 +525,7 @@ enum WatchProgressLedger {
             .filter { seenSeries.insert($0.contentId).inserted }
 
         let result = (others + latestPerSeries).sorted { $0.lastWatchedAt > $1.lastWatchedAt }
-        print("[WatchProgressLedger] continueWatchingCandidates: from \(allRecords.count) ledger records -> \(result.count) candidates: \(result.map(\.progressKey))")
+        continueWatchingLog.notice("[diag] continueWatchingCandidates: from \(allRecords.count) ledger records -> \(result.count) candidates: \(result.map(\.progressKey), privacy: .public)")
         return result
     }
 
@@ -563,7 +564,7 @@ enum WatchProgressLedger {
             }
         }
         let result = selectedBySeries.values.sorted { $0.lastWatchedAt > $1.lastWatchedAt }
-        print("[WatchProgressLedger] upNextSeeds: found \(result.count) seeds: \(result.map(\.progressKey))")
+        continueWatchingLog.notice("[diag] upNextSeeds: found \(result.count) seeds: \(result.map(\.progressKey), privacy: .public)")
         return result
     }
 }
