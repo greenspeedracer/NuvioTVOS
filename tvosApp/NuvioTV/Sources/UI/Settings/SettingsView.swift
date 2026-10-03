@@ -12225,6 +12225,7 @@ private struct CollectionFolderEditorCard: View {
     let onAddTmdb: () -> Void
     let onAddTrakt: () -> Void
     let onDelete: () -> Void
+    @State private var catalogNames: [String: String] = [:]
 
     private enum CoverMode: String, CaseIterable, Identifiable {
         case none = "None"
@@ -12349,6 +12350,10 @@ private struct CollectionFolderEditorCard: View {
             let catalogId = source["catalogId"] as? String ?? "catalog"
             let type = (source["type"] as? String ?? "").capitalized
             let addon = source["addonId"] as? String ?? "addon"
+            let nameKey = "\(source["addonId"] as? String ?? "")_\(source["type"] as? String ?? "")_\(catalogId)"
+            if let name = catalogNames[nameKey] {
+                return type.isEmpty ? name : "\(name) (\(type))"
+            }
             return type.isEmpty ? "\(addon) · \(catalogId)" : "\(type) · \(catalogId)"
         }
     }
@@ -12567,6 +12572,14 @@ private struct CollectionFolderEditorCard: View {
             RoundedRectangle(cornerRadius: cardRadius, style: .continuous)
                 .strokeBorder(Color.white.opacity(0.20), lineWidth: 1)
         )
+        .task {
+            let options = await CinemetaCatalogRepository().availableAddonCatalogs()
+            var names: [String: String] = [:]
+            for option in options {
+                names[option.id] = option.catalogName
+            }
+            catalogNames = names
+        }
     }
 
     @ViewBuilder
