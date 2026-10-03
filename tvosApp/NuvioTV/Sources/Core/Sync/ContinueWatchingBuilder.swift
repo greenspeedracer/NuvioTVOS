@@ -604,6 +604,8 @@ enum ContinueWatchingBuilder {
         let newestByIdentity = WatchedStore.newestWatchedDatesByIdentity(watched)
 
         return items.filter { item in
+            guard item.isUpNextEntry else { return true }
+
             let keys = WatchedStore.watchedIdentityKeys(
                 metaId: item.meta.id,
                 imdbId: item.meta.imdbId,
