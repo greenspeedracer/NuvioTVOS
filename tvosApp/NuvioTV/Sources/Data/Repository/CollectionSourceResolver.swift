@@ -53,7 +53,7 @@ struct CollectionSourceResolver {
                 contentType: type,
                 catalogId: catalogId,
                 skip: max(cursor, 0),
-                genre: nonEmpty(source.genre)
+                genre: Self.genreValue(source.genre)
             )
         case "tmdb":
             page = try await browseTmdb(source, page: max(cursor, 1))
@@ -68,7 +68,10 @@ struct CollectionSourceResolver {
         return page
     }
 
-    static func label(for source: NuvioCollectionSource) -> String {
+    static func label(
+        for source: NuvioCollectionSource,
+        catalogNames: [String: String] = [:]
+    ) -> String {
         if let title = nonEmpty(source.title) { return title }
         switch source.normalizedProvider {
         case "tmdb":
@@ -76,12 +79,13 @@ struct CollectionSourceResolver {
         case "trakt":
             return "Trakt List"
         default:
-            let name = (nonEmpty(source.catalogId) ?? "Catalog")
+            let key = "\(source.addonId ?? "")_\(source.type ?? "")_\(source.catalogId ?? "")"
+            let name = catalogNames[key] ?? (nonEmpty(source.catalogId) ?? "Catalog")
                 .replacingOccurrences(of: "_", with: " ")
                 .replacingOccurrences(of: "-", with: " ")
             let type = nonEmpty(source.type)?.capitalized
             let base = type.map { "\(name) (\($0))" } ?? name
-            if let genre = nonEmpty(source.genre) {
+            if let genre = genreValue(source.genre) {
                 return "\(base) · \(genre)"
             }
             return base
@@ -512,6 +516,11 @@ struct CollectionSourceResolver {
         } catch {
             throw CollectionSourceError.invalidResponse(provider)
         }
+    }
+
+    private static func genreValue(_ value: String?) -> String? {
+        guard let value = nonEmpty(value) else { return nil }
+        return ["none", "null", "nil"].contains(value.lowercased()) ? nil : value
     }
 
     private static func nonEmpty(_ value: String?) -> String? {
