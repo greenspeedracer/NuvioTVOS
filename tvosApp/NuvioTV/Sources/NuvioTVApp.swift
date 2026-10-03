@@ -7676,9 +7676,19 @@ enum CatalogHomeVisibilityResolver {
         manifestURL: URL,
         explicitHomeKeys: Set<String>
     ) -> Bool {
-        // Matching Android TV: catalogs inside collection folders remain visible
-        // in layout and on Home unless explicitly disabled by user/account settings.
-        return true
+        // A catalog that lives inside a collection folder is not also a top-level
+        // Home row, unless it was explicitly put on Home.
+        let key = TVHomeCatalogOrder.catalogSettingsKey(
+            addonId: addonID,
+            contentType: contentType,
+            catalogId: catalogID
+        )
+        if explicitHomeKeys.contains(key) { return true }
+        return !collectionSources.contains { source in
+            source.contentType == contentType
+                && source.catalogID == catalogID
+                && matches(source.addonIdentifier, addonID: addonID, manifestURL: manifestURL)
+        }
     }
 
     static func matches(_ raw: String, addonID: String, manifestURL: URL) -> Bool {
