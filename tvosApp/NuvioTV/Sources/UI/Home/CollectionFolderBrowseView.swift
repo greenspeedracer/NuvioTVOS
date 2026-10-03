@@ -54,6 +54,7 @@ struct CollectionFolderBrowseView: View {
     @State private var watchedTitleKeys: Set<String> = []
     @State private var cachedCollectionMetadata: [String: NuvioMeta] = [:]
     @State private var collectionEnrichmentTask: Task<Void, Never>?
+    @State private var catalogNames: [String: String] = [:]
     @Environment(\.isEnabled) private var isEnabled
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
@@ -93,7 +94,7 @@ struct CollectionFolderBrowseView: View {
             labels.append("All")
         }
         for source in folder.sources {
-            labels.append(Self.sourceLabel(source))
+            labels.append(sourceLabel(source))
         }
         return labels
     }
@@ -144,6 +145,7 @@ struct CollectionFolderBrowseView: View {
         }
         .task {
             refreshWatchedTitles()
+            await loadCatalogNames()
             await load()
         }
         .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification).receive(on: RunLoop.main)) { _ in
@@ -553,6 +555,14 @@ struct CollectionFolderBrowseView: View {
     }
 
     @MainActor
+    private func loadCatalogNames() async {
+        let options = await CinemetaCatalogRepository().availableAddonCatalogs()
+        var names: [String: String] = [:]
+        for option in options {
+            names[option.id] = option.catalogName
+        }
+        catalogNames = names
+    }
     private func load() async {
         isLoading = true
         errorMessage = nil
@@ -619,7 +629,7 @@ struct CollectionFolderBrowseView: View {
             rows.append(
                 CollectionFolderCatalogRow(
                     id: Self.sourceKey(source),
-                    title: Self.sourceLabel(source),
+                    title: sourceLabel(source),
                     source: source,
                     items: resolved,
                     nextSkip: nextCursor(
@@ -790,8 +800,8 @@ struct CollectionFolderBrowseView: View {
         source.routeKey
     }
 
-    private static func sourceLabel(_ source: NuvioCollectionSource) -> String {
-        CollectionSourceResolver.label(for: source)
+    private func sourceLabel(_ source: NuvioCollectionSource) -> String {
+        CollectionSourceResolver.label(for: source, catalogNames: catalogNames)
     }
 }
 
