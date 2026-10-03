@@ -699,6 +699,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
         // Catalogs the user hid from Home on another device (synced from the
         // account). Their key format matches the tvOS catalog id sans `addon_`.
         let disabledCatalogKeys = TVHomeCatalogOrder.disabledCatalogKeys()
+        let collectionSources = CatalogHomeVisibilityResolver.activeCollectionSources()
         var catalogs: [NuvioCatalog] = []
         var reports: [String] = []
         var hadFailures = false
@@ -719,6 +720,16 @@ final class CinemetaCatalogRepository: CatalogRepository {
                 guard catalog.eligibleForHome else { return false }
                 let key = "\(manifest.id)_\(catalog.type)_\(catalog.id)"
                 guard !disabledCatalogKeys.contains(key) else {
+                    return false
+                }
+                guard CatalogHomeVisibilityResolver.shouldInclude(
+                    addonID: manifest.id,
+                    contentType: catalog.type,
+                    catalogID: catalog.id,
+                    collectionSources: collectionSources,
+                    manifestURL: manifestURL,
+                    explicitHomeKeys: []
+                ) else {
                     return false
                 }
                 return !catalog.requiresGenre || catalog.firstGenreOption != nil
