@@ -20,27 +20,41 @@ jobs:
     steps:
       - name: Determine Upstream Release Tag
         id: get_tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -e
+
           if [ -n "${{ github.event.inputs.force_tag }}" ]; then
             TAG="${{ github.event.inputs.force_tag }}"
           else
-            TAG=$(curl -sL https://api.github.com/repos/bobsupra/NuvioTVOS/releases/latest | jq -r '.tag_name')
+            TAG=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/bobsupra/NuvioTVOS/releases/latest | jq -r '.tag_name // empty')
+
+            if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+              TAG=$(git ls-remote --tags --sort='v:refname' https://github.com/bobsupra/NuvioTVOS.git | tail -n1 | sed 's/.*\///')
+            fi
           fi
 
-          if [ -z "$TAG" ] \vert{}\vert{} [ "$TAG" = "null" ]; then
-            echo "Failed to fetch upstream release tag."
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "::error::Could not determine a valid upstream tag or release."
             exit 1
           fi
 
+          echo "Target tag resolved: $TAG"
           echo "target_tag=$TAG" >> "$GITHUB_OUTPUT"
 
-          EXISTS=$(curl -sL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG | jq -r '.tag_name')
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG")
 
-          if [ "$EXISTS" = "$TAG" ] && [ -z "${{ github.event.inputs.force_tag }}" ]; then
-            echo "Release $TAG already built. Skipping."
+          if [ "$HTTP_STATUS" = "200" ] && [ -z "${{ github.event.inputs.force_tag }}" ]; then
+            echo "Release $TAG already exists in this repository. Skipping build."
             echo "should_build=false" >> "$GITHUB_OUTPUT"
           else
+            echo "Release $TAG needs to be built."
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
