@@ -67,24 +67,28 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Patch App Group Identifiers
+      - name: Patch Bundle IDs and App Group
         if: steps.get_tag.outputs.should_build == 'true'
         run: |
+          OLD_BUNDLE="com.pyksel.nuviotvos"
+          NEW_BUNDLE="com.ronkozel.nuviotvos"
+
           OLD_GROUP="group.com.pyksel.nuviotvos"
           NEW_GROUP="group.M3HWHXLPC7.com.pyksel.nuviotvos"
 
-          echo "Replacing $OLD_GROUP with$NEW_GROUP across codebase..."
+          echo "Replacing $OLD_GROUP with $NEW_GROUP..."
           find . -type f \( -name "*.swift" -o -name "*.plist" -o -name "*.entitlements" -o -name "*.Project.swift" -o -name "Project.swift" \) \
             -not -path "*/.*" \
             -exec sed -i '' "s/${OLD_GROUP}/${NEW_GROUP}/g" {} +
 
-          MATCHES=$(grep -rn "$NEW_GROUP" . || true)
-          if [ -z "$MATCHES" ]; then
-            echo "Error: Failed to patch $OLD_GROUP."
-            exit 1
-          else
-            echo "Patch applied successfully."
-          fi
+          echo "Replacing $OLD_BUNDLE with $NEW_BUNDLE..."
+          find . -type f \( -name "*.swift" -o -name "*.plist" -o -name "*.entitlements" -o -name "*.Project.swift" -o -name "Project.swift" \) \
+            -not -path "*/.*" \
+            -exec sed -i '' "s/${OLD_BUNDLE}/${NEW_BUNDLE}/g" {} +
+
+          echo "Verification:"
+          grep -rn "$NEW_BUNDLE" . || { echo "Failed to patch bundle ID"; exit 1; }
+          grep -rn "$NEW_GROUP" . || { echo "Failed to patch app group"; exit 1; }
 
       - name: Show Xcode version
         if: steps.get_tag.outputs.should_build == 'true'
