@@ -73,22 +73,27 @@ jobs:
           OLD_BUNDLE="com.pyksel.nuviotvos"
           NEW_BUNDLE="com.ronkozel.nuviotvos"
 
-          OLD_GROUP="group.com.pyksel.nuviotvos"
-          NEW_GROUP="group.M3HWHXLPC7.com.pyksel.nuviotvos"
+          TARGET_GROUP="group.M3HWHXLPC7.com.pyksel.nuviotvos"
 
-          echo "Replacing $OLD_GROUP with $NEW_GROUP..."
-          find . -type f \( -name "*.swift" -o -name "*.plist" -o -name "*.entitlements" -o -name "*.Project.swift" -o -name "Project.swift" \) \
-            -not -path "*/.*" \
-            -exec sed -i '' "s/${OLD_GROUP}/${NEW_GROUP}/g" {} +
-
-          echo "Replacing $OLD_BUNDLE with $NEW_BUNDLE..."
+          echo "1. Replacing bundle IDs..."
           find . -type f \( -name "*.swift" -o -name "*.plist" -o -name "*.entitlements" -o -name "*.Project.swift" -o -name "Project.swift" \) \
             -not -path "*/.*" \
             -exec sed -i '' "s/${OLD_BUNDLE}/${NEW_BUNDLE}/g" {} +
 
+          echo "2. Enforcing App Group across codebase..."
+          # Replace both the original upstream group and any mutated bundle variations
+          find . -type f \( -name "*.swift" -o -name "*.plist" -o -name "*.entitlements" -o -name "*.Project.swift" -o -name "Project.swift" \) \
+            -not -path "*/.*" \
+            -exec sed -i '' "s/group\.[A-Z0-9]*\.com\.ronkozel\.nuviotvos/${TARGET_GROUP}/g" {} + \
+            -exec sed -i '' "s/group\.com\.ronkozel\.nuviotvos/${TARGET_GROUP}/g" {} + \
+            -exec sed -i '' "s/group\.com\.pyksel\.nuviotvos/${TARGET_GROUP}/g" {} +
+
           echo "Verification:"
+          echo "--- Bundle ID matches ---"
           grep -rn "$NEW_BUNDLE" . || { echo "Failed to patch bundle ID"; exit 1; }
-          grep -rn "$NEW_GROUP" . || { echo "Failed to patch app group"; exit 1; }
+
+          echo "--- App Group matches ---"
+          grep -rn "$TARGET_GROUP" . || { echo "Failed to patch app group"; exit 1; }
 
       - name: Show Xcode version
         if: steps.get_tag.outputs.should_build == 'true'
