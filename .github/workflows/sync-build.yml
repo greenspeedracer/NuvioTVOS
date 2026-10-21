@@ -94,6 +94,19 @@ jobs:
           echo "--- App Group matches ---"
           grep -rn "$TARGET_GROUP" . || { echo "Failed to patch app group"; exit 1; }
 
+      - name: Pin Top Shelf App Group
+        if: steps.get_tag.outputs.should_build == 'true'
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("tvosApp/NuvioTV/Sources/Core/TopShelf/TopShelfFeed.swift")
+          s = p.read_text()
+          old = 'return "group.\\(mainAppBundleID)"'
+          new = 'return "group.M3HWHXLPC7.com.pyksel.nuviotvos"'
+          assert s.count(old) == 1, f"expected 1 match, found {s.count(old)}"
+          p.write_text(s.replace(old, new))
+          PY
+
       - name: Show Xcode version
         if: steps.get_tag.outputs.should_build == 'true'
         run: xcodebuild -version
