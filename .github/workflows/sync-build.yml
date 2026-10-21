@@ -1,0 +1,112 @@
+name: Sync Upstream Release and Build
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_tag:
+        description: 'Specific upstream tag to build (leave empty for latest)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - name: Determine Upstream Release Tag
+        id: get_tag
+        run: |
+          if [ -n "${{ github.event.inputs.force_tag }}" ]; then
+            TAG="${{ github.event.inputs.force_tag }}"
+          else
+            TAG=$(curl -sL https://api.github.com/repos/bobsupra/NuvioTVOS/releases/latest | jq -r '.tag_name')
+          fi
+
+          if [ -z "$TAG" ] \vert{}\vert{} [ "$TAG" = "null" ]; then
+            echo "Failed to fetch upstream release tag."
+            exit 1
+          fi
+
+          echo "target_tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          EXISTS=$(curl -sL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG | jq -r '.tag_name')
+
+          if [ "$EXISTS" = "$TAG" ] && [ -z "${{ github.event.inputs.force_tag }}" ]; then
+            echo "Release $TAG already built. Skipping."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout Upstream Tag
+        if: steps.get_tag.outputs.should_build == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: 'bobsupra/NuvioTVOS'
+          ref: ${{ steps.get_tag.outputs.target_tag }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Patch App Group Identifiers
+        if: steps.get_tag.outputs.should_build == 'true'
+        run: |
+          OLD_GROUP="group.com.pyksel.nuviotvos"
+          NEW_GROUP="group.M3HWHXLPC7.com.pyksel.nuviotvos"
+
+          echo "Replacing $OLD_GROUP with$NEW_GROUP across codebase..."
+          find . -type f \( -name "*.swift" -o -name "*.plist" -o -name "*.entitlements" -o -name "*.Project.swift" -o -name "Project.swift" \) \
+            -not -path "*/.*" \
+            -exec sed -i '' "s/${OLD_GROUP}/${NEW_GROUP}/g" {} +
+
+          MATCHES=$(grep -rn "$NEW_GROUP" . || true)
+          if [ -z "$MATCHES" ]; then
+            echo "Error: Failed to patch $OLD_GROUP."
+            exit 1
+          else
+            echo "Patch applied successfully."
+          fi
+
+      - name: Show Xcode version
+        if: steps.get_tag.outputs.should_build == 'true'
+        run: xcodebuild -version
+
+      - name: Install mise
+        if: steps.get_tag.outputs.should_build == 'true'
+        run: curl https://mise.run | sh
+
+      - name: Install pinned tool versions (Tuist)
+        if: steps.get_tag.outputs.should_build == 'true'
+        run: |
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/mise" install
+
+      - name: Build IPA
+        if: steps.get_tag.outputs.should_build == 'true'
+        run: bash scripts/build-ipa.sh
+
+      - name: Upload IPA
+        if: steps.get_tag.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NuvioTV-${{ steps.get_tag.outputs.target_tag }}-unsigned-ipa
+          path: build-ipa/*.ipa
+          if-no-files-found: error
+
+      - name: Publish Fork Release
+        if: steps.get_tag.outputs.should_build == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_tag.outputs.target_tag }}
+          name: Nuvio tvOS ${{ steps.get_tag.outputs.target_tag }} (Patched Group)
+          body: |
+            Automated build for upstream release [${{ steps.get_tag.outputs.target_tag }}](https://github.com/bobsupra/NuvioTVOS/releases/tag/${{ steps.get_tag.outputs.target_tag }}).
+            Patched App Group: `group.M3HWHXLPC7.com.pyksel.nuviotvos`.
+          files: build-ipa/*.ipa
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
