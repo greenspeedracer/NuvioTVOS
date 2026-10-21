@@ -65,7 +65,6 @@ jobs:
           repository: 'bobsupra/NuvioTVOS'
           ref: ${{ steps.get_tag.outputs.target_tag }}
           submodules: recursive
-          fetch-depth: 0
 
       - name: Patch Bundle IDs and App Group
         if: steps.get_tag.outputs.should_build == 'true'
