@@ -107,105 +107,105 @@ jobs:
           p.write_text(s.replace(old, new))
           PY
 
-      - name: Add Top Shelf logging
-        if: steps.get_tag.outputs.should_build == 'true'
-        run: |
-          python3 - <<'PY'
-          import pathlib
+      # - name: Add Top Shelf logging
+      #   if: steps.get_tag.outputs.should_build == 'true'
+      #   run: |
+      #     python3 - <<'PY'
+      #     import pathlib
 
-          p = pathlib.Path("tvosApp/NuvioTV/Sources/Core/TopShelf/TopShelfFeed.swift")
-          s = p.read_text()
+      #     p = pathlib.Path("tvosApp/NuvioTV/Sources/Core/TopShelf/TopShelfFeed.swift")
+      #     s = p.read_text()
 
-          def swap(old, new):
-              global s
-              assert s.count(old) == 1, f"expected 1 match, found {s.count(old)} for: {old[:70]!r}"
-              s = s.replace(old, new)
+      #     def swap(old, new):
+      #         global s
+      #         assert s.count(old) == 1, f"expected 1 match, found {s.count(old)} for: {old[:70]!r}"
+      #         s = s.replace(old, new)
 
-          swap(r'''import Foundation
-          #if canImport(UIKit)''', r'''import Foundation
-          import os
-          #if canImport(UIKit)''')
+      #     swap(r'''import Foundation
+      #     #if canImport(UIKit)''', r'''import Foundation
+      #     import os
+      #     #if canImport(UIKit)''')
 
-          swap(r'''/// One card on the Top Shelf row.''', r'''fileprivate let topShelfLog = Logger(subsystem: "com.ronkozel.nuviotvos.topshelf", category: "feed")
+      #     swap(r'''/// One card on the Top Shelf row.''', r'''fileprivate let topShelfLog = Logger(subsystem: "com.ronkozel.nuviotvos.topshelf", category: "feed")
 
-          /// One card on the Top Shelf row.''')
+      #     /// One card on the Top Shelf row.''')
 
-          swap(r'''public static var isAvailable: Bool {
-                  FileManager.default.containerURL(
-                      forSecurityApplicationGroupIdentifier: topShelfAppGroupID
-                  ) != nil
-              }''', r'''public static var isAvailable: Bool {
-                  let url = FileManager.default.containerURL(
-                      forSecurityApplicationGroupIdentifier: topShelfAppGroupID
-                  )
-                  let groupID = topShelfAppGroupID
-                  let bundleID = Bundle.main.bundleIdentifier ?? "nil"
-                  let path = url?.path ?? "nil"
-                  topShelfLog.notice("isAvailable group=\(groupID, privacy: .public) bundle=\(bundleID, privacy: .public) container=\(path, privacy: .public)")
-                  return url != nil
-              }''')
+      #     swap(r'''public static var isAvailable: Bool {
+      #             FileManager.default.containerURL(
+      #                 forSecurityApplicationGroupIdentifier: topShelfAppGroupID
+      #             ) != nil
+      #         }''', r'''public static var isAvailable: Bool {
+      #             let url = FileManager.default.containerURL(
+      #                 forSecurityApplicationGroupIdentifier: topShelfAppGroupID
+      #             )
+      #             let groupID = topShelfAppGroupID
+      #             let bundleID = Bundle.main.bundleIdentifier ?? "nil"
+      #             let path = url?.path ?? "nil"
+      #             topShelfLog.notice("isAvailable group=\(groupID, privacy: .public) bundle=\(bundleID, privacy: .public) container=\(path, privacy: .public)")
+      #             return url != nil
+      #         }''')
 
-          swap(r'''guard isAvailable else { return }
-                  let generation = writeCoordinator.beginWrite()''', r'''guard isAvailable else {
-                      topShelfLog.error("write skipped: container unavailable entries=\(entries.count)")
-                      return
-                  }
-                  topShelfLog.notice("write begin entries=\(entries.count)")
-                  let generation = writeCoordinator.beginWrite()''')
+      #     swap(r'''guard isAvailable else { return }
+      #             let generation = writeCoordinator.beginWrite()''', r'''guard isAvailable else {
+      #                 topShelfLog.error("write skipped: container unavailable entries=\(entries.count)")
+      #                 return
+      #             }
+      #             topShelfLog.notice("write begin entries=\(entries.count)")
+      #             let generation = writeCoordinator.beginWrite()''')
 
-          swap(r'''guard let url = feedFileURL else { return }
-                  let feed = TopShelfFeed(entries: entries)
-                  guard let data = try? JSONEncoder().encode(feed) else { return }
-                  TopShelfArtworkPruner.withFeedLock {
-                      try? data.write(to: url, options: .atomic)
-                  }''', r'''guard let url = feedFileURL else {
-                      topShelfLog.error("writeFeed: feedFileURL is nil")
-                      return
-                  }
-                  let feed = TopShelfFeed(entries: entries)
-                  let data: Data
-                  do {
-                      data = try JSONEncoder().encode(feed)
-                  } catch {
-                      topShelfLog.error("writeFeed: encode failed: \(String(describing: error), privacy: .public)")
-                      return
-                  }
-                  TopShelfArtworkPruner.withFeedLock {
-                      do {
-                          try data.write(to: url, options: .atomic)
-                          topShelfLog.notice("writeFeed: wrote \(data.count) bytes to \(url.path, privacy: .public)")
-                      } catch {
-                          topShelfLog.error("writeFeed: write failed path=\(url.path, privacy: .public) error=\(String(describing: error), privacy: .public)")
-                      }
-                  }''')
+      #     swap(r'''guard let url = feedFileURL else { return }
+      #             let feed = TopShelfFeed(entries: entries)
+      #             guard let data = try? JSONEncoder().encode(feed) else { return }
+      #             TopShelfArtworkPruner.withFeedLock {
+      #                 try? data.write(to: url, options: .atomic)
+      #             }''', r'''guard let url = feedFileURL else {
+      #                 topShelfLog.error("writeFeed: feedFileURL is nil")
+      #                 return
+      #             }
+      #             let feed = TopShelfFeed(entries: entries)
+      #             let data: Data
+      #             do {
+      #                 data = try JSONEncoder().encode(feed)
+      #             } catch {
+      #                 topShelfLog.error("writeFeed: encode failed: \(String(describing: error), privacy: .public)")
+      #                 return
+      #             }
+      #             TopShelfArtworkPruner.withFeedLock {
+      #                 do {
+      #                     try data.write(to: url, options: .atomic)
+      #                     topShelfLog.notice("writeFeed: wrote \(data.count) bytes to \(url.path, privacy: .public)")
+      #                 } catch {
+      #                     topShelfLog.error("writeFeed: write failed path=\(url.path, privacy: .public) error=\(String(describing: error), privacy: .public)")
+      #                 }
+      #             }''')
 
-          swap(r'''guard let url = feedFileURL,
-                        let data = try? Data(contentsOf: url),
-                        let feed = try? JSONDecoder().decode(TopShelfFeed.self, from: data) else {
-                      return nil
-                  }
-                  return feed''', r'''guard let url = feedFileURL else {
-                      topShelfLog.error("read: feedFileURL is nil")
-                      return nil
-                  }
-                  let data: Data
-                  do {
-                      data = try Data(contentsOf: url)
-                  } catch {
-                      topShelfLog.error("read: cannot read \(url.path, privacy: .public): \(String(describing: error), privacy: .public)")
-                      return nil
-                  }
-                  do {
-                      let feed = try JSONDecoder().decode(TopShelfFeed.self, from: data)
-                      topShelfLog.notice("read: ok entries=\(feed.entries.count) bytes=\(data.count)")
-                      return feed
-                  } catch {
-                      topShelfLog.error("read: decode failed bytes=\(data.count): \(String(describing: error), privacy: .public)")
-                      return nil
-                  }''')
+      #     swap(r'''guard let url = feedFileURL,
+      #                   let data = try? Data(contentsOf: url),
+      #                   let feed = try? JSONDecoder().decode(TopShelfFeed.self, from: data) else {
+      #                 return nil
+      #             }
+      #             return feed''', r'''guard let url = feedFileURL else {
+      #                 topShelfLog.error("read: feedFileURL is nil")
+      #                 return nil
+      #             }
+      #             let data: Data
+      #             do {
+      #                 data = try Data(contentsOf: url)
+      #             } catch {
+      #                 topShelfLog.error("read: cannot read \(url.path, privacy: .public): \(String(describing: error), privacy: .public)")
+      #                 return nil
+      #             }
+      #             do {
+      #                 let feed = try JSONDecoder().decode(TopShelfFeed.self, from: data)
+      #                 topShelfLog.notice("read: ok entries=\(feed.entries.count) bytes=\(data.count)")
+      #                 return feed
+      #             } catch {
+      #                 topShelfLog.error("read: decode failed bytes=\(data.count): \(String(describing: error), privacy: .public)")
+      #                 return nil
+      #             }''')
 
-          p.write_text(s)
-          PY
+      #     p.write_text(s)
+      #     PY
 
       - name: Move Top Shelf feed under Library/Caches
         if: steps.get_tag.outputs.should_build == 'true'
