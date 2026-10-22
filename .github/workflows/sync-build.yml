@@ -207,6 +207,29 @@ jobs:
           p.write_text(s)
           PY
 
+      - name: Move Top Shelf feed under Library/Caches
+        if: steps.get_tag.outputs.should_build == 'true'
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          p = pathlib.Path("tvosApp/NuvioTV/Sources/Core/TopShelf/TopShelfFeed.swift")
+          s = p.read_text()
+          caches = 'container.appendingPathComponent("Library/Caches", isDirectory: true)'
+          reps = [
+              ('return container.appendingPathComponent(feedFileName)',
+               'return ' + caches + '.appendingPathComponent(feedFileName)'),
+              ('let url = container.appendingPathComponent(artworkFileName)',
+               'let url = ' + caches + '.appendingPathComponent(artworkFileName)'),
+              ('return container.appendingPathComponent(artworkFileName)',
+               'return ' + caches + '.appendingPathComponent(artworkFileName)'),
+          ]
+          for old, new in reps:
+              assert s.count(old) == 1, f"expected 1 match for {old!r}, found {s.count(old)}"
+              s = s.replace(old, new)
+          p.write_text(s)
+          PY
+
       - name: Show Xcode version
         if: steps.get_tag.outputs.should_build == 'true'
         run: xcodebuild -version
@@ -232,6 +255,32 @@ jobs:
           name: NuvioTV-${{ steps.get_tag.outputs.target_tag }}-unsigned-ipa
           path: build-ipa/*.ipa
           if-no-files-found: error
+
+      - name: Delete existing release for this tag
+        if: steps.get_tag.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.get_tag.outputs.target_tag }}"
+          API="https://api.github.com/repos/${{ github.repository }}"
+
+          RELEASE_ID=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API/releases/tags/$TAG" | jq -r '.id // empty')
+
+          if [ -n "$RELEASE_ID" ]; then
+            echo "Deleting existing release $TAG (id $RELEASE_ID)"
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API/releases/$RELEASE_ID")
+            if [ "$STATUS" != "204" ]; then
+              echo "::error::Failed to delete release $TAG (HTTP $STATUS)"
+              exit 1
+            fi
+          else
+            echo "No existing release for $TAG"
+          fi
 
       - name: Publish Fork Release
         if: steps.get_tag.outputs.should_build == 'true'
