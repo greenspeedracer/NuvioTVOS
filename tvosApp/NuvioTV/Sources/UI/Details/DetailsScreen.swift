@@ -58,8 +58,6 @@ struct DetailsScreen: View {
 
     @StateObject private var viewModel: DetailsViewModel
     @State private var isStreamPickerPresented = false
-    @State private var isWatchPartyEpisodePickerPresented = false
-    @State private var pendingWatchPartySelection: (NuvioMeta, NuvioVideo)?
     @State private var isSmartPlaybackPending = false
     @State private var isPreparingPlayback = false
     @State private var isPreparingInitialPlayback = false
@@ -238,13 +236,9 @@ struct DetailsScreen: View {
                             forceManualPicker: true
                         )
                     },
-                    onHostWatchParty: onCreateWatchParty == nil ? nil : {
+                    onHostWatchParty: onCreateWatchParty == nil ? nil : { episode in
                         guard let meta = viewModel.uiState.meta else { return }
-                        if meta.isSeries {
-                            isWatchPartyEpisodePickerPresented = true
-                        } else {
-                            onCreateWatchParty?(meta, nil)
-                        }
+                        onCreateWatchParty?(meta, episode)
                     },
                     onEpisodeSelected: { video in
                         if creatingWatchPartyRoom, let meta = viewModel.uiState.meta {
@@ -297,7 +291,7 @@ struct DetailsScreen: View {
                 // While the stream picker is open it sits on top as a full-screen
                 // overlay; disable the details content so the focus engine can't
                 // route focus to the (hidden) buttons behind it.
-                .disabled(isStreamPickerPresented || isWatchPartyEpisodePickerPresented || expandedComment != nil || isSmartPlaybackPending || isResolvingDebrid || isPreparingPlayback || isPreparingInitialPlayback)
+                .disabled(isStreamPickerPresented || expandedComment != nil || isSmartPlaybackPending || isResolvingDebrid || isPreparingPlayback || isPreparingInitialPlayback)
                 #else
                 MobileDetailsContent(
                     uiState: viewModel.uiState,
@@ -345,26 +339,6 @@ struct DetailsScreen: View {
             }
         }
         #if os(tvOS)
-        .fullScreenCover(isPresented: $isWatchPartyEpisodePickerPresented, onDismiss: {
-            // Wait for the native focus hierarchy to dismiss before navigating.
-            guard let selection = pendingWatchPartySelection else { return }
-            pendingWatchPartySelection = nil
-            onCreateWatchParty?(selection.0, selection.1)
-        }) {
-            if let meta = viewModel.uiState.meta {
-                WatchPartyDetailsEpisodePicker(
-                    episodes: (meta.videos ?? []).filter { $0.episode > 0 && $0.season >= 0 },
-                    onSelect: { episode in
-                        pendingWatchPartySelection = (meta, episode)
-                        isWatchPartyEpisodePickerPresented = false
-                    },
-                    onCancel: {
-                        pendingWatchPartySelection = nil
-                        isWatchPartyEpisodePickerPresented = false
-                    }
-                )
-            }
-        }
         // Present sources in an isolated full-screen focus hierarchy. Keeping
         // this overlay inside the details screen's vertical ScrollView ancestry
         // lets tvOS apply focus-visibility corrections to the shared host,
@@ -709,6 +683,7 @@ struct DetailsScreen: View {
             let debridSaved = preResolvedDuration ?? 0
             let totalSaved = discoverySaved + debridSaved
 
+            #if DEBUG
             print("\n============================================================")
             print("[PreFetch] 🚀 INSTANT PLAYBACK TRIGGERED (ZERO-WAIT LAUNCH):")
             print("  • Title:              \(meta.name)")
@@ -718,6 +693,7 @@ struct DetailsScreen: View {
             print("  • Debrid Resolution:  Saved \(String(format: "%.3fs", debridSaved)) (bypassed)")
             print("  ⏱ TOTAL TIME SAVED:   \(String(format: "%.3fs", totalSaved))")
             print("============================================================\n")
+            #endif
 
             let startupToken = ensureStartupRequest(title: meta.name)
             PlaybackStartupTiming.markSourcePicked(stream: preStream, token: startupToken)
@@ -1121,6 +1097,23 @@ struct DetailsScreen: View {
         }
     }
 
+    /// Up to two more Usenet streams (other NZBs) listed after `stream`.
+    private func usenetAlternates(after stream: NuvioStream) -> [NuvioStream] {
+        let all = viewModel.uiState.streams
+        let chosenNZB = stream.directURL.flatMap(URL.init(string:)).flatMap(UsenetStreamSpec.init(url:))?.nzbURL
+        let start = all.firstIndex { $0.id == stream.id }.map { $0 + 1 } ?? 0
+        var seen = Set(chosenNZB.map { [$0] } ?? [])
+        var result: [NuvioStream] = []
+        for candidate in all[start...] where result.count < 2 {
+            guard candidate.unavailabilityReason == nil,
+                  let raw = candidate.directURL, let url = URL(string: raw),
+                  let spec = UsenetStreamSpec(url: url),
+                  seen.insert(spec.nzbURL).inserted else { continue }
+            result.append(candidate)
+        }
+        return result
+    }
+
     /// Plays a chosen stream. Direct URLs go straight to the player; torrent-only
     /// streams are resolved through the configured debrid provider first, keeping
     /// the picker's spinner up until a link comes back (or the attempt fails).
@@ -1150,6 +1143,69 @@ struct DetailsScreen: View {
             BingeGroupStore.save(seriesId: meta.id, stream: stream, profileId: activeProfileId)
         }
         PlaybackStartupTiming.markSourcePicked(stream: stream, token: startupToken)
+        // Usenet: start the on-device engine here so a failure (no server,
+        // incomplete release) lands back in the source picker with a reason.
+        if let raw = stream.directURL, let usenetURL = URL(string: raw), UsenetStreamSpec(url: usenetURL) != nil {
+            isResolvingDebrid = true
+            isPreparingPlayback = true
+            isSmartPlaybackPending = false
+            // A broken release falls through to the next Usenet streams of the
+            // same title, so one bad upload doesn't end in an error.
+            let candidates = [stream] + usenetAlternates(after: stream)
+            Task { @MainActor in
+                var lastError: Error = UsenetError.noPlayableFile
+                for candidate in candidates {
+                    guard let raw = candidate.directURL, let url = URL(string: raw),
+                          let spec = UsenetStreamSpec(url: url) else { continue }
+                    do {
+                        let localURL = try await UsenetEngineManager.shared.startStream(spec)
+                        guard PlaybackStartupTiming.isActive(token: startupToken) else {
+                            await UsenetEngineManager.shared.stopActiveStream(for: localURL)
+                            return
+                        }
+                        isResolvingDebrid = false
+                        isStreamPickerPresented = false
+                        if !candidate.isNotPlayable { armExternalPlayerTimeoutIfNeeded(player: player) }
+                        if self.startupBenchmarkToken == startupToken {
+                            self.startupBenchmarkToken = nil
+                        }
+                        onPlayClick(
+                            localURL.absoluteString,
+                            candidate.httpHeaders ?? [:],
+                            meta,
+                            pendingEpisodeSubtitle,
+                            candidate.subtitles,
+                            pendingEpisode,
+                            orderedEpisodes(for: meta),
+                            player,
+                            nil,
+                            candidate.filename,
+                            candidate.videoSize,
+                            candidate.videoHash,
+                            nil,
+                            startupToken,
+                            candidate.id,
+                            candidate.isNotPlayable
+                        )
+                        return
+                    } catch {
+                        lastError = error
+                        guard UsenetEngineManager.isReleaseProblem(error),
+                              PlaybackStartupTiming.isActive(token: startupToken) else { break }
+                        usenetLog.notice("usenet: trying the next source after: \(error.localizedDescription, privacy: .public)")
+                    }
+                }
+                isResolvingDebrid = false
+                cancelStartupRequest(token: startupToken)
+                isPreparingPlayback = false
+                isSmartPlaybackPending = false
+                if !(lastError is CancellationError) {
+                    streamPickerAvailabilityMessage = lastError.localizedDescription
+                    isStreamPickerPresented = true
+                }
+            }
+            return
+        }
         if let url = stream.directURL, !url.isEmpty {
             isStreamPickerPresented = false
             isPreparingPlayback = true
@@ -1380,6 +1436,29 @@ actor YouTubeTrailerResolver {
     private var trailerIdFailureDates: [String: Date] = [:]
     private var trailerioCache: [String: TrailerPlaybackSource] = [:]
 
+    private let preferredLanguageProvider: () -> String
+    private let configurationIdentityProvider: () -> String
+    private let trailerYouTubeIdProvider: ((NuvioMeta) async -> String?)?
+    private let refreshedTrailerIdsProvider: ((NuvioMeta) async -> [String]?)?
+    private let trailerioProvider: ((String, Bool) async -> TrailerPlaybackSource?)?
+    private let youtubeSourceProvider: ((String, String?, String?, Bool) async -> TrailerPlaybackSource?)?
+
+    init(
+        preferredLanguageProvider: @escaping () -> String = { TmdbDetailsService.preferredLanguage },
+        configurationIdentityProvider: @escaping () -> String = { TmdbDetailsService.trailerResolutionConfigurationIdentity },
+        trailerYouTubeIdProvider: ((NuvioMeta) async -> String?)? = nil,
+        refreshedTrailerIdsProvider: ((NuvioMeta) async -> [String]?)? = nil,
+        trailerioProvider: ((String, Bool) async -> TrailerPlaybackSource?)? = nil,
+        youtubeSourceProvider: ((String, String?, String?, Bool) async -> TrailerPlaybackSource?)? = nil
+    ) {
+        self.preferredLanguageProvider = preferredLanguageProvider
+        self.configurationIdentityProvider = configurationIdentityProvider
+        self.trailerYouTubeIdProvider = trailerYouTubeIdProvider
+        self.refreshedTrailerIdsProvider = refreshedTrailerIdsProvider
+        self.trailerioProvider = trailerioProvider
+        self.youtubeSourceProvider = youtubeSourceProvider
+    }
+
     private struct TrailerioResponse: Decodable {
         struct Meta: Decodable {
             struct Link: Decodable {
@@ -1477,35 +1556,15 @@ actor YouTubeTrailerResolver {
     }
 
     func resolve(for meta: NuvioMeta) async -> TrailerPlaybackSource? {
-        // 1. Try Trailerio first (direct 1080p CDN streams from Apple TV, Rotten Tomatoes, Plex)
-        if let imdbId = meta.imdbId ?? NuvioMeta.canonicalImdbID(from: meta.id),
-           let source = await resolveTrailerio(imdbId: imdbId, isSeries: meta.isSeries) {
-            return source
+        await TmdbDetailsService.withRequestContext {
+            await self.resolveForCurrentContext(meta, preview: false)
         }
-
-        // 2. Fall back to YouTube resolver
-        guard let ytId = await preferredTrailerYouTubeId(for: meta) else { return nil }
-        return await resolve(
-            youtubeVideoId: ytId,
-            title: meta.name,
-            year: meta.year.map(String.init)
-        )
     }
 
     func resolvePreview(for meta: NuvioMeta) async -> TrailerPlaybackSource? {
-        // 1. Try Trailerio first (direct 1080p CDN streams from Apple TV, Rotten Tomatoes, Plex)
-        if let imdbId = meta.imdbId ?? NuvioMeta.canonicalImdbID(from: meta.id),
-           let source = await resolveTrailerio(imdbId: imdbId, isSeries: meta.isSeries) {
-            return source
+        await TmdbDetailsService.withRequestContext {
+            await self.resolveForCurrentContext(meta, preview: true)
         }
-
-        // 2. Fall back to YouTube preview resolver
-        guard let ytId = await preferredTrailerYouTubeId(for: meta) else { return nil }
-        return await resolvePreview(
-            youtubeVideoId: ytId,
-            title: meta.name,
-            year: meta.year.map(String.init)
-        )
     }
 
     static func preferredTrailerYouTubeId(for meta: NuvioMeta) async -> String? {
@@ -1513,7 +1572,21 @@ actor YouTubeTrailerResolver {
     }
 
     func preferredTrailerYouTubeId(for meta: NuvioMeta) async -> String? {
-        let cacheKey = "\(meta.id)|\(meta.tmdbId ?? 0)"
+        await TmdbDetailsService.withRequestContext {
+            await self.preferredTrailerYouTubeIdInCurrentContext(for: meta)
+        }
+    }
+
+    private func preferredTrailerYouTubeIdInCurrentContext(for meta: NuvioMeta) async -> String? {
+        let mediaType = meta.isSeries ? "tv" : "movie"
+        let language = TmdbMetadataLanguage.normalized(preferredLanguageProvider())
+        let cacheKey = [
+            meta.id,
+            String(meta.tmdbId ?? 0),
+            mediaType,
+            language,
+            configurationIdentityProvider()
+        ].joined(separator: "|")
         if let cached = trailerIdCache[cacheKey] {
             if !cached.isEmpty { return cached }
             if let failedAt = trailerIdFailureDates[cacheKey],
@@ -1526,20 +1599,36 @@ actor YouTubeTrailerResolver {
 
         var resolvedId: String? = nil
 
-        if let ytId = meta.trailerYtIds?
-            .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
-            .first(where: { Self.isYouTubeVideoId($0) }) {
-            resolvedId = ytId
-        } else if let ytId = await TmdbDetailsService.fetchTrailerYouTubeId(for: meta),
+        // TMDB applies the selected metadata language and its own English
+        // fallback, so prefer it to untagged catalog trailer IDs.
+        let tmdbTrailerId: String?
+        if let trailerYouTubeIdProvider {
+            tmdbTrailerId = await trailerYouTubeIdProvider(meta)
+        } else {
+            tmdbTrailerId = await TmdbDetailsService.fetchTrailerYouTubeId(for: meta)
+        }
+        if let ytId = tmdbTrailerId,
            Self.isYouTubeVideoId(ytId.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            resolvedId = ytId
-        } else if let refreshed = try? await CinemetaCatalogRepository().getMetadata(
-            id: meta.id,
-            type: meta.type
-        ), let ytId = refreshed.trailerYtIds?
+            resolvedId = ytId.trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if let ytId = meta.trailerYtIds?
             .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
             .first(where: { Self.isYouTubeVideoId($0) }) {
             resolvedId = ytId
+        } else {
+            let refreshedTrailerIds: [String]?
+            if let refreshedTrailerIdsProvider {
+                refreshedTrailerIds = await refreshedTrailerIdsProvider(meta)
+            } else if let refreshed = try? await CinemetaCatalogRepository().getMetadata(
+                id: meta.id,
+                type: meta.type
+            ) {
+                refreshedTrailerIds = refreshed.trailerYtIds
+            } else {
+                refreshedTrailerIds = nil
+            }
+            resolvedId = refreshedTrailerIds?
+                .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+                .first(where: { Self.isYouTubeVideoId($0) })
         }
 
         guard !Task.isCancelled else { return nil }
@@ -1554,6 +1643,57 @@ actor YouTubeTrailerResolver {
             trailerIdFailureDates.removeValue(forKey: cacheKey)
         }
         return resolvedId
+    }
+
+    private func resolveForCurrentContext(
+        _ meta: NuvioMeta,
+        preview: Bool
+    ) async -> TrailerPlaybackSource? {
+        let isEnglish = TmdbMetadataLanguage.normalized(preferredLanguageProvider())
+            .split(separator: "-").first?.lowercased() == "en"
+
+        if isEnglish, let source = await resolveTrailerio(for: meta) {
+            return source
+        }
+
+        if let ytId = await preferredTrailerYouTubeIdInCurrentContext(for: meta) {
+            let source: TrailerPlaybackSource?
+            if let youtubeSourceProvider {
+                source = await youtubeSourceProvider(
+                    ytId,
+                    meta.name,
+                    meta.year.map(String.init),
+                    preview
+                )
+            } else if preview {
+                source = await resolvePreview(
+                    youtubeVideoId: ytId,
+                    title: meta.name,
+                    year: meta.year.map(String.init)
+                )
+            } else {
+                source = await resolve(
+                    youtubeVideoId: ytId,
+                    title: meta.name,
+                    year: meta.year.map(String.init)
+                )
+            }
+            if let source { return source }
+        }
+
+        // The YouTube ID may be present while its stream is unavailable. Keep
+        // Trailerio as a fallback for both language paths in that case.
+        return isEnglish ? nil : await resolveTrailerio(for: meta)
+    }
+
+    private func resolveTrailerio(for meta: NuvioMeta) async -> TrailerPlaybackSource? {
+        guard let imdbId = meta.imdbId ?? NuvioMeta.canonicalImdbID(from: meta.id) else {
+            return nil
+        }
+        if let trailerioProvider {
+            return await trailerioProvider(imdbId, meta.isSeries)
+        }
+        return await resolveTrailerio(imdbId: imdbId, isSeries: meta.isSeries)
     }
     private struct Client {
         let key: String
@@ -3199,84 +3339,13 @@ private enum TvDetailsFocusSection: Hashable {
     case comments
 }
 
-/// A separate focus hierarchy for choosing the exact episode to host.
-private struct WatchPartyDetailsEpisodePicker: View {
-    let episodes: [NuvioVideo]
-    let onSelect: (NuvioVideo) -> Void
-    let onCancel: () -> Void
-
-    @FocusState private var focusedEpisodeID: String?
-
-    private var sortedEpisodes: [NuvioVideo] {
-        episodes.sorted {
-            ($0.season, $0.episode, $0.id) < ($1.season, $1.episode, $1.id)
-        }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 26) {
-            HStack {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Choose an episode")
-                        .font(.system(size: 40, weight: .bold))
-                    Text("Your Watch Party room will be created for this exact episode.")
-                        .font(.system(size: 21))
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button("Cancel", action: onCancel)
-            }
-            .padding(.horizontal, 64)
-
-            if sortedEpisodes.isEmpty {
-                ContentUnavailableView(
-                    "Episodes unavailable",
-                    systemImage: "tv",
-                    description: Text("Wait for the episode list to load before creating a room.")
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 14) {
-                        ForEach(sortedEpisodes, id: \.id) { episode in
-                            Button {
-                                onSelect(episode)
-                            } label: {
-                                HStack(spacing: 20) {
-                                    Text("S\(episode.season) · E\(episode.episode)")
-                                        .font(.system(size: 23, weight: .semibold, design: .monospaced))
-                                    Text(episode.title)
-                                        .font(.system(size: 22))
-                                        .lineLimit(2)
-                                    Spacer()
-                                    Image(systemName: "chevron.right")
-                                }
-                                .padding(22)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 18))
-                            }
-                            .buttonStyle(.plain)
-                            .focused($focusedEpisodeID, equals: episode.id)
-                        }
-                    }
-                    .padding(.horizontal, 64)
-                }
-            }
-        }
-        .padding(.vertical, 46)
-        .background(Color.black.ignoresSafeArea())
-        .onAppear { focusedEpisodeID = sortedEpisodes.first?.id }
-        .onExitCommand(perform: onCancel)
-    }
-}
-
 struct TvDetailsContent: View {
     let uiState: DetailsUiState
     var initialPlayRequestID: UInt? = nil
     var onInitialPlayRequestConsumed: ((UInt) -> Void)? = nil
     let onPlayClick: () -> Void
     var onPlayManually: (() -> Void)? = nil
-    var onHostWatchParty: (() -> Void)? = nil
+    var onHostWatchParty: ((NuvioVideo?) -> Void)? = nil
     let onEpisodeSelected: (NuvioVideo) -> Void
     var onEpisodePlayManually: ((NuvioVideo) -> Void)? = nil
     var onEpisodeMenuPresented: ((Bool) -> Void)? = nil
@@ -3301,6 +3370,7 @@ struct TvDetailsContent: View {
     /// The section that currently owns focus. Other sections expose only their
     /// remembered entry anchor, matching Settings' pre-spatial focus lock.
     @State private var focusedDetailsSection: TvDetailsFocusSection = .actions
+    @State private var isChoosingWatchPartyEpisode = false
     @State private var consumedInitialPlayRequestID: UInt?
     @State private var detailsFocusMoveGeneration = 0
     @State private var pendingPlayFocusGeneration: Int?
@@ -3567,7 +3637,13 @@ struct TvDetailsContent: View {
             onPlayLongPress: canBypassPicker ? {
                 handlePlayLongPress(playTarget: playTarget)
             } : nil,
-            onHostWatchParty: onHostWatchParty,
+            onHostWatchParty: onHostWatchParty == nil ? nil : {
+                beginWatchPartyEpisodeSelection(
+                    meta: meta,
+                    playTarget: playTarget,
+                    scrollProxy: scrollProxy
+                )
+            },
             onWatchlistClick: onWatchlistClick,
             onWatchedClick: onWatchedClick,
             onRateClick: onRateClick != nil ? {
@@ -3625,6 +3701,31 @@ struct TvDetailsContent: View {
             onPlayManually()
         } else {
             onPlayClick()
+        }
+    }
+
+    private func beginWatchPartyEpisodeSelection(
+        meta: NuvioMeta,
+        playTarget: TvDetailsPlayTarget,
+        scrollProxy: ScrollViewProxy
+    ) {
+        stopBackgroundTrailer(manual: false)
+        guard meta.isSeries else {
+            onHostWatchParty?(nil)
+            return
+        }
+        guard let episode = playTarget.episode else { return }
+
+        isChoosingWatchPartyEpisode = true
+        cancelPendingFocusHandoff()
+        focusedDetailsSection = .episodes
+        withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
+            scrollProxy.scrollTo(TvDetailsScrollID.episodesSection, anchor: .top)
+        }
+        let target = TvEpisodeFocus.card(episode.id)
+        DispatchQueue.main.asyncAfter(deadline: .now() + TvDetailsScrollTiming.duration) {
+            guard isChoosingWatchPartyEpisode else { return }
+            episodeFocus = target
         }
     }
 
@@ -3702,6 +3803,8 @@ struct TvDetailsContent: View {
                                     presentationRevision: episodePresentation.revision,
                                     seriesRating: meta.rating,
                                     continueItem: continueItem,
+                                    isChoosingWatchPartyEpisode: isChoosingWatchPartyEpisode,
+                                    onCancelWatchPartySelection: { isChoosingWatchPartyEpisode = false },
                                     onFocus: {
                                         cancelPendingFocusHandoff()
                                         if focusedDetailsSection != .episodes {
@@ -3719,7 +3822,12 @@ struct TvDetailsContent: View {
                                     },
                                     onSelect: { video in
                                         stopBackgroundTrailer(manual: false)
-                                        onEpisodeSelected(video)
+                                        if isChoosingWatchPartyEpisode {
+                                            isChoosingWatchPartyEpisode = false
+                                            onHostWatchParty?(video)
+                                        } else {
+                                            onEpisodeSelected(video)
+                                        }
                                     },
                                     onPlayManually: onEpisodePlayManually != nil ? { video in
                                         stopBackgroundTrailer(manual: false)
@@ -4822,148 +4930,8 @@ private struct TvDetailsSummary: View {
     }
 
     private var externalRatingBadges: [TvRatingBadge] {
-        let ratings = Dictionary(
-            (meta.externalRatings ?? []).map { rating in
-                let key = rating.source.lowercased() == "mal" ? MdbListDetailsService.providerMyAnimeList : rating.source
-                return (key, rating)
-            },
-            uniquingKeysWith: { first, _ in first }
-        )
-        // 1. Built-in MDBList provider badges in priority order:
-        var badges = TvRatingVisual.all.compactMap { visual -> TvRatingBadge? in
-            guard let rating = ratings[visual.source] else { return nil }
-            return TvRatingBadge(visual: visual, rating: rating)
-        }
-        // 2. Extra rating badges provided by add-ons:
-        let builtInSources = Set(TvRatingVisual.all.map { $0.source.lowercased() })
-        let extraRatings = (meta.externalRatings ?? []).filter {
-            let lower = $0.source.lowercased()
-            return !builtInSources.contains(lower) && lower != "mal"
-        }
-        for extra in extraRatings {
-            let visual = TvRatingVisual(
-                source: extra.source,
-                displayName: extra.name ?? extra.source.capitalized,
-                assetName: nil,
-                iconUrl: extra.iconUrl.flatMap { URL(string: $0) },
-                iconWidth: 38,
-                color: Color(red: 0.96, green: 0.77, blue: 0.09),
-                format: { AddonRatingsService.formatRating(value: $0, max: extra.max) }
-            )
-            badges.append(TvRatingBadge(visual: visual, rating: extra))
-        }
-        return AddonRatingsService.sortRatings(badges, by: { $0.visual.source })
+        TvRatingBadge.badges(from: meta.externalRatings ?? [])
     }
-}
-
-private struct TvRatingBadge: Identifiable {
-    let visual: TvRatingVisual
-    let rating: NuvioExternalRating
-
-    var id: String { rating.source }
-}
-
-private struct TvRatingVisual {
-    let source: String
-    let displayName: String
-    let assetName: String?
-    let iconUrl: URL?
-    let iconWidth: CGFloat
-    let color: Color
-    let format: (Double) -> String
-
-    init(
-        source: String,
-        displayName: String,
-        assetName: String? = nil,
-        iconUrl: URL? = nil,
-        iconWidth: CGFloat,
-        color: Color,
-        format: @escaping (Double) -> String
-    ) {
-        self.source = source
-        self.displayName = displayName
-        self.assetName = assetName
-        self.iconUrl = iconUrl
-        self.iconWidth = iconWidth
-        self.color = color
-        self.format = format
-    }
-
-    static let all: [TvRatingVisual] = [
-        TvRatingVisual(
-            source: MdbListDetailsService.providerIMDb,
-            displayName: "IMDb",
-            assetName: "rating_imdb",
-            iconWidth: 68,
-            color: Color(red: 0.96, green: 0.77, blue: 0.09),
-            format: { String(format: "%.1f", $0) }
-        ),
-        TvRatingVisual(
-            source: MdbListDetailsService.providerTMDB,
-            displayName: "TMDB",
-            assetName: "rating_tmdb",
-            iconWidth: 40,
-            color: Color(red: 0.00, green: 0.71, blue: 0.89),
-            format: { String(Int($0.rounded())) }
-        ),
-        TvRatingVisual(
-            source: MdbListDetailsService.providerTomatoes,
-            displayName: "Rotten Tomatoes",
-            assetName: "rating_rotten_tomatoes",
-            iconWidth: 38,
-            color: Color(red: 0.98, green: 0.20, blue: 0.04),
-            format: { "\(Int($0.rounded()))%" }
-        ),
-        TvRatingVisual(
-            source: MdbListDetailsService.providerAudience,
-            displayName: "Audience Score",
-            assetName: "rating_audience_score",
-            iconWidth: 31,
-            color: Color(red: 0.98, green: 0.20, blue: 0.04),
-            format: { "\(Int($0.rounded()))%" }
-        ),
-        TvRatingVisual(
-            source: MdbListDetailsService.providerMetacritic,
-            displayName: "Metacritic",
-            assetName: "rating_metacritic",
-            iconWidth: 38,
-            color: Color(red: 1.00, green: 0.80, blue: 0.20),
-            format: { String(Int($0.rounded())) }
-        ),
-        TvRatingVisual(
-            source: MdbListDetailsService.providerTrakt,
-            displayName: "Trakt",
-            assetName: "rating_trakt",
-            iconWidth: 38,
-            color: Color(red: 0.93, green: 0.11, blue: 0.14),
-            format: { String(Int($0.rounded())) }
-        ),
-        TvRatingVisual(
-            source: MdbListDetailsService.providerLetterboxd,
-            displayName: "Letterboxd",
-            assetName: "rating_letterboxd",
-            iconWidth: 38,
-            color: Color(red: 0.00, green: 0.88, blue: 0.33),
-            format: { String(format: "%.1f", $0) }
-        ),
-        TvRatingVisual(
-            source: MdbListDetailsService.providerMyAnimeList,
-            displayName: "MyAnimeList",
-            assetName: "rating_myanimelist",
-            iconWidth: 42,
-            color: Color(red: 0.18, green: 0.32, blue: 0.64),
-            format: { String(format: "%.1f", $0) }
-        ),
-        TvRatingVisual(
-            source: MdbListDetailsService.providerTVDB,
-            displayName: "TVDB",
-            assetName: "rating_tvdb",
-            iconWidth: 42,
-            color: Color(red: 0.11, green: 0.66, blue: 0.31),
-            format: { $0 > 10 ? "\(Int($0.rounded()))%" : String(format: "%.1f", $0) }
-        ),
-    ]
 }
 
 private struct TvDetailsRatingsRow: View {
@@ -4974,37 +4942,9 @@ private struct TvDetailsRatingsRow: View {
             HStack(spacing: 26) {
                 ForEach(badges) { badge in
                     HStack(spacing: 9) {
-                        if let assetName = badge.visual.assetName {
-                            Image(assetName)
-                                .resizable()
-                                .scaledToFit()
-                                .frame(width: badge.visual.iconWidth, height: 38)
-                                .accessibilityLabel(badge.visual.displayName)
-                        } else if let iconUrl = badge.visual.iconUrl {
-                            AsyncImage(url: iconUrl) { phase in
-                                if let image = phase.image {
-                                    image
-                                        .resizable()
-                                        .scaledToFit()
-                                } else {
-                                    Image(systemName: "star.fill")
-                                        .resizable()
-                                        .scaledToFit()
-                                        .foregroundColor(badge.visual.color)
-                                }
-                            }
-                            .frame(width: badge.visual.iconWidth, height: 38)
-                            .accessibilityLabel(badge.visual.displayName)
-                        } else {
-                            Image(systemName: "star.fill")
-                                .resizable()
-                                .scaledToFit()
-                                .frame(width: 24, height: 24)
-                                .foregroundColor(badge.visual.color)
-                                .accessibilityLabel(badge.visual.displayName)
-                        }
+                        TvRatingIcon(visual: badge.visual, height: 38)
 
-                        Text(badge.visual.format(badge.rating.value))
+                        Text(badge.formattedValue)
                             .font(.system(size: 28, weight: .regular))
                             .foregroundColor(.white.opacity(0.62))
                     }
@@ -6827,6 +6767,8 @@ private struct TvDetailsEpisodes: View {
     let presentationRevision: TvDetailsEpisodePresentationRevision
     let seriesRating: Double?
     let continueItem: ContinueWatchingItem?
+    let isChoosingWatchPartyEpisode: Bool
+    let onCancelWatchPartySelection: () -> Void
     let onFocus: () -> Void
     let onSelect: (NuvioVideo) -> Void
     var onPlayManually: ((NuvioVideo) -> Void)? = nil
@@ -6862,6 +6804,8 @@ private struct TvDetailsEpisodes: View {
         presentationRevision: TvDetailsEpisodePresentationRevision,
         seriesRating: Double?,
         continueItem: ContinueWatchingItem?,
+        isChoosingWatchPartyEpisode: Bool = false,
+        onCancelWatchPartySelection: @escaping () -> Void = {},
         onFocus: @escaping () -> Void,
         onSelect: @escaping (NuvioVideo) -> Void,
         onPlayManually: ((NuvioVideo) -> Void)? = nil,
@@ -6879,6 +6823,8 @@ private struct TvDetailsEpisodes: View {
         self.presentationRevision = presentationRevision
         self.seriesRating = seriesRating
         self.continueItem = continueItem
+        self.isChoosingWatchPartyEpisode = isChoosingWatchPartyEpisode
+        self.onCancelWatchPartySelection = onCancelWatchPartySelection
         self.onFocus = onFocus
         self.onSelect = onSelect
         self.onPlayManually = onPlayManually
@@ -6901,13 +6847,20 @@ private struct TvDetailsEpisodes: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 30) {
+            if isChoosingWatchPartyEpisode {
+                watchPartySelectionPrompt
+            }
             watchedProgressSummary
             seasonSelector
             episodeCardStrip
         }
         .focusSection()
         .onExitCommand {
-            onBack?()
+            if isChoosingWatchPartyEpisode {
+                onCancelWatchPartySelection()
+            } else {
+                onBack?()
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification).receive(on: RunLoop.main)) { _ in
             refreshWatchedState()
@@ -6934,6 +6887,21 @@ private struct TvDetailsEpisodes: View {
         .onChange(of: selectedSeason) { _, newSeason in
             setSeasonEpisodes(episodeGuide.episodesBySeason[newSeason] ?? [])
         }
+    }
+
+    private var watchPartySelectionPrompt: some View {
+        HStack(spacing: 18) {
+            Label("Choose an episode for your Watch Party", systemImage: "person.2.fill")
+                .font(.system(size: 23, weight: .semibold))
+                .foregroundStyle(.white)
+            Spacer()
+            Button("Cancel", action: onCancelWatchPartySelection)
+                .buttonStyle(PosterCardButtonStyle())
+                .focusEffectDisabledIfAvailable()
+        }
+        .padding(.horizontal, 30)
+        .padding(.vertical, 18)
+        .background(.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
     }
 
     private func refreshEpisodeGuideState() {
@@ -7369,19 +7337,8 @@ private struct TvEpisodeCard: View {
                         ForEach(episodeRatingItems) { item in
                             HStack(spacing: 6) {
                                 if let iconUrl = item.iconUrl {
-                                    AsyncImage(url: iconUrl) { phase in
-                                        if let image = phase.image {
-                                            image
-                                                .resizable()
-                                                .scaledToFit()
-                                        } else {
-                                            Image(systemName: "star.fill")
-                                                .resizable()
-                                                .scaledToFit()
-                                                .foregroundColor(item.color)
-                                        }
-                                    }
-                                    .frame(width: 22, height: 22)
+                                    CachedRatingIcon(url: iconUrl, fallbackColor: item.color)
+                                        .frame(width: 22, height: 22)
                                 } else if let assetName = item.assetName {
                                     Image(assetName)
                                         .resizable()
@@ -7604,19 +7561,8 @@ private struct TvEpisodeCard: View {
                 ForEach(episodeRatingItems) { item in
                     HStack(spacing: 6) {
                         if let iconUrl = item.iconUrl {
-                            AsyncImage(url: iconUrl) { phase in
-                                if let image = phase.image {
-                                    image
-                                        .resizable()
-                                        .scaledToFit()
-                                } else {
-                                    Image(systemName: "star.fill")
-                                        .resizable()
-                                        .scaledToFit()
-                                        .foregroundColor(item.color)
-                                }
-                            }
-                            .frame(width: 22, height: 22)
+                            CachedRatingIcon(url: iconUrl, fallbackColor: item.color)
+                                .frame(width: 22, height: 22)
                         } else if let assetName = item.assetName {
                             Image(assetName)
                                 .resizable()
@@ -8140,19 +8086,8 @@ private struct TvStreamPickerOverlay: View {
                             ForEach(episodeRatingItems) { item in
                                 HStack(spacing: 6) {
                                     if let iconUrl = item.iconUrl {
-                                        AsyncImage(url: iconUrl) { phase in
-                                            if let image = phase.image {
-                                                image
-                                                    .resizable()
-                                                    .scaledToFit()
-                                            } else {
-                                                Image(systemName: "star.fill")
-                                                    .resizable()
-                                                    .scaledToFit()
-                                                    .foregroundColor(item.color)
-                                            }
-                                        }
-                                        .frame(width: 24, height: 24)
+                                        CachedRatingIcon(url: iconUrl, fallbackColor: item.color)
+                                            .frame(width: 24, height: 24)
                                     } else if let assetName = item.assetName {
                                         Image(assetName)
                                             .resizable()

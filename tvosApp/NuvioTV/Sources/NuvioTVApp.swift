@@ -75,10 +75,11 @@ enum TVHomeDebugTrace {
         String(format: "%.1f", Double(now() - start) / 1_000_000)
     }
 
-    static func breadcrumb(_ message: String) {
+    static func breadcrumb(_ message: @autoclosure () -> String) {
         guard enabled else { return }
+        let text = message()
         let isMain = Thread.isMainThread
-        let item = Breadcrumb(timestamp: now(), message: message, isMainThread: isMain)
+        let item = Breadcrumb(timestamp: now(), message: text, isMainThread: isMain)
         os_unfair_lock_lock(&breadcrumbLock)
         breadcrumbs.append(item)
         if breadcrumbs.count > maxBreadcrumbs {
@@ -108,30 +109,32 @@ enum TVHomeDebugTrace {
     }
 
     @discardableResult
-    static func measure<T>(_ label: String, thresholdMs: Double = 15.0, block: () throws -> T) rethrows -> T {
+    static func measure<T>(_ label: @autoclosure () -> String, thresholdMs: Double = 15.0, block: () throws -> T) rethrows -> T {
         guard enabled else { return try block() }
-        breadcrumb("\(label) begin")
+        let text = label()
+        breadcrumb("\(text) begin")
         let start = now()
         defer {
             let elapsedMs = Double(now() - start) / 1_000_000
-            breadcrumb("\(label) end (\(String(format: "%.1f", elapsedMs))ms)")
+            breadcrumb("\(text) end (\(String(format: "%.1f", elapsedMs))ms)")
             if elapsedMs >= thresholdMs {
-                log("⚠️ [SLOW_OP] \(label) took \(String(format: "%.1f", elapsedMs))ms (threshold \(thresholdMs)ms)")
+                log("⚠️ [SLOW_OP] \(text) took \(String(format: "%.1f", elapsedMs))ms (threshold \(thresholdMs)ms)")
             }
         }
         return try block()
     }
 
     @discardableResult
-    static func measureAsync<T>(_ label: String, thresholdMs: Double = 20.0, block: () async throws -> T) async rethrows -> T {
+    static func measureAsync<T>(_ label: @autoclosure () -> String, thresholdMs: Double = 20.0, block: () async throws -> T) async rethrows -> T {
         guard enabled else { return try await block() }
-        breadcrumb("\(label) begin")
+        let text = label()
+        breadcrumb("\(text) begin")
         let start = now()
         defer {
             let elapsedMs = Double(now() - start) / 1_000_000
-            breadcrumb("\(label) end (\(String(format: "%.1f", elapsedMs))ms)")
+            breadcrumb("\(text) end (\(String(format: "%.1f", elapsedMs))ms)")
             if elapsedMs >= thresholdMs {
-                log("⚠️ [SLOW_OP_ASYNC] \(label) took \(String(format: "%.1f", elapsedMs))ms")
+                log("⚠️ [SLOW_OP_ASYNC] \(text) took \(String(format: "%.1f", elapsedMs))ms")
             }
         }
         return try await block()
@@ -420,6 +423,8 @@ struct ContentView: View {
     @State private var detailsBackStack: [(id: String, type: String)] = []
     @State private var nextDetailsPlaybackRequestID: UInt = 0
     @State private var pendingDetailsPlaybackRequestID: UInt?
+    @State private var presentedAppNoticeDetails: AppNotice?
+    @State private var appNoticeFocusRequestGeneration: UInt = 0
     /// Where the root Details screen should return. This is normally Home, but
     /// a title opened from a collection must return to that collection.
     @State private var detailsReturnDestination: DetailsReturnDestination = .main
@@ -438,6 +443,8 @@ struct ContentView: View {
     @StateObject private var searchViewModel = SearchViewModel()
     @StateObject private var netflixSearchViewModel = NetflixSearchViewModel()
     @StateObject private var libraryViewModel = LibraryViewModel()
+    @StateObject private var releaseUpdateService = ReleaseUpdateService()
+    @StateObject private var announcementService = AnnouncementService()
     // Owned here (not inside TVHomeView) so the Home catalog + focused card
     // survive the details/player push, which tears TVHomeView down. Returning
     // then restores the exact card instead of reloading and jumping to the top.
@@ -547,11 +554,32 @@ struct ContentView: View {
                 .transition(.asymmetric(insertion: .identity, removal: .opacity))
                 .zIndex(999)
             }
+
+            if let notice = visibleAppNotice {
+                AppNoticeBanner(
+                    notice: notice,
+                    currentVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0",
+                    accentColor: AppFocusOutline.color,
+                    focusRequestGeneration: appNoticeFocusRequestGeneration,
+                    isDetailsPresented: presentedAppNoticeDetails != nil,
+                    onShowDetails: { presentedAppNoticeDetails = notice },
+                    onDismiss: { dismissAppNotice(notice) },
+                    onSkip: { skipAppNotice(notice) }
+                )
+                .id(notice.id)
+                .padding(.trailing, 52)
+                .padding(.bottom, 42)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .zIndex(10)
+            }
         }
         // Resolve every @AppStorage in the app against the active profile's
         // settings suite, so each profile keeps its own theme, layout, playback
         // preferences, etc. Falls back to the shared store before a profile is picked.
         .defaultAppStorage(ProfileSettings.store(for: profileViewModel.activeProfile?.id))
+        .environmentObject(releaseUpdateService)
+        .environmentObject(announcementService)
         // Apply selected app language (locale + L10n catalog) and refresh UI on change.
         .appliesAppLocale()
         .onChange(of: profileViewModel.activeProfile?.id) { _, _ in
@@ -571,9 +599,16 @@ struct ContentView: View {
         }
         .onChange(of: activeScreen) { oldScreen, newScreen in
             TVHomeDebugTrace.log("app.activeScreen changed from \(oldScreen) to \(newScreen)")
+            if oldScreen.isPlayer, !newScreen.isPlayer,
+               let transitionID = watchPartyOwner.incomingMediaTransition?.id {
+                watchPartyOwner.cancelIncomingMediaTransition(transitionID)
+            }
             if oldScreen != newScreen, !newScreen.isPlayer, partyLaunchTask != nil {
                 partyLaunchID = UUID(); partyLaunchTask?.cancel(); partyLaunchTask = nil
             }
+        }
+        .onChange(of: visibleAppNotice?.id) { _, noticeID in
+            if noticeID != nil { appNoticeFocusRequestGeneration &+= 1 }
         }
         .overlay {
             if partyLaunchTask != nil {
@@ -597,7 +632,14 @@ struct ContentView: View {
         // catches those stray presses and dismisses the overlay instead. When
         // focus is settled inside Details/Player their own handler fires first,
         // so this only kicks in for the in-between frames.
-        .onExitCommand(perform: isOverlayPresented ? dismissOverlay : nil)
+        .onExitCommand(perform: visibleAppNotice != nil
+            ? dismissVisibleAppNotice
+            : (isOverlayPresented ? dismissOverlay : nil))
+        .sheet(item: $presentedAppNoticeDetails, onDismiss: {
+            appNoticeFocusRequestGeneration &+= 1
+        }) {
+            AppNoticeDetailsSheet(notice: $0)
+        }
         .onChange(of: watchPartyOwner.presentation?.id) { old, new in
             if old == nil, let new, activeScreen.isPlayer, playbackPartyID == nil {
                 // InSight adopted the already-playing PlayerViewModel. Keep its view identity stable.
@@ -610,6 +652,9 @@ struct ContentView: View {
                     activeScreen = .main; selectedTab = WatchPartyConfiguration.isEnabled ? .party : .home
                 }
             }
+        }
+        .onChange(of: watchPartyOwner.incomingMediaTransition?.id) { _, transitionID in
+            handleIncomingMediaTransitionChange(transitionID)
         }
         .onReceive(authManager.contextWillChange.merge(with: profileViewModel.contextWillChange)) { _ in
             partyDetailsOrigin = nil
@@ -625,6 +670,8 @@ struct ContentView: View {
             watchPartyOwner.resumeAfterForeground()
         }
         .onAppear {
+            Task { await releaseUpdateService.checkIfNeeded() }
+            Task { await announcementService.checkIfNeeded() }
             if WatchPartyConfiguration.isEnabled {
                 watchPartyOwner.attach(authManager: authManager, profiles: profileViewModel)
             }
@@ -716,6 +763,12 @@ struct ContentView: View {
                 backgroundedAt = Date()
                 syncManager.flushPendingPushes()
             case .active:
+                if backgroundedAt != nil {
+                    releaseUpdateService.beginForegroundSession()
+                    announcementService.beginForegroundSession()
+                }
+                Task { await releaseUpdateService.checkIfNeeded() }
+                Task { await announcementService.checkIfNeeded() }
                 syncManager.refreshAccountIfIdle()
                 presentProfileSelectionAfterBackgroundIfNeeded()
                 watchPartyOwner.resumeAfterForeground()
@@ -800,13 +853,61 @@ struct ContentView: View {
         return fullScreenOverlayPresented
     }
 
+    private var selectedAppNotice: AppNotice? {
+        AppNotice.select(
+            release: releaseUpdateService.latestRelease,
+            releaseIsAvailable: releaseUpdateService.shouldShowNotice,
+            announcementsEnabled: announcementService.isEnabled,
+            activeAnnouncements: announcementService.activeAnnouncements,
+            skippedAnnouncementIDs: announcementService.skippedAnnouncementIDs,
+            dismissedAnnouncementIDs: announcementService.dismissedAnnouncementIDs
+        )
+    }
+
+    private var visibleAppNotice: AppNotice? {
+        guard resolvedInitialScreen,
+              activeScreen == .main,
+              !isPreparingProfile,
+              !isOverlayPresented,
+              partyLaunchTask == nil,
+              selectedTab == .home else {
+            return nil
+        }
+        return selectedAppNotice
+    }
+
+    private func dismissVisibleAppNotice() {
+        guard let visibleAppNotice else { return }
+        dismissAppNotice(visibleAppNotice)
+    }
+
+    private func dismissAppNotice(_ notice: AppNotice) {
+        switch notice {
+        case .release(let release):
+            releaseUpdateService.dismissNotice(tag: release.tagName)
+        case .announcement(let announcement):
+            announcementService.dismiss(id: announcement.id)
+        }
+    }
+
+    private func skipAppNotice(_ notice: AppNotice) {
+        switch notice {
+        case .release(let release):
+            releaseUpdateService.skipCurrentVersion(tag: release.tagName)
+        case .announcement(let announcement):
+            announcementService.skip(id: announcement.id)
+        }
+    }
+
     /// Full-screen overlays already hide Home with alpha zero. Propagating
     /// `.disabled` through that hidden tree changes `isEnabled` for every
     /// resident card and forces the shelves to lay themselves out again while
     /// Details is entering. Keep the environment lock for visible menus, where
     /// Home still needs to stay on screen but must not receive focus.
     private var shouldDisableHomeContent: Bool {
-        isOverlayPresented && !fullScreenOverlayPresented
+        visibleAppNotice != nil
+            || presentedAppNoticeDetails != nil
+            || (isOverlayPresented && !fullScreenOverlayPresented)
     }
 
     /// Details/Player fully replace Home, so the tab view fades to black under
@@ -1591,6 +1692,26 @@ struct ContentView: View {
         collectionContext: CollectionPlaybackContext? = nil,
         isActionPlaybackSession: Bool = false
     ) {
+        // Usenet streams arrive as nuvio-usenet:// URLs: start the local
+        // engine first, then play its 127.0.0.1 URL like any other stream.
+        if let usenet = UsenetStreamSpec(url: url) {
+            Task { @MainActor in
+                do {
+                    let localURL = try await UsenetEngineManager.shared.startStream(usenet)
+                    presentPlayback(
+                        url: localURL, meta: meta, subtitle: subtitle, externalSubtitles: externalSubtitles,
+                        resumeFrom: resumeFrom, httpHeaders: httpHeaders, origin: origin, customPlayer: customPlayer,
+                        cacheFileIdentity: cacheFileIdentity, filename: filename, videoSize: videoSize,
+                        videoHash: videoHash, startupBenchmarkToken: startupBenchmarkToken, sourceID: sourceID,
+                        collectionContext: collectionContext, isActionPlaybackSession: isActionPlaybackSession
+                    )
+                } catch {
+                    PlaybackStartupTiming.cancel(token: startupBenchmarkToken)
+                    usenetLog.error("usenet: playback not started: \(error.localizedDescription, privacy: .public)")
+                }
+            }
+            return
+        }
         playbackIsActionPlaybackSession = isActionPlaybackSession
         let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
         let isStandalonePlaybackSession = isTrailer || isActionPlaybackSession
@@ -1849,12 +1970,205 @@ struct ContentView: View {
                 PlaybackStartupTiming.cancel(token: startupBenchmarkToken)
                 if PictureInPictureManager.shared.activeCoordinator?.torrentStreamSourceURL != url {
                     await TorrentEngineManager.shared.stopActiveStream(for: url)
+                    await UsenetEngineManager.shared.stopActiveStream(for: url)
                 }
                 guard partyLaunchID == mark, !Task.isCancelled else { return }
                 watchPartyOwner.message = error is WatchPartyLaunchError
                     ? "That title or episode doesn't match the room. Choose the matching entry; you can use any source."
                     : "Watch Party could not start. Check the room status and choose your source again."
                 selectedTab = .party; activeScreen = .main
+            }
+        }
+    }
+
+    @MainActor
+    private func changeWatchPartyEpisode(
+        _ episode: NuvioVideo,
+        prepared: PreparedNextStream,
+        sourceViewModel: PlayerViewModel,
+        expectedPresentationID: UUID,
+        expectedSurfaceID: UUID,
+        meta: NuvioMeta
+    ) async -> Bool {
+        guard activeScreen.isPlayer, playerSurfaceID == expectedSurfaceID,
+              playbackPartyID == expectedPresentationID,
+              let presentation = watchPartyOwner.presentation,
+              presentation.id == expectedPresentationID,
+              presentation.mount.isCurrent,
+              presentation.mount.viewModel === sourceViewModel,
+              let service = watchPartyOwner.service,
+              let room = service.session,
+              room.connection == .ready,
+              room.playbackContext == presentation.context,
+              room.party?.hostMemberID == room.memberID else { return false }
+
+        let startupToken = sourceViewModel.startupBenchmarkToken
+        var nextStartupToken: UUID?
+        do {
+            let media = try WatchPartyLaunchPolicy.mediaForPlayback(
+                meta, episode: episode, room: room.party?.media
+            )
+            try await watchPartyOwner.updateRoomMedia(media)
+            try Task.checkCancellation()
+            guard watchPartyOwner.service === service, service.session === room,
+                  room.connection == .ready, room.party?.media.key == media.key,
+                  activeScreen.isPlayer, playerSurfaceID == expectedSurfaceID else {
+                throw WatchPartyPlaybackRuntimeError.staleContext
+            }
+
+            playbackCurrentEpisode = episode
+            PlaybackStartupTiming.cancel(token: startupToken)
+            nextStartupToken = PlaybackStartupTiming.start(title: meta.name)
+            let nextPresentation = try watchPartyOwner.preparePlayback(media: media)
+            presentBuiltInPlayer(
+                url: prepared.url,
+                meta: meta,
+                subtitle: prepared.subtitleLine,
+                httpHeaders: prepared.httpHeaders,
+                externalSubtitles: prepared.subtitles,
+                resumeFrom: nil,
+                origin: playbackOrigin,
+                cacheFileIdentity: prepared.cacheFileIdentity,
+                filename: prepared.filename,
+                videoSize: prepared.videoSize,
+                videoHash: prepared.videoHash,
+                startupBenchmarkToken: nextStartupToken,
+                sourceID: prepared.sourceID,
+                party: nextPresentation
+            )
+            return true
+        } catch {
+            PlaybackStartupTiming.cancel(token: startupToken)
+            PlaybackStartupTiming.cancel(token: nextStartupToken)
+            guard activeScreen.isPlayer, playerSurfaceID == expectedSurfaceID,
+                  playbackPartyID == expectedPresentationID else { return false }
+            if watchPartyOwner.presentation?.id == expectedPresentationID {
+                watchPartyOwner.message = "Couldn't change the Watch Party episode. Try again."
+            } else {
+                playbackPartyID = nil
+                selectedTab = .party
+                activeScreen = .main
+            }
+            return false
+        }
+    }
+
+    @MainActor
+    private func handleIncomingMediaTransitionChange(_ transitionID: UUID?) {
+        guard let transitionID,
+              let transition = watchPartyOwner.incomingMediaTransition,
+              transition.id == transitionID else { return }
+        guard case let .player(_, meta, _, _, _, _) = activeScreen else {
+            watchPartyOwner.cancelIncomingMediaTransition(transitionID)
+            return
+        }
+        let expectedSurfaceID = playerSurfaceID
+        Task { @MainActor in
+            await handleIncomingWatchPartyMediaTransition(
+                transition, expectedSurfaceID: expectedSurfaceID, meta: meta
+            )
+        }
+    }
+
+    @MainActor
+    private func completeIncomingWatchPartyEpisode(
+        transitionID: UUID,
+        context: WatchPartyPlaybackContext,
+        media: WatchPartyMedia,
+        episode: NuvioVideo,
+        prepared: PreparedNextStream,
+        startupToken: UUID,
+        expectedSurfaceID: UUID,
+        meta: NuvioMeta
+    ) async -> Bool {
+        guard activeScreen.isPlayer, playerSurfaceID == expectedSurfaceID,
+              watchPartyOwner.isCurrentIncomingMediaTransition(transitionID, context: context),
+              let service = watchPartyOwner.service,
+              let room = service.session,
+              room.connection == .ready,
+              room.playbackContext == context,
+              room.party?.media.key == media.key,
+              context.mediaKey == media.key else { return false }
+
+        do {
+            let presentation = try watchPartyOwner.preparePlayback(media: media)
+            playbackCurrentEpisode = episode
+            presentBuiltInPlayer(
+                url: prepared.url,
+                meta: meta,
+                subtitle: prepared.subtitleLine,
+                httpHeaders: prepared.httpHeaders,
+                externalSubtitles: prepared.subtitles,
+                resumeFrom: nil,
+                origin: playbackOrigin,
+                cacheFileIdentity: prepared.cacheFileIdentity,
+                filename: prepared.filename,
+                videoSize: prepared.videoSize,
+                videoHash: prepared.videoHash,
+                startupBenchmarkToken: startupToken,
+                sourceID: prepared.sourceID,
+                party: presentation
+            )
+            watchPartyOwner.completeIncomingMediaTransition(transitionID, context: context)
+            return true
+        } catch {
+            PlaybackStartupTiming.cancel(token: startupToken)
+            return false
+        }
+    }
+
+    @MainActor
+    private func handleIncomingWatchPartyMediaTransition(
+        _ transition: WatchPartyAppOwner.IncomingMediaTransition,
+        expectedSurfaceID: UUID,
+        meta: NuvioMeta
+    ) async {
+        let id = transition.id
+        let context = transition.context
+        let viewModel = transition.viewModel
+        guard activeScreen.isPlayer, playerSurfaceID == expectedSurfaceID,
+              watchPartyOwner.isCurrentIncomingMediaTransition(id, context: context) else {
+            watchPartyOwner.cancelIncomingMediaTransition(id)
+            return
+        }
+        guard let plan = transition.plan,
+              let service = watchPartyOwner.service,
+              let room = service.session else {
+            if !watchPartyOwner.showWatchPartyAfterIncomingMediaTransition(id) {
+                selectedTab = .party
+                activeScreen = .main
+            }
+            return
+        }
+
+        let isCurrent: @MainActor () -> Bool = {
+            activeScreen.isPlayer && playerSurfaceID == expectedSurfaceID
+                && watchPartyOwner.isCurrentIncomingMediaTransition(id, context: context)
+        }
+        let waitUntilReady: @MainActor () async -> Bool = {
+            let deadline = Date().addingTimeInterval(20)
+            while service.session === room, room.connection != .ready {
+                guard !Task.isCancelled, isCurrent(),
+                      Date() < deadline else { return false }
+                do { try await Task.sleep(nanoseconds: 100_000_000) }
+                catch { return false }
+            }
+            return !Task.isCancelled && isCurrent()
+        }
+        let resolved = await viewModel.resolveIncomingWatchPartyEpisode(
+            plan, media: transition.media, context: context,
+            transitionID: id, isCurrent: isCurrent,
+            waitUntilReady: waitUntilReady
+        )
+        guard watchPartyOwner.incomingMediaTransition?.id == id else { return }
+        guard activeScreen.isPlayer, playerSurfaceID == expectedSurfaceID else {
+            watchPartyOwner.cancelIncomingMediaTransition(id)
+            return
+        }
+        if !resolved {
+            if !watchPartyOwner.showWatchPartyAfterIncomingMediaTransition(id) {
+                selectedTab = .party
+                activeScreen = .main
             }
         }
     }
@@ -1972,7 +2286,8 @@ struct ContentView: View {
                 presentation.mount.viewModel.markWatchPartySharedSource()
                 creatingParty = false; choosingPartySource = false
                 playbackIsActionPlaybackSession = false
-                playbackEpisodes = []; playbackCurrentEpisode = target.episode
+                playbackEpisodes = target.meta.isSeries ? (target.meta.videos ?? []) : []
+                playbackCurrentEpisode = target.episode
                 reopenStreamPickerOnDetails = false; reopenStreamPickerEpisode = nil
                 pendingDetailsPlaybackRequestID = nil
                 let subtitle = target.episode.map { "S\($0.season) · E\($0.episode) · \($0.title)" } ?? ""
@@ -2111,6 +2426,7 @@ struct ContentView: View {
             Task {
                 guard let sourceURL else { return }
                 await TorrentEngineManager.shared.stopActiveStream(for: sourceURL)
+                await UsenetEngineManager.shared.stopActiveStream(for: sourceURL)
             }
         }
     }
@@ -2764,7 +3080,8 @@ struct ContentView: View {
             // Direct URL already known-bad this session.
             if let urlString = candidate.directURL?.trimmingCharacters(in: .whitespacesAndNewlines),
                !urlString.isEmpty,
-               excludingURLs.contains(urlString) {
+               excludingURLs.contains(urlString)
+                || UsenetEngineManager.isExcluded(sourceURL: urlString, excludedPlaybackURLs: excludingURLs) {
                 continue
             }
 
@@ -2829,7 +3146,8 @@ struct ContentView: View {
                 )
             }
 
-            guard let urlString = candidate.directURL, let url = URL(string: urlString) else { continue }
+            guard let urlString = candidate.directURL, let rawURL = URL(string: urlString),
+                  let url = await Self.playableURL(for: rawURL) else { continue }
             PlaybackStartupTiming.markSourcePicked(stream: candidate, token: startupToken)
             LastStreamQualityStore.save(
                 metaId: metaIdForTags,
@@ -2923,6 +3241,18 @@ struct ContentView: View {
         }
     }
 
+    /// A Usenet stream URL becomes the on-device engine's local URL (nil when
+    /// it can't start); every other URL is returned unchanged.
+    private static func playableURL(for url: URL) async -> URL? {
+        guard let spec = UsenetStreamSpec(url: url) else { return url }
+        do {
+            return try await UsenetEngineManager.shared.startStream(spec)
+        } catch {
+            usenetLog.error("usenet: source not started: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+    }
+
     /// Resolves one user-picked source (direct URL or debrid) for mid-playback switch.
     private static func resolveChosenStream(
         _ stream: NuvioStream,
@@ -2999,7 +3329,8 @@ struct ContentView: View {
             )
         }
 
-        guard let urlString = stream.directURL, let url = URL(string: urlString) else { return nil }
+        guard let urlString = stream.directURL, let rawURL = URL(string: urlString),
+              let url = await playableURL(for: rawURL) else { return nil }
         LastStreamQualityStore.save(
             metaId: metaIdForTags,
             stream: stream,
@@ -3113,6 +3444,38 @@ struct ContentView: View {
         let party = playbackPartyID.flatMap { id in
             watchPartyOwner.presentation.flatMap { $0.id == id && $0.mount.isCurrent ? $0.mount : nil }
         }
+        let partyRoom = party == nil ? nil : watchPartyOwner.service?.session
+        let partyIsHost = party == nil
+            || (partyRoom?.memberID != nil && partyRoom?.party?.hostMemberID == partyRoom?.memberID)
+        let incomingMediaCompletion: WatchPartyIncomingEpisodePlan.Completion? = {
+            guard party != nil else { return nil }
+            return { transitionID, context, media, episode, prepared, startupToken in
+                await self.completeIncomingWatchPartyEpisode(
+                    transitionID: transitionID, context: context, media: media,
+                    episode: episode, prepared: prepared, startupToken: startupToken,
+                    expectedSurfaceID: surfaceIdentity, meta: meta
+                )
+            }
+        }()
+        let hostEpisodeResolved: (@MainActor (NuvioVideo, PreparedNextStream) async -> Bool)? = {
+            guard party != nil, partyIsHost else { return nil }
+            return { episode, prepared in
+                guard let party, let expectedID = playbackPartyID else { return false }
+                return await self.changeWatchPartyEpisode(
+                    episode, prepared: prepared, sourceViewModel: party.viewModel,
+                    expectedPresentationID: expectedID, expectedSurfaceID: surfaceIdentity, meta: meta
+                )
+            }
+        }()
+        let watchPartySourceChanged: (@MainActor () async -> Void)? = {
+            guard party != nil else { return nil }
+            return {
+                guard let room = watchPartyOwner.service?.session,
+                      let roomParty = room.party,
+                      roomParty.hostMemberID == room.memberID else { return }
+                _ = try? await room.stopSharingStream()
+            }
+        }()
         if playbackPartyID == nil || party != nil {
         PlayerView(
             url: url,
@@ -3128,12 +3491,13 @@ struct ContentView: View {
             videoHash: isStandalonePlaybackSession ? nil : playbackVideoHash,
             cacheFileIdentity: isStandalonePlaybackSession ? nil : playbackCacheFileIdentity,
             sourceID: isStandalonePlaybackSession ? nil : playbackSourceID,
-            episodes: (isStandalonePlaybackSession || party != nil) ? [] : playbackEpisodes,
+            episodes: isStandalonePlaybackSession ? [] : playbackEpisodes,
             currentEpisode: isStandalonePlaybackSession ? nil : playbackCurrentEpisode,
             initialStartupBenchmarkToken: startupBenchmarkToken,
             autoPlayNextEnabled: party == nil && autoPlayNext,
             autoPlayNextCountdownSeconds: autoPlayNextCountdown,
-            resolveNextStream: (isStandalonePlaybackSession || party != nil || !meta.isSeries) ? nil : { episode, startupToken in
+            allowsManualEpisodeSelection: party == nil || partyIsHost,
+            resolveNextStream: (isStandalonePlaybackSession || !meta.isSeries) ? nil : { episode, startupToken in
                 await Self.resolveNextEpisodeStream(
                     episode: episode,
                     seriesMeta: meta,
@@ -3168,14 +3532,14 @@ struct ContentView: View {
                     startupToken: nil
                 )
             },
-            fetchPlaybackSources: (isStandalonePlaybackSession || party != nil) ? nil : { contentId, type in
+            fetchPlaybackSources: isStandalonePlaybackSession ? nil : { contentId, type in
                 Self.playbackSourcesProgressively(
                     contentId: contentId,
                     type: type,
                     profileId: profileViewModel.activeProfile?.id
                 )
             },
-            resolvePlaybackStream: (isStandalonePlaybackSession || party != nil) ? nil : { stream, contentId, subtitleLine, startupToken in
+            resolvePlaybackStream: isStandalonePlaybackSession ? nil : { stream, contentId, subtitleLine, startupToken in
                 await Self.resolveChosenStream(
                     stream,
                     contentId: contentId,
@@ -3185,6 +3549,9 @@ struct ContentView: View {
                     startupToken: startupToken
                 )
             },
+            onWatchPartyIncomingMediaResolved: incomingMediaCompletion,
+            onWatchPartyEpisodeResolved: hostEpisodeResolved,
+            onWatchPartySourceChanged: watchPartySourceChanged,
             onRequestSources: (isStandalonePlaybackSession || party != nil) ? nil : {
                 withAnimation(.easeInOut(duration: 0.28)) {
                     reopenStreamPickerOnDetails = true
@@ -3491,7 +3858,10 @@ extension CrossfadingBackdrop: Equatable {
 
 /// Small in-memory cache + loader for backdrop images so revisiting a poster is
 /// instant (no decode flicker) and repeated focus changes don't refetch.
-actor BackdropImageCache {
+/// A lock-protected class rather than an actor, so a view can read an image
+/// that is already decoded synchronously when it is created (rating icons are
+/// then drawn on the first frame instead of popping in after an actor hop).
+final class BackdropImageCache: @unchecked Sendable {
     static let shared = BackdropImageCache()
     private static let tracker = NSCacheMemoryTracker(
         maxCost: {
@@ -3511,6 +3881,7 @@ actor BackdropImageCache {
     }
 
     private let cache = NSCache<NSString, UIImage>()
+    private let lock = NSLock()
     private var inFlight: [String: Task<UIImage?, Never>] = [:]
 
     init() {
@@ -3522,9 +3893,7 @@ actor BackdropImageCache {
             object: nil,
             queue: nil
         ) { _ in
-            Task {
-                await BackdropImageCache.shared.purge()
-            }
+            BackdropImageCache.shared.purge()
         }
         #endif
     }
@@ -3536,26 +3905,49 @@ actor BackdropImageCache {
         Self.tracker.reset()
     }
 
-    func image(for url: URL) async -> UIImage? {
-        let key = url.absoluteString as NSString
-        if let cached = cache.object(forKey: key) { return cached }
-        if let pending = inFlight[url.absoluteString] { return await pending.value }
+    /// The decoded image when it is already in memory. Never downloads.
+    func cachedImage(for url: URL) -> UIImage? {
+        cache.object(forKey: url.absoluteString as NSString)
+    }
+
+    /// `minimumBytes` rejects error pages posing as artwork; small rating
+    /// icons pass 0. Non-HTTP responses (`data:` icon URLs) are accepted.
+    func image(
+        for url: URL,
+        priority: TaskPriority = .userInitiated,
+        minimumBytes: Int = 512
+    ) async -> UIImage? {
+        let key = url.absoluteString
+        if let cached = cache.object(forKey: key as NSString) { return cached }
         let pixelSize = Self.maxPixelSize
-        let task = Task.detached(priority: .userInitiated) { () -> UIImage? in
-            guard let (data, response) = try? await URLSession.shared.data(from: url),
-                  !Task.isCancelled,
-                  let http = response as? HTTPURLResponse,
-                  (200...299).contains(http.statusCode),
-                  data.count > 512 else { return nil }
-            return downsampleBackdropImage(data: data, maxPixelSize: pixelSize)
+        let task: Task<UIImage?, Never> = lock.withLock {
+            if let pending = inFlight[key] { return pending }
+            let task = Task.detached(priority: priority) { [weak self] () -> UIImage? in
+                var decoded: UIImage?
+                if let (data, response) = try? await URLSession.shared.data(from: url) {
+                    let statusOK = (response as? HTTPURLResponse).map { (200...299).contains($0.statusCode) } ?? true
+                    if statusOK, data.count > minimumBytes {
+                        decoded = downsampleBackdropImage(data: data, maxPixelSize: pixelSize)
+                    }
+                }
+                // Store before leaving the in-flight list, so a caller arriving
+                // in between finds the image instead of downloading it again.
+                self?.finishLoad(key: key, image: decoded)
+                return decoded
+            }
+            inFlight[key] = task
+            return task
         }
-        inFlight[url.absoluteString] = task
-        defer { inFlight[url.absoluteString] = nil }
-        guard let decoded = await task.value else { return nil }
-        let cost = decoded.decodedByteCost
-        cache.setObject(decoded, forKey: key, cost: cost)
-        Self.tracker.recordInsertion(cost: cost)
-        return decoded
+        return await task.value
+    }
+
+    private func finishLoad(key: String, image: UIImage?) {
+        if let image {
+            let cost = image.decodedByteCost
+            cache.setObject(image, forKey: key as NSString, cost: cost)
+            Self.tracker.recordInsertion(cost: cost)
+        }
+        lock.withLock { inFlight[key] = nil }
     }
 }
 
@@ -3939,10 +4331,17 @@ private struct TVMainTabView: View {
         if let service = watchPartyOwner.service {
             WatchPartyLobbyView(owner: watchPartyOwner, service: service,
                 onChooseSharedSource: onChoosePartySharedSource,
+                onReturnToPlayer: { PictureInPictureManager.shared.restoreFullscreenFromApp() },
                 canUseAccount: isAuthenticated && !sessionNeedsReauthentication && activeProfile != nil,
                 isChoosing: partyIsChoosing, onCreate: onCreateParty,
                 onChooseSource: onChoosePartySource, onCancelSelection: onCancelPartySelection,
-                onOpenProfile: onSwitchProfile,
+                onOpenProfile: {
+                    if !isAuthenticated || sessionNeedsReauthentication {
+                        onSignIn()
+                    } else {
+                        onSwitchProfile()
+                    }
+                },
                 detailsMedia: partyDetailsMedia, onRoomExited: onPartyRoomExited)
         } else {
             Text("Sign in and choose a profile to use Watch Party.")
@@ -4480,7 +4879,7 @@ struct TVHomeView: View {
     @State private var isBannerDismissed = false
 
     @State private var localTitlesSection: TVHomeSection?
-    @State private var jellyfinSection: TVHomeSection?
+    @State private var jellyfinSections: [TVHomeSection] = []
     @State private var isLoading = true
     @State private var profileGateFailedLoadIdentity: TVHomeContentIdentity?
     @State private var focusedMeta: NuvioMeta?
@@ -6999,7 +7398,7 @@ struct TVHomeView: View {
             upCount: continueWatchingVisible ? upcomingMetas.count : 0,
             upFirstId: continueWatchingVisible ? upcomingMetas.first?.id : nil,
             localCount: localTitlesSection?.items.count ?? 0,
-            jellyfinCount: jellyfinSection?.items.count ?? 0,
+            jellyfinCount: jellyfinSections.reduce(0) { $0 + $1.items.count },
             storeRevision: store.sectionsRevision,
             hideUnreleased: hideUnreleased,
             cwLandscape: continueWatchingLandscape,
@@ -7024,7 +7423,8 @@ struct TVHomeView: View {
         )
         let pinnedSections = ((continueWatching.isEmpty || !continueWatchingVisible) ? [] : [resumeSection])
             + ((upcomingMetas.isEmpty || !continueWatchingVisible) ? [] : [upcomingSection])
-            + [localTitlesSection, jellyfinSection].compactMap { $0 }
+            + [localTitlesSection].compactMap { $0 }
+            + jellyfinSections
         let allSections = collectionHome == nil ? pinnedSections + store.sections : store.sections
 
         let result: [TVHomeSection]
@@ -7036,7 +7436,8 @@ struct TVHomeView: View {
                 // Collection folder rows don't carry title posters; leave them intact.
                 if !section.collectionFolders.isEmpty
                     || section.id == TVHomeSection.localTitlesId
-                    || section.id == TVHomeSection.jellyfinId {
+                    || section.id == TVHomeSection.jellyfinId
+                    || section.id.hasPrefix(TVHomeSection.jellyfinLibraryIdPrefix) {
                     return section
                 }
                 var copy = section
@@ -8628,24 +9029,73 @@ struct TVHomeView: View {
 
     @MainActor
     private func loadJellyfinSection() async {
+        focusWork.cachedVisibleSections = nil
         guard collectionHome == nil else { return }
         guard contentIdentity.profileId != "none" && !contentIdentity.profileId.isEmpty else {
-            jellyfinSection = nil
+            jellyfinSections = []
             return
         }
         guard jellyfinLocalRowEnabled else {
-            jellyfinSection = nil
+            jellyfinSections = []
             return
         }
-        let metas = JellyfinLibraryIndex.shared.titles().compactMap {
+        let indexedTitles = JellyfinLibraryIndex.shared.titles()
+        let legacyTitles = indexedTitles.filter { $0.libraryID == nil || $0.libraryName == nil }
+        var sections: [TVHomeSection] = []
+        let legacyMetas = Self.jellyfinMetas(legacyTitles)
+        if !legacyMetas.isEmpty {
+            sections.append(TVHomeSection(
+                id: TVHomeSection.jellyfinId,
+                title: L10n.string("home_jellyfin_titles", fallback: "Jellyfin"),
+                items: legacyMetas
+            ))
+        }
+
+        let libraryTitles = indexedTitles.filter { $0.libraryID != nil && $0.libraryName != nil }
+        let groupedTitles = Dictionary(grouping: libraryTitles) {
+            JellyfinHomeLibraryKey(serverID: $0.serverID, libraryID: $0.libraryID!)
+        }
+        let serverOrder = Dictionary(uniqueKeysWithValues: JellyfinServerStore.shared.servers.enumerated().map {
+            ($0.element.id, $0.offset)
+        })
+        let orderedKeys = groupedTitles.keys.sorted { lhs, rhs in
+            let lhsServerOrder = serverOrder[lhs.serverID] ?? Int.max
+            let rhsServerOrder = serverOrder[rhs.serverID] ?? Int.max
+            if lhsServerOrder != rhsServerOrder { return lhsServerOrder < rhsServerOrder }
+            if lhs.serverID != rhs.serverID { return lhs.serverID < rhs.serverID }
+            let lhsName = groupedTitles[lhs]?.first?.libraryName ?? lhs.libraryID
+            let rhsName = groupedTitles[rhs]?.first?.libraryName ?? rhs.libraryID
+            if lhsName != rhsName { return lhsName < rhsName }
+            return lhs.libraryID < rhs.libraryID
+        }
+        for key in orderedKeys {
+            guard let titles = groupedTitles[key],
+                  let libraryName = titles.first?.libraryName else { continue }
+            let metas = Self.jellyfinMetas(titles)
+            guard !metas.isEmpty else { continue }
+            sections.append(TVHomeSection(
+                id: TVHomeSection.jellyfinLibraryId(serverID: key.serverID, libraryID: key.libraryID),
+                title: libraryName,
+                items: metas
+            ))
+        }
+        jellyfinSections = sections
+    }
+
+    @MainActor
+    private static func jellyfinMetas(_ titles: [JellyfinIndexedTitle]) -> [NuvioMeta] {
+        titles.sorted {
+            if $0.name != $1.name { return $0.name < $1.name }
+            return $0.contentId < $1.contentId
+        }.compactMap {
             JellyfinLibraryIndex.shared.meta(forContentId: $0.contentId)
         }
-        jellyfinSection = metas.isEmpty ? nil : TVHomeSection(
-            id: TVHomeSection.jellyfinId,
-            title: L10n.string("home_jellyfin_titles", fallback: "Jellyfin"),
-            items: metas
-        )
     }
+}
+
+private struct JellyfinHomeLibraryKey: Hashable {
+    let serverID: String
+    let libraryID: String
 }
 
 struct TVHomeSection: Identifiable {
@@ -8653,6 +9103,10 @@ struct TVHomeSection: Identifiable {
     static let upcomingId = "upcoming"
     static let localTitlesId = "local_titles"
     static let jellyfinId = "jellyfin_titles"
+    static let jellyfinLibraryIdPrefix = "jellyfin_library_"
+    static func jellyfinLibraryId(serverID: String, libraryID: String) -> String {
+        "\(jellyfinLibraryIdPrefix)\(serverID):\(libraryID)"
+    }
     /// Id prefix for rows built from account-synced collections.
     static let collectionIdPrefix = "collection_"
 
@@ -9938,6 +10392,40 @@ final class TVHomeStore: ObservableObject {
         loadingContentIdentity = nil
         hasLoaded = true
         lastLoadedAt = Date()
+        // Collection tabs reuse this store; only the main Home feeds the shelf.
+        if identity.collectionScope == nil {
+            writeTopShelfFeed()
+        }
+    }
+
+    /// Mirrors the first populated catalog row on Home into the App Group for
+    /// the Top Shelf. Rows the shelf already covers (Continue Watching) and
+    /// rows that aren't plain title lists are skipped.
+    private func writeTopShelfFeed() {
+        guard TopShelfFeedStore.isAvailable else { return }
+        let skippedIds: Set<String> = [
+            TVHomeSection.continueWatchingId,
+            TVHomeSection.upcomingId,
+            TVHomeSection.localTitlesId,
+            TVHomeSection.jellyfinId,
+        ]
+        let row = sections.first {
+            !skippedIds.contains($0.id) && $0.collectionFolders.isEmpty
+                && !$0.isLoadingPlaceholder && !$0.items.isEmpty
+        }
+        let entries = (row?.items ?? []).prefix(15).map { meta in
+            TopShelfEntry(
+                contentId: meta.id,
+                contentType: meta.type,
+                title: meta.name,
+                subtitle: nil,
+                imageURL: meta.posterUrl,
+                backdropURL: meta.backdropUrl,
+                progress: nil,
+                action: .details
+            )
+        }
+        TopShelfFeedStore.write(Array(entries), section: .catalog, title: row?.title)
     }
 
     func cancelLoad(
@@ -9973,7 +10461,8 @@ enum AppCacheManager {
     static func clearCache() async {
         // 1. Wipe poster data (memory + disk + URLSession)
         await PosterArtworkCache.clearAllArtwork()
-        await BackdropImageCache.shared.purge()
+        BackdropImageCache.shared.purge()
+        HomeHeroRatingsCache.shared.clear()
         await PersonProfileImageCache.shared.purge()
 
         // 2. Wipe catalog order & snapshots
@@ -10909,15 +11398,25 @@ private struct TVGridHeroSlideshowView: View {
             updateLibraryStatus()
         }
         .focusSection()
-        .task(id: "\(activeItem?.id ?? "")-\(homeHeroRatingSource)") {
+        .task(id: "\(activeItem?.id ?? "")-\(homeHeroRatingSource)-\(items.count)") {
             guard let item = activeItem,
-                  homeHeroRatingSource != "imdb",
-                  item.externalRatings == nil || item.externalRatings?.isEmpty == true,
-                  gridHeroRatings[item.id] == nil else { return }
-            let ratings = await AddonRatingsService.fetchHomeHeroRatings(for: item)
-            if !ratings.isEmpty {
-                gridHeroRatings[item.id] = ratings
+                  AddonRatingsService.heroNeedsFetchedRatings(source: homeHeroRatingSource, meta: item) else { return }
+            // The next slide's ratings, so the timer or Next shows them at once.
+            if items.count > 1 {
+                let next = items[(index + 1) % items.count]
+                if AddonRatingsService.heroNeedsFetchedRatings(source: homeHeroRatingSource, meta: next) {
+                    AddonRatingsService.prefetchHomeHeroRatings(for: [next])
+                }
             }
+            guard gridHeroRatings[item.id] == nil else { return }
+            if let cached = AddonRatingsService.cachedHomeHeroRatings(for: item) {
+                // Keep them with the slide, so they survive the cache entry expiring.
+                gridHeroRatings[item.id] = cached
+                return
+            }
+            let ratings = await AddonRatingsService.fetchHomeHeroRatings(for: item)
+            guard !Task.isCancelled else { return }
+            gridHeroRatings[item.id] = ratings
         }
         .task(id: playTargetTaskIdentity) {
             await resolveCurrentHeroPlayTarget()
@@ -11071,6 +11570,14 @@ private struct TVGridHeroSlideshowView: View {
                 .id("hero-meta-\(item.id)")
                 .transition(.opacity)
 
+            // 2b. "All" rating source: the Details ratings row with icons.
+            if AddonRatingsService.heroShowsAllRatings(homeHeroRatingSource) {
+                TvHeroRatingsRow(badges: gridRatingBadges(for: item), iconHeight: 22, fontSize: 19)
+                    .shadow(color: .black.opacity(0.6), radius: 4, y: 2)
+                    .id("hero-ratings-\(item.id)")
+                    .transition(.opacity)
+            }
+
             // 3. Description (2 lines, clean Apple TV typography)
             if let description = item.description, !description.isEmpty {
                 Text(description)
@@ -11141,6 +11648,12 @@ private struct TVGridHeroSlideshowView: View {
         .padding(.bottom, 64)
     }
 
+    private func gridRatingBadges(for item: NuvioMeta) -> [TvRatingBadge] {
+        TvRatingBadge.badges(
+            from: AddonRatingsService.heroDisplayRatings(for: item, fetched: gridHeroRatings[item.id])
+        )
+    }
+
     private func metadataStrings(for item: NuvioMeta) -> [String] {
         let typeLabel = item.isSeries
             ? L10n.string("type_series", fallback: "Series")
@@ -11173,8 +11686,11 @@ private struct TVGridHeroSlideshowView: View {
                 heroBadge(cert)
             } else if let badge = item.statusBadgeLabel, !badge.isEmpty {
                 heroBadge(badge)
-            } else {
-                let effectiveRatings = (item.externalRatings?.isEmpty == false ? item.externalRatings : nil) ?? gridHeroRatings[item.id]
+            } else if !AddonRatingsService.heroShowsAllRatings(homeHeroRatingSource) {
+                // ("All" shows the full ratings row on its own line instead.)
+                let effectiveRatings = (item.externalRatings?.isEmpty == false ? item.externalRatings : nil)
+                    ?? gridHeroRatings[item.id]
+                    ?? AddonRatingsService.cachedHomeHeroRatings(for: item)
                 if let ratingStr = AddonRatingsService.heroRatingString(for: item, source: homeHeroRatingSource, ratings: effectiveRatings) {
                     heroBadge(ratingStr)
                 }
@@ -11334,7 +11850,12 @@ private struct TVGridHeroSlideshowView: View {
         if isInLibraryCache {
             return L10n.string("details_in_library", fallback: "In your library")
         }
-        let effectiveRatings = (item.externalRatings?.isEmpty == false ? item.externalRatings : nil) ?? gridHeroRatings[item.id]
+        guard !AddonRatingsService.heroShowsAllRatings(homeHeroRatingSource) else {
+            return "4K Ultra HD • HDR • Dolby Atmos"
+        }
+        let effectiveRatings = (item.externalRatings?.isEmpty == false ? item.externalRatings : nil)
+            ?? gridHeroRatings[item.id]
+            ?? AddonRatingsService.cachedHomeHeroRatings(for: item)
         if let ratingStr = AddonRatingsService.heroRatingString(for: item, source: homeHeroRatingSource, ratings: effectiveRatings) {
             return "\(ratingStr) • 4K Ultra HD • HDR"
         }
@@ -11460,7 +11981,10 @@ private struct TVHeroMetaLine: View {
     var episodeLine: String? = nil
     @AppStorage(SettingsKey.showFullDates) private var showFullDates = true
     @AppStorage(SettingsKey.homeHeroRatingSource) private var homeHeroRatingSource = "imdb"
-    @State private var fetchedRatings: [NuvioExternalRating] = []
+    @State private var fetchedRatings: [NuvioExternalRating]?
+    /// Which title/source `fetchedRatings` belong to, so a reused view never
+    /// shows the previous title's scores.
+    @State private var fetchedRatingsKey: String?
 
     var body: some View {
         let values = [
@@ -11471,13 +11995,30 @@ private struct TVHeroMetaLine: View {
         ].compactMap { $0 }.filter { !$0.isEmpty }
 
         let badge = meta.statusBadgeLabel
-        let effectiveRatings = (meta.externalRatings?.isEmpty == false ? meta.externalRatings : nil) ?? (fetchedRatings.isEmpty ? nil : fetchedRatings)
-        let rating = AddonRatingsService.heroRatingString(for: meta, source: homeHeroRatingSource, ratings: effectiveRatings)
+        // Same key as the ratings cache: enrichment can add an IMDb id to a
+        // kitsu:/tmdb: item, which must re-run the lookup below.
+        let ratingsKey = "\(AddonRatingsService.homeHeroRatingsKey(for: meta))-\(homeHeroRatingSource)"
+        let fetched = fetchedRatingsKey == ratingsKey ? fetchedRatings : nil
+        let cached = AddonRatingsService.cachedHomeHeroRatings(for: meta)
+        let showsAllRatings = AddonRatingsService.heroShowsAllRatings(homeHeroRatingSource)
+        let ratingBadges = showsAllRatings
+            ? TvRatingBadge.badges(from: AddonRatingsService.heroDisplayRatings(for: meta, fetched: fetched))
+            : []
+        // Still waiting for MDBList/add-on scores: keep the ratings line.
+        let ratingsPending = showsAllRatings && fetched == nil && cached == nil
+        let effectiveRatings = (meta.externalRatings?.isEmpty == false ? meta.externalRatings : nil)
+            ?? nonEmpty(fetched)
+            ?? nonEmpty(cached)
+        let rating = showsAllRatings
+            ? nil
+            : AddonRatingsService.heroRatingString(for: meta, source: homeHeroRatingSource, ratings: effectiveRatings)
         // Movies have no status badge, so their rating would sit alone on the
         // second line; ride it on the primary line right after the date instead.
         let isMovie = !meta.isSeries
         let primaryValues = isMovie ? values + [rating].compactMap { $0 } : values
-        let showSecondLine = !isMovie && (badge != nil || rating != nil)
+        let showSecondLine = showsAllRatings
+            ? (badge != nil || !ratingBadges.isEmpty || ratingsPending)
+            : (!isMovie && (badge != nil || rating != nil))
         // An empty `Text("")` still consumes a full line height and, with the
         // hero VStack spacing, opens a dead gap between the title and the first
         // catalog row (e.g. "The Chi" → "gg"). Collapse entirely when blank.
@@ -11493,7 +12034,8 @@ private struct TVHeroMetaLine: View {
                             .lineLimit(1)
                     }
 
-                    // Second line, like the Android hero: "[ONGOING] • IMDb 7.4".
+                    // Second line, like the Android hero: "[ONGOING] • IMDb 7.4",
+                    // or with "All" the Details ratings row with icons.
                     if showSecondLine {
                         HStack(spacing: 14) {
                             if let badge {
@@ -11508,22 +12050,38 @@ private struct TVHeroMetaLine: View {
                                     )
                             }
 
-                            if let rating {
+                            if showsAllRatings {
+                                TvHeroRatingsRow(badges: ratingBadges, iconHeight: 26, fontSize: 22)
+                            } else if let rating {
                                 Text(badge != nil ? "•  \(rating)" : rating)
                                     .font(.custom("Inter-SemiBold", size: 22))
                                     .foregroundColor(.white.opacity(0.66))
                                     .lineLimit(1)
                             }
                         }
+                        .frame(minHeight: showsAllRatings ? 34 : nil, alignment: .leading)
                     }
                 }
             }
         }
-        .task(id: "\(meta.id)-\(homeHeroRatingSource)") {
-            if homeHeroRatingSource != "imdb" && (meta.externalRatings == nil || meta.externalRatings?.isEmpty == true) {
-                fetchedRatings = await AddonRatingsService.fetchHomeHeroRatings(for: meta)
+        .task(id: ratingsKey) {
+            guard AddonRatingsService.heroNeedsFetchedRatings(source: homeHeroRatingSource, meta: meta) else { return }
+            if let cached = AddonRatingsService.cachedHomeHeroRatings(for: meta) {
+                // Keep them here too, so the row survives the cache entry expiring.
+                fetchedRatings = cached
+                fetchedRatingsKey = ratingsKey
+                return
             }
+            let ratings = await AddonRatingsService.fetchHomeHeroRatings(for: meta)
+            guard !Task.isCancelled else { return }
+            fetchedRatings = ratings
+            fetchedRatingsKey = ratingsKey
         }
+    }
+
+    private func nonEmpty(_ ratings: [NuvioExternalRating]?) -> [NuvioExternalRating]? {
+        guard let ratings, !ratings.isEmpty else { return nil }
+        return ratings
     }
 
     private var formattedRuntime: String? {

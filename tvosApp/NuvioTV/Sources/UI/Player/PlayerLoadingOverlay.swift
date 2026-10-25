@@ -9,6 +9,16 @@ import SwiftUI
 
 // MARK: - Playback Startup Benchmark & Timing
 
+#if DEBUG
+@inline(__always)
+private func startupBenchmarkLog(_ message: @autoclosure () -> String) {
+    print(message())
+}
+#else
+@inline(__always)
+private func startupBenchmarkLog(_ message: @autoclosure () -> String) {}
+#endif
+
 @MainActor
 final class PlaybackStartupBenchmark {
     static let shared = PlaybackStartupBenchmark()
@@ -52,7 +62,7 @@ final class PlaybackStartupBenchmark {
         self.t_displayPrepared = nil
         self.t_sessionConstructed = nil
         let target = title.isEmpty ? "playback" : "\"\(title)\""
-        print("[StartupBenchmark] ⏱ [0/3] Started startup timer for \(target)")
+        startupBenchmarkLog("[StartupBenchmark] ⏱ [0/3] Started startup timer for \(target)")
         return token
     }
 
@@ -64,7 +74,7 @@ final class PlaybackStartupBenchmark {
         self.addonName = stream.addonName ?? "Unknown"
         let pickDuration = now.timeIntervalSince(t0)
         let cleanName = streamName.replacingOccurrences(of: "\n", with: " ")
-        print("[StartupBenchmark] 🔍 [1/3] Source picked in \(String(format: "%.3fs", pickDuration)) (\(addonName) · \(cleanName))")
+        startupBenchmarkLog("[StartupBenchmark] 🔍 [1/3] Source picked in \(String(format: "%.3fs", pickDuration)) (\(addonName) · \(cleanName))")
     }
 
     func markDebridResolved(token: UUID?) {
@@ -73,7 +83,7 @@ final class PlaybackStartupBenchmark {
         self.t2_debridResolved = now
         let debridDuration = now.timeIntervalSince(t1)
         let totalSoFar = now.timeIntervalSince(t0_initiated ?? t1)
-        print("[StartupBenchmark] ⚡️ [2/3] Debrid link resolved in \(String(format: "%.3fs", debridDuration)) (elapsed: \(String(format: "%.3fs", totalSoFar)))")
+        startupBenchmarkLog("[StartupBenchmark] ⚡️ [2/3] Debrid link resolved in \(String(format: "%.3fs", debridDuration)) (elapsed: \(String(format: "%.3fs", totalSoFar)))")
     }
 
     func markEngineCheckpoint(_ name: String, token: UUID?) {
@@ -103,6 +113,7 @@ final class PlaybackStartupBenchmark {
         self.activeToken = nil
 
         let totalDuration = now.timeIntervalSince(t0)
+#if DEBUG
         let pickDuration = t1_sourcePicked.map { $0.timeIntervalSince(t0) }
         let debridDuration: Double = {
             if let t2 = t2_debridResolved, let t1 = t1_sourcePicked {
@@ -192,12 +203,13 @@ final class PlaybackStartupBenchmark {
         lines.append("============================================================\n")
 
         print(lines.joined(separator: "\n"))
+#endif
         return totalDuration
     }
 
     func cancel(token: UUID?) {
         guard owns(token) else { return }
-        print("[StartupBenchmark] ❌ Startup timer cancelled")
+        startupBenchmarkLog("[StartupBenchmark] ❌ Startup timer cancelled")
         activeToken = nil
         t0_initiated = nil
         t1_sourcePicked = nil
@@ -269,6 +281,9 @@ struct PlayerLoadingOverlay: View {
     var startTime: Date? = nil
     var showTimer: Bool = true
     var onDismiss: (() -> Void)? = nil
+    var focusEnabled: Bool = true
+    var onSelect: (() -> Void)? = nil
+    var onMove: ((MoveCommandDirection) -> Void)? = nil
 
     @AppStorage(SettingsKey.showLoadingStatus) private var showLoadingStatus = true
     @FocusState private var isFocusActive: Bool
@@ -276,6 +291,7 @@ struct PlayerLoadingOverlay: View {
     @State private var logoLoadFailed = false
     @State private var mountedDate = Date()
     @ObservedObject private var torrentManager = TorrentEngineManager.shared
+    @ObservedObject private var usenetManager = UsenetEngineManager.shared
 
     private var effectiveStartTime: Date {
         startTime ?? mountedDate
@@ -286,8 +302,19 @@ struct PlayerLoadingOverlay: View {
             #if os(tvOS)
             Color.clear
                 .frame(width: 1, height: 1)
-                .focusable(true)
+                .contentShape(Rectangle())
+                .focusable(focusEnabled)
                 .focused($isFocusActive)
+                .onTapGesture {
+                    if focusEnabled {
+                        onSelect?()
+                    }
+                }
+                .onMoveCommand { direction in
+                    if focusEnabled {
+                        onMove?(direction)
+                    }
+                }
             #endif
 
             // 1. Solid Black Base
@@ -441,6 +468,66 @@ struct PlayerLoadingOverlay: View {
                     )
                     .shadow(color: .black.opacity(0.5), radius: 4, y: 1)
                 }
+
+                if showLoadingStatus && usenetManager.isStreaming && !TorrentSettings.hideStats() {
+                    let stats = usenetManager.activeStats
+                    HStack(spacing: 12) {
+                        HStack(spacing: 5) {
+                            Image(systemName: "arrow.down.circle.fill")
+                                .font(.system(size: 13))
+                                .foregroundColor(.green)
+                            Text(stats.downloadRateFormatted)
+                                .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                        }
+
+                        Text("•")
+                            .font(.system(size: 11))
+                            .foregroundColor(.white.opacity(0.4))
+
+                        HStack(spacing: 4) {
+                            Text(stats.connectionsText)
+                                .font(.system(size: 14, weight: .bold, design: .monospaced))
+                                .foregroundColor(.green)
+                            Text(L10n.string("player_usenet_connections", fallback: "connections"))
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(.white.opacity(0.7))
+                        }
+
+                        Text("•")
+                            .font(.system(size: 11))
+                            .foregroundColor(.white.opacity(0.4))
+
+                        HStack(spacing: 4) {
+                            Text(stats.bufferedFormatted)
+                                .font(.system(size: 14, weight: .bold, design: .monospaced))
+                                .foregroundColor(.blue)
+                            Text(L10n.string("player_usenet_buffered", fallback: "buffered"))
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(.white.opacity(0.7))
+                        }
+
+                        if stats.missingArticles > 0 {
+                            Text("•")
+                                .font(.system(size: 11))
+                                .foregroundColor(.white.opacity(0.4))
+                            Text(L10n.format("player_usenet_missing", fallback: "%d missing", stats.missingArticles))
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(.orange)
+                        }
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 5)
+                    .background(
+                        Capsule()
+                            .fill(Color.black.opacity(0.45))
+                            .overlay(
+                                Capsule()
+                                    .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
+                            )
+                    )
+                    .shadow(color: .black.opacity(0.5), radius: 4, y: 1)
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             .padding(.horizontal, 80)
@@ -449,17 +536,28 @@ struct PlayerLoadingOverlay: View {
         .ignoresSafeArea()
         #if os(tvOS)
         .onExitCommand {
-            onDismiss?()
+            if focusEnabled {
+                onDismiss?()
+            }
         }
         #endif
         .onAppear {
             isPulsing = true
             #if os(tvOS)
             DispatchQueue.main.async {
-                isFocusActive = true
+                isFocusActive = focusEnabled
             }
             #endif
         }
+        #if os(tvOS)
+        .onChange(of: focusEnabled) { _, enabled in
+            if enabled {
+                DispatchQueue.main.async { isFocusActive = focusEnabled }
+            } else {
+                isFocusActive = false
+            }
+        }
+        #endif
     }
 
     @ViewBuilder

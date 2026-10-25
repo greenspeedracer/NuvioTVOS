@@ -30,6 +30,7 @@ extension PlayerView {
             playerStatusOverlay
                 .zIndex(10)
             playerToastLayer
+                .zIndex(22)
             focusSinkLayer
             pauseOverlayLayer
             skipSegmentLayer
@@ -45,81 +46,109 @@ extension PlayerView {
 
     @ViewBuilder
     var videoSurfaceLayer: some View {
-        // Main video surface (or top-right mini window during post-play recommendations)
-        if !viewModel.postPlayState.isTrailerPlaying &&
-            (!viewModel.postPlayState.isVisible || viewModel.postPlayState.canReturnToPlayer) {
-            ZStack {
-                Group {
-                    switch viewModel.activeEngineKind {
-                    case .aether:
-                        if let controller = viewModel.aetherController {
-                            AetherPlayerSurface(controller: controller)
-                        } else {
-                            Color.black
-                        }
-                    case .mpv:
+        // Keep MPV mounted through trailer/EOF states; hiding this layer must not
+        // tear down the still-live native surface.
+        let shouldShowSurface = !viewModel.postPlayState.isTrailerPlaying &&
+            (!viewModel.postPlayState.isVisible || viewModel.postPlayState.canReturnToPlayer)
+
+        if viewModel.activeEngineKind == .mpv {
+            GeometryReader { geometry in
+                let insets = geometry.safeAreaInsets
+                let viewportSize = CGSize(
+                    width: geometry.size.width + insets.leading + insets.trailing,
+                    height: geometry.size.height + insets.top + insets.bottom
+                )
+                let miniSize = CGSize(width: 580, height: 326)
+                videoSurfaceStack {
+                    StablePlayerSurfacePresentation(
+                        viewportSize: viewportSize,
+                        presentationSize: viewModel.postPlayState.isVisible ? miniSize : viewportSize
+                    ) {
                         MPVVideoSurface(controller: viewModel.playerController)
                     }
                 }
-
-                if viewModel.activeEngineKind == .aether,
-                   let aetherController = viewModel.aetherController {
-                    PlayerSubtitleOverlay(
-                        playback: aetherController.subtitleOverlayState,
-                        translation: aetherController.subtitleTranslationState,
-                        subtitleDelaySeconds: Double(viewModel.subtitleDelayMs) / 1000.0,
-                        videoNaturalSize: viewModel.videoNaturalSize,
-                        aspectMode: viewModel.aspectMode,
-                        style: viewModel.subtitleStyle
-                    )
-                    .offset(y: viewModel.showScenePanel ? -430 : 0)
-                    .ignoresSafeArea(edges: viewModel.postPlayState.isVisible ? [] : .all)
-                } else {
-                    MPVSubtitleOverlay(
-                        translation: viewModel.playerController.subtitleTranslationState,
-                        videoNaturalSize: viewModel.videoNaturalSize,
-                        aspectMode: viewModel.aspectMode,
-                        style: viewModel.subtitleStyle
-                    )
-                    .offset(y: viewModel.showScenePanel ? -430 : 0)
-                    .ignoresSafeArea(edges: viewModel.postPlayState.isVisible ? [] : .all)
-                }
-
-                if viewModel.postPlayState.isVisible && viewModel.postPlayState.canReturnToPlayer {
-                    miniPlayerReturnButton
-                }
             }
-            .frame(
-                width: viewModel.postPlayState.isVisible ? 580 : nil,
-                height: viewModel.postPlayState.isVisible ? 326 : nil
-            )
-            .clipShape(RoundedRectangle(cornerRadius: viewModel.postPlayState.isVisible ? 16 : 0))
-            .scaleEffect(viewModel.postPlayState.isVisible && postPlayFocus == .miniPlayer ? 1.05 : 1.0)
-            .animation(.easeOut(duration: 0.16), value: postPlayFocus)
-            .overlay {
-                if viewModel.postPlayState.isVisible {
-                    RoundedRectangle(cornerRadius: 16)
-                        .stroke(
-                            postPlayFocus == .miniPlayer ? Color.white : Color.white.opacity(0.35),
-                            lineWidth: postPlayFocus == .miniPlayer ? 4 : 2
-                        )
-                        .shadow(
-                            color: postPlayFocus == .miniPlayer ? Color.white.opacity(0.6) : Color.clear,
-                            radius: 12
-                        )
-                }
-            }
-            .shadow(color: Color.black.opacity(viewModel.postPlayState.isVisible ? 0.6 : 0), radius: 16)
-            .frame(
-                maxWidth: .infinity,
-                maxHeight: .infinity,
-                alignment: viewModel.postPlayState.isVisible ? .topTrailing : .center
-            )
-            .padding(.top, viewModel.postPlayState.isVisible ? 50 : 0)
-            .padding(.trailing, viewModel.postPlayState.isVisible ? 60 : 0)
+            // Measure in the parent's safe area for every state, then include
+            // the insets in the stable native viewport and scale only its output.
             .zIndex(viewModel.postPlayState.isVisible ? 5 : 0)
-            .ignoresSafeArea(edges: viewModel.postPlayState.isVisible ? [] : .all)
+            .opacity(shouldShowSurface ? 1 : 0)
+            .accessibilityHidden(!shouldShowSurface)
+            .allowsHitTesting(shouldShowSurface)
+        } else if shouldShowSurface {
+            videoSurfaceStack {
+                if let controller = viewModel.aetherController {
+                    AetherPlayerSurface(controller: controller)
+                } else {
+                    Color.black
+                }
+            }
         }
+    }
+
+    @ViewBuilder
+    private func videoSurfaceStack<Surface: View>(
+        @ViewBuilder surface: () -> Surface
+    ) -> some View {
+        ZStack {
+            surface()
+
+            if viewModel.activeEngineKind == .aether,
+               let aetherController = viewModel.aetherController {
+                PlayerSubtitleOverlay(
+                    playback: aetherController.subtitleOverlayState,
+                    translation: aetherController.subtitleTranslationState,
+                    subtitleDelaySeconds: Double(viewModel.subtitleDelayMs) / 1000.0,
+                    videoNaturalSize: viewModel.videoNaturalSize,
+                    aspectMode: viewModel.aspectMode,
+                    style: viewModel.subtitleStyle
+                )
+                .offset(y: viewModel.showScenePanel ? -430 : 0)
+                .ignoresSafeArea(edges: viewModel.postPlayState.isVisible ? [] : .all)
+            } else {
+                MPVSubtitleOverlay(
+                    translation: viewModel.playerController.subtitleTranslationState,
+                    videoNaturalSize: viewModel.videoNaturalSize,
+                    aspectMode: viewModel.aspectMode,
+                    style: viewModel.subtitleStyle
+                )
+                .offset(y: viewModel.showScenePanel ? -430 : 0)
+                .ignoresSafeArea(edges: viewModel.postPlayState.isVisible ? [] : .all)
+            }
+
+            if viewModel.postPlayState.isVisible && viewModel.postPlayState.canReturnToPlayer {
+                miniPlayerReturnButton
+            }
+        }
+        .frame(
+            width: viewModel.postPlayState.isVisible ? 580 : nil,
+            height: viewModel.postPlayState.isVisible ? 326 : nil
+        )
+        .clipShape(RoundedRectangle(cornerRadius: viewModel.postPlayState.isVisible ? 16 : 0))
+        .scaleEffect(viewModel.postPlayState.isVisible && postPlayFocus == .miniPlayer ? 1.05 : 1.0)
+        .animation(.easeOut(duration: 0.16), value: postPlayFocus)
+        .overlay {
+            if viewModel.postPlayState.isVisible {
+                RoundedRectangle(cornerRadius: 16)
+                    .stroke(
+                        postPlayFocus == .miniPlayer ? Color.white : Color.white.opacity(0.35),
+                        lineWidth: postPlayFocus == .miniPlayer ? 4 : 2
+                    )
+                    .shadow(
+                        color: postPlayFocus == .miniPlayer ? Color.white.opacity(0.6) : Color.clear,
+                        radius: 12
+                    )
+            }
+        }
+        .shadow(color: Color.black.opacity(viewModel.postPlayState.isVisible ? 0.6 : 0), radius: 16)
+        .frame(
+            maxWidth: .infinity,
+            maxHeight: .infinity,
+            alignment: viewModel.postPlayState.isVisible ? .topTrailing : .center
+        )
+        .padding(.top, viewModel.postPlayState.isVisible ? 50 : 0)
+        .padding(.trailing, viewModel.postPlayState.isVisible ? 60 : 0)
+        .zIndex(viewModel.postPlayState.isVisible ? 5 : 0)
+        .ignoresSafeArea(edges: viewModel.postPlayState.isVisible ? [] : .all)
     }
 
     @ViewBuilder
@@ -176,7 +205,8 @@ extension PlayerView {
         RemoteTouchCatcher(
             isActive: {
                 PlayerWindowInputCapturePolicy.allowsCapture(
-                    existingConditions: !isWakingFromBackground
+                    existingConditions: didReportPlaybackStarted
+                    && !isWakingFromBackground
                     && viewModel.currentErrorDiagnostic == nil && !viewModel.showSettingsPanel
                     && !viewModel.showScenePanel
                     && !viewModel.isSceneDetailVisible
@@ -205,7 +235,8 @@ extension PlayerView {
             // Tap or hold left/right seek is active during video playback,
             // when controls are hidden or when the timeline is focused.
             isActive: PlayerWindowInputCapturePolicy.allowsCapture(
-                existingConditions: !isWakingFromBackground
+                existingConditions: didReportPlaybackStarted
+                && !isWakingFromBackground
                 && viewModel.currentErrorDiagnostic == nil
                 && !viewModel.showSettingsPanel
                 && !viewModel.showScenePanel
@@ -276,9 +307,19 @@ extension PlayerView {
                     if hasAvatar {
                         toastAvatar(toast)
                     }
-                    Text(toast.message)
-                        .font(.system(size: 22, weight: .semibold))
-                        .foregroundColor(.white)
+                    if let sender = toast.senderName, !sender.isEmpty {
+                        Text("\(sender):")
+                            .font(.system(size: 20, weight: .bold))
+                            .foregroundColor(.white)
+                        Text(toast.message)
+                            .font(.system(size: 20, weight: .medium))
+                            .foregroundColor(.white.opacity(0.9))
+                            .lineLimit(2)
+                    } else {
+                        Text(toast.message)
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundColor(.white)
+                    }
                 }
                 .padding(.leading, hasAvatar ? 12 : 28)
                 .padding(.trailing, 28)
@@ -290,7 +331,7 @@ extension PlayerView {
             }
             .transition(.opacity)
             .allowsHitTesting(false)
-            .zIndex(6)
+            .zIndex(22)
         }
     }
 
@@ -352,17 +393,17 @@ extension PlayerView {
         // disabled), and dropping its opacity to hide that glow also makes the
         // focus engine skip it entirely — so `up` produced no move command.
         // A focusable Color draws no highlight yet stays reliably focusable at
-        // full opacity. Kept mounted full-time (mounting it only when the
-        // controls hide raced the timeline losing focusability, leaving focus in
-        // a void); non-focusable while the controls are up so focus hands cleanly
-        // to the timeline, focusable again the instant they hide. `up`/`down`
-        // reveal via the PlayerView `onMoveCommand`; the select click toggles
-        // play/pause via the tap gesture.
+        // full opacity. Kept mounted full-time; it is disabled during startup so
+        // the loading overlay can route input and the controls can take focus.
+        // After playback starts, it owns focus while controls are hidden and
+        // hands focus to the timeline when they appear. Select toggles playback
+        // only after startup is ready.
         Color.clear
             .ignoresSafeArea()
             .contentShape(Rectangle())
             .focusable(
-                (!viewModel.showControls || !didReportPlaybackStarted || viewModel.isSwitchingSource || viewModel.showPauseOverlay)
+                didReportPlaybackStarted
+                    && (!viewModel.showControls || viewModel.isSwitchingSource || viewModel.showPauseOverlay)
                     && !viewModel.isScrubbing
                     && !viewModel.isHoldingSeek
                     && viewModel.currentErrorDiagnostic == nil
@@ -380,6 +421,10 @@ extension PlayerView {
                 screensaverDebugLog("[ScreensaverDebug][Input] onTapGesture: isWakingFromBg=\(isWakingFromBackground) (elapsedWake=\(String(format: "%.3f", elapsedWake))s), isScrubbing=\(viewModel.isScrubbing), showPauseOverlay=\(viewModel.showPauseOverlay), status=\(viewModel.status), pos=\(viewModel.time.current)")
                 guard !isWakingFromBackground else {
                     screensaverDebugLog("[ScreensaverDebug][Input] onTapGesture suppressed by isWakingFromBackground")
+                    return
+                }
+                guard didReportPlaybackStarted else {
+                    revealControlsAndFocusSettings()
                     return
                 }
                 viewModel.handleSelectTap(
@@ -438,13 +483,14 @@ extension PlayerView {
                     }
                 },
                 watchPartyContent: WatchPartyConfiguration.isEnabled && watchPartyOwner?.service != nil && !isStandalonePlaybackSession
-                    ? { focus, tabFocus in
+                    ? { focus, focusContext in
                         guard let owner = watchPartyOwner, let service = owner.service else {
                             return AnyView(EmptyView())
                         }
                         return AnyView(PlayerWatchPartyPanel(
                             viewModel: viewModel, owner: owner, service: service,
-                            focusedControlID: focus, focusedTab: tabFocus,
+                            focusedControlID: focus,
+                            focusContext: focusContext,
                             isCurrentPlayerSurface: isCurrentPlayerSurface,
                             onOpenLobby: onOpenWatchPartyLobby
                         ))
@@ -695,10 +741,11 @@ extension PlayerView {
 
     @ViewBuilder
     var playerControlsLayer: some View {
-        if didReportPlaybackStarted, viewModel.currentErrorDiagnostic == nil {
+        if viewModel.currentErrorDiagnostic == nil {
             let isSeekingOrControlsVisible = (viewModel.showControls || viewModel.isScrubbing || viewModel.isHoldingSeek || viewModel.pendingSeekDelta != 0) && !viewModel.showScenePanel && !viewModel.isSceneDetailVisible
             PlayerControls(
                 viewModel: viewModel,
+                didReportPlaybackStarted: didReportPlaybackStarted,
                 isSkipSegmentFocused: skipSegmentFocused,
                 isNextEpisodeFocused: nextEpisodeFocused || cancelAutoPlayFocused,
                 requestedFocus: $requestedControlFocus,
@@ -708,7 +755,6 @@ extension PlayerView {
             .offset(y: viewModel.showScenePanel ? -160 : 0)
             .opacity(
                 isSeekingOrControlsVisible
-                    && didReportPlaybackStarted
                     && !viewModel.isSwitchingSource
                     && !viewModel.showSettingsPanel
                     && !viewModel.showPauseOverlay
@@ -716,7 +762,6 @@ extension PlayerView {
             )
             .scaleEffect(
                 isSeekingOrControlsVisible
-                    && didReportPlaybackStarted
                     && !viewModel.isSwitchingSource
                     && !viewModel.showSettingsPanel
                     && !viewModel.showPauseOverlay
@@ -724,7 +769,6 @@ extension PlayerView {
             )
             .allowsHitTesting(
                 isSeekingOrControlsVisible
-                    && didReportPlaybackStarted
                     && !viewModel.isSwitchingSource
                     && !viewModel.showSettingsPanel
                     && !viewModel.showPauseOverlay
@@ -749,7 +793,7 @@ extension PlayerView {
     var settingsPanelLayer: some View {
         // Settings panel (subtitles / audio / speed), over the dimmed video.
         if viewModel.showSettingsPanel {
-            PlayerSettingsPanel(viewModel: viewModel) {
+            PlayerSettingsPanel(viewModel: viewModel, didReportPlaybackStarted: didReportPlaybackStarted) {
                 viewModel.showSettingsPanel = false
             }
             .transition(.opacity)
@@ -762,10 +806,10 @@ extension PlayerView {
         // Episodes / Sources side panels.
         if viewModel.sidePanel == .episodes {
             PlayerEpisodesPanel(viewModel: viewModel)
-                .zIndex(7)
+                .zIndex(25)
         } else if viewModel.sidePanel == .sources {
             PlayerSourcesPanel(viewModel: viewModel)
-                .zIndex(7)
+                .zIndex(25)
         }
     }
 }
