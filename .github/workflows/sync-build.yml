@@ -230,6 +230,54 @@ jobs:
           p.write_text(s)
           PY
 
+      - name: Add pause trace logging
+        run: |
+          python3 - <<'PY'
+          def swap(path, old, new):
+              s = open(path).read()
+              assert s.count(old) == 1, (path, s.count(old))
+              open(path, "w").write(s.replace(old, new))
+
+          base = "tvosApp/NuvioTV/Sources/"
+
+          swap(base + "Core/Player/AetherPlaybackController.swift",
+          """            if let handler = self.watchPartyRemoteIntent { _ = handler(intent); return }
+                      if case .toggle = intent {""",
+          """            NSLog("[PauseTrace] Aether MPRemoteCommand intent=%@", String(describing: intent))
+                      if let handler = self.watchPartyRemoteIntent { _ = handler(intent); return }
+                      if case .toggle = intent {""")
+
+          swap(base + "Core/Player/MPVPlaybackController.swift",
+          """            if let handler = self.watchPartyRemoteIntent { _ = handler(intent); return }
+                      guard let intent = intent.localIntent(""",
+          """            NSLog("[PauseTrace] MPV MPRemoteCommand intent=%@", String(describing: intent))
+                      if let handler = self.watchPartyRemoteIntent { _ = handler(intent); return }
+                      guard let intent = intent.localIntent(""")
+
+          swap(base + "UI/Player/PlayerView+RemoteCommands.swift",
+          """            .onPlayPauseCommand {
+          """,
+          """            .onPlayPauseCommand {
+                          NSLog("[PauseTrace] onPlayPauseCommand fired")
+          """)
+
+          swap(base + "ViewModels/PlayerViewModel.swift",
+          """    func pause(forBackground: Bool = false) {
+          """,
+          """    func pause(forBackground: Bool = false) {
+                  NSLog("[PauseTrace] PlayerViewModel.pause(forBackground=%d)", forBackground ? 1 : 0)
+          """)
+
+          swap(base + "ViewModels/PlayerViewModel.swift",
+          """            if latestStatus == .paused, previousStatus == .playing {
+                          cancelControlsHideTimer()""",
+          """            if latestStatus == .paused, previousStatus == .playing {
+                          NSLog("[PauseTrace] poll observed external playing->paused")
+                          cancelControlsHideTimer()""")
+          print("trace patched")
+          PY
+
+
       - name: Show Xcode version
         if: steps.get_tag.outputs.should_build == 'true'
         run: xcodebuild -version
