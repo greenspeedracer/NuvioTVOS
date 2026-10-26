@@ -348,6 +348,22 @@ jobs:
           print("patched", p)
           PY
 
+      - name: Report resume to scrobble services when only scrobble targets are active
+        run: |
+          python3 - <<'PY'
+          p = "tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift"
+          s = open(p).read()
+          old = """           time.duration > 0,
+                     RemoteTrackingState.isProgressSourceAuthenticated {
+                      reportTraktProgress("""
+          new = """           time.duration > 0,
+                     RemoteTrackingState.isProgressSourceAuthenticated || hasActiveScrobbleServices {
+                      reportTraktProgress("""
+          assert s.count(old) == 1, s.count(old)
+          open(p, "w").write(s.replace(old, new))
+          print("patched", p)
+          PY
+
       - name: Show Xcode version
         if: steps.get_tag.outputs.should_build == 'true'
         run: xcodebuild -version
