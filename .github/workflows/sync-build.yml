@@ -230,66 +230,101 @@ jobs:
           p.write_text(s)
           PY
 
-      - name: Add pause trace logging (temporary)
+      # - name: Add pause trace logging (temporary)
+      #   run: |
+      #     python3 - <<'PY'
+      #     def swap(path, old, new):
+      #         s = open(path).read()
+      #         assert s.count(old) == 1, (path, s.count(old))
+      #         open(path, "w").write(s.replace(old, new))
+
+      #     base = "tvosApp/NuvioTV/Sources/"
+
+      #     swap(base + "ViewModels/PlayerViewModel.swift",
+      #     """import AetherEngine
+
+      #     @MainActor
+      #     protocol ScrubThumbnailProviding: AnyObject {""",
+      #     """import AetherEngine
+      #     import os
+
+      #     func pauseTrace(_ message: String) {
+      #         Logger(subsystem: "com.ronkozel.nuviotvos.pause", category: "trace").notice("\\(message, privacy: .public)")
+      #     }
+
+      #     @MainActor
+      #     protocol ScrubThumbnailProviding: AnyObject {""")
+
+      #     swap(base + "Core/Player/AetherPlaybackController.swift",
+      #     """            if let handler = self.watchPartyRemoteIntent { _ = handler(intent); return }
+      #                 if case .toggle = intent {""",
+      #     """            pauseTrace("Aether MPRemoteCommand intent=\\(String(describing: intent))")
+      #                 if let handler = self.watchPartyRemoteIntent { _ = handler(intent); return }
+      #                 if case .toggle = intent {""")
+
+      #     swap(base + "Core/Player/MPVPlaybackController.swift",
+      #     """            if let handler = self.watchPartyRemoteIntent { _ = handler(intent); return }
+      #                 guard let intent = intent.localIntent(""",
+      #     """            pauseTrace("MPV MPRemoteCommand intent=\\(String(describing: intent))")
+      #                 if let handler = self.watchPartyRemoteIntent { _ = handler(intent); return }
+      #                 guard let intent = intent.localIntent(""")
+
+      #     swap(base + "UI/Player/PlayerView+RemoteCommands.swift",
+      #     """.onPlayPauseCommand {
+      #     """,
+      #     """.onPlayPauseCommand {
+      #                     pauseTrace("onPlayPauseCommand fired")
+      #     """)
+
+      #     swap(base + "ViewModels/PlayerViewModel.swift",
+      #     """    func pause(forBackground: Bool = false) {
+      #     """,
+      #     """    func pause(forBackground: Bool = false) {
+      #             pauseTrace("PlayerViewModel.pause forBackground=\\(forBackground)")
+      #     """)
+
+      #     swap(base + "ViewModels/PlayerViewModel.swift",
+      #     """            if latestStatus == .paused, previousStatus == .playing {
+      #                     cancelControlsHideTimer()""",
+      #     """            if latestStatus == .paused, previousStatus == .playing {
+      #                     pauseTrace("poll observed external playing->paused")
+      #                     cancelControlsHideTimer()""")
+      #     print("trace patched")
+      #     PY
+
+      - name: Add play trace logging (temporary)
         run: |
           python3 - <<'PY'
-          def swap(path, old, new):
-              s = open(path).read()
-              assert s.count(old) == 1, (path, s.count(old))
-              open(path, "w").write(s.replace(old, new))
+          p = "tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift"
+          s = open(p).read()
 
-          base = "tvosApp/NuvioTV/Sources/"
+          def swap(old, new):
+              global s
+              assert s.count(old) == 1, (old, s.count(old))
+              s = s.replace(old, new)
 
-          swap(base + "ViewModels/PlayerViewModel.swift",
-          """import AetherEngine
-
-          @MainActor
-          protocol ScrubThumbnailProviding: AnyObject {""",
-          """import AetherEngine
-          import os
-
-          func pauseTrace(_ message: String) {
-              Logger(subsystem: "com.ronkozel.nuviotvos.pause", category: "trace").notice("\\(message, privacy: .public)")
-          }
-
-          @MainActor
-          protocol ScrubThumbnailProviding: AnyObject {""")
-
-          swap(base + "Core/Player/AetherPlaybackController.swift",
-          """            if let handler = self.watchPartyRemoteIntent { _ = handler(intent); return }
-                      if case .toggle = intent {""",
-          """            pauseTrace("Aether MPRemoteCommand intent=\\(String(describing: intent))")
-                      if let handler = self.watchPartyRemoteIntent { _ = handler(intent); return }
-                      if case .toggle = intent {""")
-
-          swap(base + "Core/Player/MPVPlaybackController.swift",
-          """            if let handler = self.watchPartyRemoteIntent { _ = handler(intent); return }
-                      guard let intent = intent.localIntent(""",
-          """            pauseTrace("MPV MPRemoteCommand intent=\\(String(describing: intent))")
-                      if let handler = self.watchPartyRemoteIntent { _ = handler(intent); return }
-                      guard let intent = intent.localIntent(""")
-
-          swap(base + "UI/Player/PlayerView+RemoteCommands.swift",
-          """.onPlayPauseCommand {
+          swap("""    func togglePlayPause() {
+                  recordWatchPartyTransportIntent()
           """,
-          """.onPlayPauseCommand {
-                          pauseTrace("onPlayPauseCommand fired")
+          """    func togglePlayPause() {
+                  pauseTrace("togglePlayPause isScrubbing=\\(isScrubbing) transportPlaying=\\(engine.isTransportPlaying) status=\\(status) party=\\(watchPartyPlayerBridge != nil)")
+                  recordWatchPartyTransportIntent()
           """)
 
-          swap(base + "ViewModels/PlayerViewModel.swift",
-          """    func pause(forBackground: Bool = false) {
+          swap("""    func play() {
+                  if watchPartyPlayerBridge != nil && status == .ended {""",
+          """    func play() {
+                  pauseTrace("play() status=\\(status)")
+                  if watchPartyPlayerBridge != nil && status == .ended {""")
+
+          swap("""    private func recordPlaybackResumeIfEligible() {
           """,
-          """    func pause(forBackground: Bool = false) {
-                  pauseTrace("PlayerViewModel.pause forBackground=\\(forBackground)")
+          """    private func recordPlaybackResumeIfEligible() {
+                  pauseTrace("resume check trackable=\\(isTrackablePlayback) meta=\\(activeMeta != nil) time=\\(time.current)/\\(time.duration) progressAuth=\\(RemoteTrackingState.isProgressSourceAuthenticated) scrobbleServices=\\(hasActiveScrobbleServices)")
           """)
 
-          swap(base + "ViewModels/PlayerViewModel.swift",
-          """            if latestStatus == .paused, previousStatus == .playing {
-                          cancelControlsHideTimer()""",
-          """            if latestStatus == .paused, previousStatus == .playing {
-                          pauseTrace("poll observed external playing->paused")
-                          cancelControlsHideTimer()""")
-          print("trace patched")
+          open(p, "w").write(s)
+          print("play trace patched")
           PY
 
       - name: Report pause to scrobble services on external pause
