@@ -107,7 +107,8 @@ jobs:
           p.write_text(s.replace(old, new))
           PY
 
-      - name: Restore poster Top Shelf cards
+      - name: Restore proper Top Shelf cards
+        if: steps.get_tag.outputs.should_build == 'true'
         run: |
           python3 - <<'PY'
           base = "tvosApp/"
@@ -150,9 +151,25 @@ jobs:
           patch("TopShelf/TopShelfContentProvider.swift", [
               ("item.imageShape = .hdtv", "item.imageShape = .poster"),
           ])
+
+          patch("NuvioTV/Sources/Models/CatalogModels.swift", [
+              (
+                  "    /// the Top Shelf extension can render the Apple TV home rows: in-progress\n    /// titles, and aired next-episode suggestions as their own Up Next row.\n",
+                  "    /// the Top Shelf extension can render the Apple TV home row: in-progress\n    /// titles and aired next-episode suggestions, as in the app.\n",
+              ),
+              (
+                  "        let inProgress = allItems.filter { !$0.isUpNextEntry }.prefix(10)\n        // Unaired suggestions can't be played yet, so they stay off the shelf.\n        let upNext = allItems\n            .filter { $0.isUpNextEntry && ($0.hasAired || $0.isAiringToday) }\n            .prefix(10)\n",
+                  "        let inProgress = allItems.filter { !ContinueWatchingSortPolicy.isUpcomingItem($0) }.prefix(10)\n",
+              ),
+              (
+                  "        TopShelfFeedStore.write(upNext.map(topShelfEntry(for:)), section: .upNext,\n",
+                  "        TopShelfFeedStore.write([], section: .upNext,\n",
+              ),
+          ])
           PY
       
       - name: Show source info on the paused controls
+        if: steps.get_tag.outputs.should_build == 'true'
         run: |
           python3 - <<'PY'
           import sys
