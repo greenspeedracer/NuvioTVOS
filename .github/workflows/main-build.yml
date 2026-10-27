@@ -1,0 +1,361 @@
+name: Main Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Fork Main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          submodules: recursive
+
+      - name: Resolve Short SHA
+        id: rev
+        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Patch Bundle IDs and App Group
+        run: |
+          OLD_BUNDLE="com.pyksel.nuviotvos"
+          NEW_BUNDLE="com.ronkozel.nuviotvos"
+
+          TARGET_GROUP="group.M3HWHXLPC7.com.pyksel.nuviotvos"
+
+          echo "1. Replacing bundle IDs..."
+          find . -type f \( -name "*.swift" -o -name "*.plist" -o -name "*.entitlements" -o -name "*.Project.swift" -o -name "Project.swift" \) \
+            -not -path "*/.*" \
+            -exec sed -i '' "s/${OLD_BUNDLE}/${NEW_BUNDLE}/g" {} +
+
+          echo "2. Enforcing App Group across codebase..."
+          # Replace both the original upstream group and any mutated bundle variations
+          find . -type f \( -name "*.swift" -o -name "*.plist" -o -name "*.entitlements" -o -name "*.Project.swift" -o -name "Project.swift" \) \
+            -not -path "*/.*" \
+            -exec sed -i '' "s/group\.[A-Z0-9]*\.com\.ronkozel\.nuviotvos/${TARGET_GROUP}/g" {} + \
+            -exec sed -i '' "s/group\.com\.ronkozel\.nuviotvos/${TARGET_GROUP}/g" {} + \
+            -exec sed -i '' "s/group\.com\.pyksel\.nuviotvos/${TARGET_GROUP}/g" {} +
+
+          echo "Verification:"
+          echo "--- Bundle ID matches ---"
+          grep -rn "$NEW_BUNDLE" . || { echo "Failed to patch bundle ID"; exit 1; }
+
+          echo "--- App Group matches ---"
+          grep -rn "$TARGET_GROUP" . || { echo "Failed to patch app group"; exit 1; }
+
+      - name: Pin Top Shelf App Group
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("tvosApp/NuvioTV/Sources/Core/TopShelf/TopShelfFeed.swift")
+          s = p.read_text()
+          old = 'return "group.\\(mainAppBundleID)"'
+          new = 'return "group.M3HWHXLPC7.com.pyksel.nuviotvos"'
+          assert s.count(old) == 1, f"expected 1 match, found {s.count(old)}"
+          p.write_text(s.replace(old, new))
+          PY
+
+      - name: Show source info on the paused controls
+        run: |
+          python3 - <<'PY'
+          import sys
+
+          base = "tvosApp/NuvioTV/Sources/"
+
+
+          def patch(path, edits):
+              p = base + path
+              s = open(p).read()
+              for old, new in edits:
+                  assert s.count(old) == 1, (path, s.count(old), old[:70])
+                  s = s.replace(old, new)
+              open(p, "w").write(s)
+              print("patched", p)
+
+
+          labels_enum = r'''enum StreamSourceLabels {
+              struct Entry {
+                  let streamName: String?
+                  let addonName: String?
+              }
+
+              private static let lock = NSLock()
+              private static var labels: [String: Entry] = [:]
+              private static let maxEntries = 800
+
+              static func flattened(_ value: String?) -> String? {
+                  guard let value else { return nil }
+                  let text = value
+                      .components(separatedBy: .whitespacesAndNewlines)
+                      .filter { !$0.isEmpty }
+                      .joined(separator: " ")
+                  return text.isEmpty ? nil : text
+              }
+
+              static func record(_ stream: NuvioStream) {
+                  guard let addon = flattened(stream.addonName) else { return }
+                  let id = stream.id
+                  let label = Entry(streamName: flattened(stream.name), addonName: addon)
+                  lock.lock()
+                  defer { lock.unlock() }
+                  if labels.count >= maxEntries, labels[id] == nil {
+                      labels.removeAll(keepingCapacity: true)
+                  }
+                  labels[id] = label
+              }
+
+              static func label(for id: String?) -> Entry? {
+                  guard let id, !id.isEmpty else { return nil }
+                  lock.lock()
+                  defer { lock.unlock() }
+                  return labels[id]
+              }
+          }
+
+          '''
+
+          patch("Core/Streams/StreamQualityTags.swift", [
+              (
+                  "/// Profile-scoped memory of the exact playable link",
+                  labels_enum + "/// Profile-scoped memory of the exact playable link",
+              ),
+              (
+                  "        let savedAt: Date?\n    }\n",
+                  "        let savedAt: Date?\n        let streamName: String?\n        let addonName: String?\n    }\n",
+              ),
+              (
+                  "        savedAt: Date = Date()\n    ) {\n        let cleanUrl",
+                  "        savedAt: Date = Date(),\n        streamName: String? = nil,\n        addonName: String? = nil\n    ) {\n        let cleanUrl",
+              ),
+              (
+                  "            episode: episode,\n            savedAt: savedAt\n        )\n",
+                  "            episode: episode,\n            savedAt: savedAt,\n            streamName: streamName,\n            addonName: addonName\n        )\n",
+              ),
+              (
+                  "        var records = loadRecords(profileId: profileId)\n        records[trimmedMetaId] = record\n        persistRecords(records, profileId: profileId)\n",
+                  """        var records = loadRecords(profileId: profileId)
+                  var merged = record
+                  if streamName == nil, addonName == nil,
+                     let existing = records[trimmedMetaId], existing.url == cleanUrl {
+                      merged = Record(
+                          url: record.url,
+                          httpHeaders: record.httpHeaders,
+                          season: record.season,
+                          episode: record.episode,
+                          savedAt: record.savedAt,
+                          streamName: existing.streamName,
+                          addonName: existing.addonName
+                      )
+                  }
+                  records[trimmedMetaId] = merged
+                  persistRecords(records, profileId: profileId)
+          """,
+              ),
+              (
+                  "    static func remove(\n        metaId: String,\n        season: Int? = nil,\n        episode: Int? = nil,\n        profileId: String? = nil\n    ) {\n",
+                  """    static func labels(
+                  metaId: String,
+                  season: Int?,
+                  episode: Int?,
+                  url: String,
+                  profileId: String? = nil
+              ) -> (streamName: String?, addonName: String?)? {
+                  let trimmedMetaId = metaId.trimmingCharacters(in: .whitespacesAndNewlines)
+                  guard !trimmedMetaId.isEmpty else { return nil }
+
+                  lock.lock()
+                  defer { lock.unlock() }
+
+                  guard let record = loadRecords(profileId: profileId)[trimmedMetaId],
+                        record.season == season,
+                        record.episode == episode,
+                        record.url == url,
+                        record.streamName != nil || record.addonName != nil else { return nil }
+                  return (record.streamName, record.addonName)
+              }
+
+              static func remove(
+                  metaId: String,
+                  season: Int? = nil,
+                  episode: Int? = nil,
+                  profileId: String? = nil
+              ) {
+          """,
+              ),
+          ])
+
+          patch("Data/Repository/StreamsRepository.swift", [
+              (
+                  "        return NuvioStream(\n            url: parsed.directURL,\n            name: displayName,\n",
+                  "        let stream = NuvioStream(\n            url: parsed.directURL,\n            name: displayName,\n",
+              ),
+              (
+                  "            notPlayable: isNotPlayable ? true : nil\n        )\n    }\n",
+                  "            notPlayable: isNotPlayable ? true : nil\n        )\n        StreamSourceLabels.record(stream)\n        return stream\n    }\n",
+              ),
+          ])
+
+          vm_methods = r'''    var sourceNameLine: String? {
+                  let parts = [
+                      StreamSourceLabels.flattened(sourceLabelAddon),
+                      StreamSourceLabels.flattened(sourceLabelStream)
+                  ].compactMap { $0 }
+                  return parts.isEmpty ? nil : parts.joined(separator: "  •  ")
+              }
+
+              private func resolveSourceLabels(url: URL, meta: NuvioMeta, episode: NuvioVideo?, sourceID: String?) {
+                  sourceMeasuredLine = nil
+                  if let label = StreamSourceLabels.label(for: sourceID) {
+                      sourceLabelStream = label.streamName
+                      sourceLabelAddon = label.addonName
+                      return
+                  }
+                  if let stored = LastPlaybackStreamStore.labels(
+                      metaId: meta.id,
+                      season: episode?.season,
+                      episode: episode?.episode,
+                      url: url.absoluteString,
+                      profileId: WatchedStore.activeProfileId
+                  ) {
+                      sourceLabelStream = stored.streamName
+                      sourceLabelAddon = stored.addonName
+                      return
+                  }
+                  sourceLabelStream = nil
+                  sourceLabelAddon = nil
+              }
+
+              private func refreshSourceMeasuredLine() {
+                  let info = engine.playbackDebugInfo
+                  var parts: [String] = []
+                  if let resolution = Self.sourceResolutionText(info.resolution) {
+                      parts.append(resolution)
+                  }
+                  let format = [Self.sourceCodecText(info.videoCodec), Self.sourceRangeText(info.dynamicRange)]
+                      .compactMap { $0 }
+                      .joined(separator: " ")
+                  if !format.isEmpty {
+                      parts.append(format)
+                  }
+                  if let bitrate = Self.sourceAverageBitrateText(info.vBitrate) {
+                      parts.append(bitrate)
+                  }
+                  sourceMeasuredLine = parts.isEmpty ? nil : parts.joined(separator: "  •  ")
+              }
+
+              private static func sourceResolutionText(_ value: String) -> String? {
+                  let dims = value
+                      .components(separatedBy: "×")
+                      .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+                  guard dims.count == 2, dims[0] > 0, dims[1] > 0 else { return nil }
+                  let effectiveHeight = max(Double(dims[1]), Double(dims[0]) * 9.0 / 16.0)
+                  switch effectiveHeight {
+                  case 2000...: return "2160p"
+                  case 1300...: return "1440p"
+                  case 1000...: return "1080p"
+                  case 650...: return "720p"
+                  default: return "\(dims[1])p"
+                  }
+              }
+
+              private static func sourceCodecText(_ value: String) -> String? {
+                  let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                  return text.isEmpty || text == "Unknown" ? nil : text
+              }
+
+              private static func sourceRangeText(_ value: String) -> String? {
+                  let source = value
+                      .components(separatedBy: " → ")
+                      .first?
+                      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                  if source.isEmpty { return nil }
+                  return source == "HDR10/PQ" ? "HDR10" : source
+              }
+
+              private static func sourceAverageBitrateText(_ value: String) -> String? {
+                  guard let regex = try? NSRegularExpression(pattern: #"avg mux ([0-9]+(?:\.[0-9]+)?) Mbit/s"#),
+                        let match = regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)),
+                        let range = Range(match.range(at: 1), in: value) else { return nil }
+                  return "\(value[range]) Mbps"
+              }
+
+          '''
+
+          patch("ViewModels/PlayerViewModel.swift", [
+              (
+                  "    private var activeAddonName: String?\n    private var activeProviderName: String?\n",
+                  "    private var activeAddonName: String?\n    private var activeProviderName: String?\n    private var sourceLabelStream: String?\n    private var sourceLabelAddon: String?\n    @Published private(set) var sourceMeasuredLine: String?\n",
+              ),
+              (
+                  "        activeVideoSize = videoSize\n",
+                  "        activeVideoSize = videoSize\n        resolveSourceLabels(url: url, meta: meta, episode: currentEpisode, sourceID: sourceID)\n",
+              ),
+              (
+                  "        self.activeProviderName = prepared.provider\n",
+                  "        self.activeProviderName = prepared.provider\n        self.sourceLabelStream = prepared.streamName\n        self.sourceLabelAddon = prepared.addonName\n        self.sourceMeasuredLine = nil\n",
+              ),
+              (
+                  "                schedulePauseOverlay()\n                saveProgress(force: true, eventAction: .pause)\n            }\n",
+                  "                schedulePauseOverlay()\n                saveProgress(force: true, eventAction: .pause)\n                refreshSourceMeasuredLine()\n            }\n",
+              ),
+              (
+                  "                episode: episode,\n                profileId: WatchedStore.activeProfileId\n            )\n        } else if completesPlayback {\n",
+                  "                episode: episode,\n                profileId: WatchedStore.activeProfileId,\n                streamName: sourceLabelStream,\n                addonName: sourceLabelAddon\n            )\n        } else if completesPlayback {\n",
+              ),
+              (
+                  "    func isCurrentSource(_ stream: NuvioStream) -> Bool {\n",
+                  vm_methods + "    func isCurrentSource(_ stream: NuvioStream) -> Bool {\n",
+              ),
+          ])
+
+          controls_old = """                            if !viewModel.subtitle.isEmpty {
+                                          Text(viewModel.subtitle)
+                                              .font(.system(size: 21, weight: .medium))
+                                              .foregroundColor(.white.opacity(0.68))
+                                              .lineLimit(1)
+                                      }
+          """
+          controls_new = controls_old + """
+                                      if viewModel.status == .paused {
+                                          if let line = viewModel.sourceNameLine {
+                                              Text(line)
+                                                  .font(.system(size: 21, weight: .medium))
+                                                  .foregroundColor(.white.opacity(0.68))
+                                                  .lineLimit(1)
+                                          }
+                                          if let line = viewModel.sourceMeasuredLine {
+                                              Text(line)
+                                                  .font(.system(size: 21, weight: .medium))
+                                                  .foregroundColor(.white.opacity(0.68))
+                                                  .lineLimit(1)
+                                          }
+                                      }
+          """
+          patch("UI/Player/PlayerControls.swift", [(controls_old, controls_new)])
+          PY
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install mise
+        run: curl https://mise.run | sh
+
+      - name: Install pinned tool versions (Tuist)
+        run: |
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/mise" install
+
+      - name: Build IPA
+        run: bash scripts/build-ipa.sh
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: NuvioTV-main-${{ steps.rev.outputs.short }}-unsigned-ipa
+          path: build-ipa/*.ipa
+          if-no-files-found: error
