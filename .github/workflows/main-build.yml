@@ -60,12 +60,10 @@ jobs:
           p.write_text(s.replace(old, new))
           PY
 
-      - name: Show source info on the paused controls
+      - name: Restore poster Top Shelf cards
         run: |
           python3 - <<'PY'
-          import sys
-
-          base = "tvosApp/NuvioTV/Sources/"
+          base = "tvosApp/"
 
 
           def patch(path, edits):
@@ -78,16 +76,63 @@ jobs:
               print("patched", p)
 
 
+          patch("NuvioTV/Sources/Core/TopShelf/TopShelfFeed.swift", [
+              (
+                  "    /// Artwork the card is rendered from: the backdrop, else the poster.\n    var artworkSourceURL: String? {\n        backdropURL ?? imageURL\n",
+                  "    /// Artwork the card is rendered from: the poster, else the backdrop.\n    var artworkSourceURL: String? {\n        imageURL ?? backdropURL\n",
+              ),
+              (
+                  "    private static let artworkRenderVersion = 3\n    /// Rendered card size. 16:9, large enough for the 2x shelf scale.\n    private static let artworkSize = CGSize(width: 1_280, height: 720)\n",
+                  "    private static let artworkRenderVersion = 4\n    /// Rendered card size. 2:3 poster, large enough for the 2x shelf scale.\n    private static let artworkSize = CGSize(width: 1_000, height: 1_500)\n",
+              ),
+              (
+                  "    /// Renders a 16:9 card. Landscape art fills it; portrait art (a poster used\n    /// when no backdrop exists) sits centered over a dimmed, filled copy of\n    /// itself rather than being cropped to a sliver.\n",
+                  "    /// Renders a poster card: the artwork fills it, with the episode/time pill\n    /// across the top.\n",
+              ),
+              (
+                  "            let fillRect = aspectRect(for: image.size, in: size, fill: true)\n            let isLandscape = image.size.width >= image.size.height * 1.2\n            if isLandscape {\n                image.draw(in: fillRect)\n            } else {\n                image.draw(in: fillRect, blendMode: .normal, alpha: 0.35)\n                image.draw(in: aspectRect(for: image.size, in: size, fill: false))\n            }\n",
+                  "            image.draw(in: aspectRect(for: image.size, in: size, fill: true))\n",
+              ),
+              ("UIFont.systemFont(ofSize: 40, weight: .bold)", "UIFont.systemFont(ofSize: 44, weight: .bold)"),
+              ("let horizontalPadding: CGFloat = 64", "let horizontalPadding: CGFloat = 72"),
+              ("let maximumPillWidth = size.width - 80", "let maximumPillWidth = size.width - 88"),
+              ("let pillHeight = max(88, ceil(textSize.height) + 32)", "let pillHeight = max(108, ceil(textSize.height) + 36)"),
+              ("y: size.height - pillHeight - 40,", "y: 44,"),
+          ])
+
+          patch("TopShelf/TopShelfContentProvider.swift", [
+              ("item.imageShape = .hdtv", "item.imageShape = .poster"),
+          ])
+          PY
+
+      - name: Show source info on the paused controls
+        run: |
+          python3 - <<'PY'
+          import sys
+ 
+          base = "tvosApp/NuvioTV/Sources/"
+ 
+ 
+          def patch(path, edits):
+              p = base + path
+              s = open(p).read()
+              for old, new in edits:
+                  assert s.count(old) == 1, (path, s.count(old), old[:70])
+                  s = s.replace(old, new)
+              open(p, "w").write(s)
+              print("patched", p)
+ 
+ 
           labels_enum = r'''enum StreamSourceLabels {
               struct Entry {
                   let streamName: String?
                   let addonName: String?
               }
-
+ 
               private static let lock = NSLock()
               private static var labels: [String: Entry] = [:]
               private static let maxEntries = 800
-
+ 
               static func flattened(_ value: String?) -> String? {
                   guard let value else { return nil }
                   let text = value
@@ -96,7 +141,7 @@ jobs:
                       .joined(separator: " ")
                   return text.isEmpty ? nil : text
               }
-
+ 
               static func record(_ stream: NuvioStream) {
                   guard let addon = flattened(stream.addonName) else { return }
                   let id = stream.id
@@ -108,7 +153,7 @@ jobs:
                   }
                   labels[id] = label
               }
-
+ 
               static func label(for id: String?) -> Entry? {
                   guard let id, !id.isEmpty else { return nil }
                   lock.lock()
@@ -116,9 +161,9 @@ jobs:
                   return labels[id]
               }
           }
-
+ 
           '''
-
+ 
           patch("Core/Streams/StreamQualityTags.swift", [
               (
                   "/// Profile-scoped memory of the exact playable link",
@@ -167,10 +212,10 @@ jobs:
               ) -> (streamName: String?, addonName: String?)? {
                   let trimmedMetaId = metaId.trimmingCharacters(in: .whitespacesAndNewlines)
                   guard !trimmedMetaId.isEmpty else { return nil }
-
+ 
                   lock.lock()
                   defer { lock.unlock() }
-
+ 
                   guard let record = loadRecords(profileId: profileId)[trimmedMetaId],
                         record.season == season,
                         record.episode == episode,
@@ -178,7 +223,7 @@ jobs:
                         record.streamName != nil || record.addonName != nil else { return nil }
                   return (record.streamName, record.addonName)
               }
-
+ 
               static func remove(
                   metaId: String,
                   season: Int? = nil,
@@ -188,7 +233,7 @@ jobs:
           """,
               ),
           ])
-
+ 
           patch("Data/Repository/StreamsRepository.swift", [
               (
                   "        return NuvioStream(\n            url: parsed.directURL,\n            name: displayName,\n",
@@ -199,7 +244,7 @@ jobs:
                   "            notPlayable: isNotPlayable ? true : nil\n        )\n        StreamSourceLabels.record(stream)\n        return stream\n    }\n",
               ),
           ])
-
+ 
           vm_methods = r'''    var sourceNameLine: String? {
                   let parts = [
                       StreamSourceLabels.flattened(sourceLabelAddon),
@@ -207,7 +252,7 @@ jobs:
                   ].compactMap { $0 }
                   return parts.isEmpty ? nil : parts.joined(separator: "  •  ")
               }
-
+ 
               private func resolveSourceLabels(url: URL, meta: NuvioMeta, episode: NuvioVideo?, sourceID: String?) {
                   sourceMeasuredLine = nil
                   if let label = StreamSourceLabels.label(for: sourceID) {
@@ -229,7 +274,7 @@ jobs:
                   sourceLabelStream = nil
                   sourceLabelAddon = nil
               }
-
+ 
               private func refreshSourceMeasuredLine() {
                   let info = engine.playbackDebugInfo
                   var parts: [String] = []
@@ -247,7 +292,7 @@ jobs:
                   }
                   sourceMeasuredLine = parts.isEmpty ? nil : parts.joined(separator: "  •  ")
               }
-
+ 
               private static func sourceResolutionText(_ value: String) -> String? {
                   let dims = value
                       .components(separatedBy: "×")
@@ -262,12 +307,12 @@ jobs:
                   default: return "\(dims[1])p"
                   }
               }
-
+ 
               private static func sourceCodecText(_ value: String) -> String? {
                   let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
                   return text.isEmpty || text == "Unknown" ? nil : text
               }
-
+ 
               private static func sourceRangeText(_ value: String) -> String? {
                   let source = value
                       .components(separatedBy: " → ")
@@ -276,16 +321,16 @@ jobs:
                   if source.isEmpty { return nil }
                   return source == "HDR10/PQ" ? "HDR10" : source
               }
-
+ 
               private static func sourceAverageBitrateText(_ value: String) -> String? {
                   guard let regex = try? NSRegularExpression(pattern: #"avg mux ([0-9]+(?:\.[0-9]+)?) Mbit/s"#),
                         let match = regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)),
                         let range = Range(match.range(at: 1), in: value) else { return nil }
                   return "\(value[range]) Mbps"
               }
-
+ 
           '''
-
+ 
           patch("ViewModels/PlayerViewModel.swift", [
               (
                   "    private var activeAddonName: String?\n    private var activeProviderName: String?\n",
@@ -308,11 +353,15 @@ jobs:
                   "                episode: episode,\n                profileId: WatchedStore.activeProfileId,\n                streamName: sourceLabelStream,\n                addonName: sourceLabelAddon\n            )\n        } else if completesPlayback {\n",
               ),
               (
+                  "        showPauseOverlay = false\n        // Show progress bar and transport controls when paused\n        showControls = true\n",
+                  "        showPauseOverlay = false\n        refreshSourceMeasuredLine()\n        // Show progress bar and transport controls when paused\n        showControls = true\n",
+              ),
+              (
                   "    func isCurrentSource(_ stream: NuvioStream) -> Bool {\n",
                   vm_methods + "    func isCurrentSource(_ stream: NuvioStream) -> Bool {\n",
               ),
           ])
-
+ 
           controls_old = """                            if !viewModel.subtitle.isEmpty {
                                           Text(viewModel.subtitle)
                                               .font(.system(size: 21, weight: .medium))
