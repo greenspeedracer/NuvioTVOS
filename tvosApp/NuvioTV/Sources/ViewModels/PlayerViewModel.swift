@@ -3205,6 +3205,7 @@ class PlayerViewModel: ObservableObject {
         let rawCurrent = Double(c.positionMs) / 1000.0
         let rawDuration = Double(c.durationMs) / 1000.0
         let latestTime = PlayerTime(current: rawCurrent, duration: rawDuration)
+        UsenetEngineManager.shared.reportDuration(rawDuration, playbackURL: activeStreamURL)
 
         // An unavailable duration is unknown, not evidence of a live stream.
         // Keep recognized channel/source hints, including a URL resolved after load.
@@ -3488,6 +3489,7 @@ class PlayerViewModel: ObservableObject {
                 showControls = true
                 isTimelineFocused = true
                 schedulePauseOverlay()
+                saveProgress(force: true, eventAction: .pause)
             }
         }
         if showScenePanel {
@@ -3749,7 +3751,7 @@ class PlayerViewModel: ObservableObject {
            let activeMeta,
            time.current > 0,
            time.duration > 0,
-           RemoteTrackingState.isProgressSourceAuthenticated {
+           RemoteTrackingState.isProgressSourceAuthenticated || hasActiveScrobbleServices {
             reportTraktProgress(
                 meta: activeMeta,
                 playbackTime: time,
