@@ -95,6 +95,9 @@ struct PlayerControls: View {
             // Don't steal focus while the pause metadata sheet, loading, or post play owns the remote.
             if isVisible,
                !viewModel.isSwitchingSource,
+               !viewModel.isAwaitingStreamStart,
+               !viewModel.isReloadingStream,
+               !viewModel.isAdvancingEpisode,
                !viewModel.showPauseOverlay,
                !viewModel.postPlayState.isVisible,
                !isSkipSegmentFocused,
@@ -109,6 +112,28 @@ struct PlayerControls: View {
         .onChange(of: viewModel.isSwitchingSource) { _, isSwitching in
             guard !isSwitching,
                   viewModel.showControls,
+                  !viewModel.isAwaitingStreamStart,
+                  !viewModel.isReloadingStream,
+                  !viewModel.isAdvancingEpisode,
+                  !viewModel.controlsAutoHideSuspended,
+                  !viewModel.showSettingsPanel,
+                  !viewModel.showScenePanel,
+                  !viewModel.isSceneDetailVisible,
+                  viewModel.sidePanel == nil,
+                  !viewModel.postPlayState.isVisible,
+                  !viewModel.showPauseOverlay,
+                  !isSkipSegmentFocused,
+                  !isNextEpisodeFocused else { return }
+            DispatchQueue.main.async {
+                focusedControl = initialFocusControl
+            }
+        }
+        .onChange(of: viewModel.isAwaitingStreamStart) { _, isAwaiting in
+            guard !isAwaiting,
+                  viewModel.showControls,
+                  !viewModel.isSwitchingSource,
+                  !viewModel.isReloadingStream,
+                  !viewModel.isAdvancingEpisode,
                   !viewModel.controlsAutoHideSuspended,
                   !viewModel.showSettingsPanel,
                   !viewModel.showScenePanel,
@@ -234,6 +259,9 @@ struct PlayerControls: View {
     private var controlsInteractable: Bool {
         (viewModel.showControls || viewModel.isScrubbing)
             && !viewModel.isSwitchingSource
+            && !viewModel.isAwaitingStreamStart
+            && !viewModel.isReloadingStream
+            && !viewModel.isAdvancingEpisode
             && !viewModel.showPauseOverlay
             && !viewModel.showSettingsPanel
             && !viewModel.showScenePanel
@@ -1394,6 +1422,7 @@ struct SkipSegmentOverlay: View {
     let interval: SkipInterval
     let countdown: Int?
     var isFocused: Bool
+    var targetsPostCredits: Bool = false
 
     var body: some View {
         HStack(spacing: 16) {
@@ -1406,7 +1435,7 @@ struct SkipSegmentOverlay: View {
                 }
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(interval.label)
+                Text(interval.label(targetsPostCredits: targetsPostCredits))
                     .font(.system(size: 26, weight: .bold))
                     .foregroundColor(.white)
                 Text(detailText)

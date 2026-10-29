@@ -335,6 +335,7 @@ class PlayerViewModel: ObservableObject {
     @Published var isAdvancingEpisode: Bool = false
     /// Current IntroDB skip segment, visible as a compact skip action.
     @Published var activeSkipInterval: SkipInterval?
+    @Published var activeSkipTargetsPostCredits: Bool = false
     @Published var skipSegmentCountdown: Int?
 
     var showSkipSegmentCard: Bool {
@@ -531,6 +532,11 @@ class PlayerViewModel: ObservableObject {
         get { ProfileSettings.current.bool(forKey: SettingsKey.autoSkipOutro) }
         set { ProfileSettings.current.set(newValue, forKey: SettingsKey.autoSkipOutro) }
     }
+
+    var autoSkipMovieCreditsEnabled: Bool {
+        get { ProfileSettings.current.bool(forKey: SettingsKey.autoSkipMovieCredits) }
+        set { ProfileSettings.current.set(newValue, forKey: SettingsKey.autoSkipMovieCredits) }
+    }
     private var skipSegmentAutoHideDeadline: Date?
     private var skipIntervalLoadTask: Task<Void, Never>?
     private var sourcesFetchTask: Task<Void, Never>?
@@ -659,10 +665,12 @@ class PlayerViewModel: ObservableObject {
     /// the old pipeline down and opens the new one, which the poll would
     /// otherwise read as `.paused` — a black screen with no spinner, and the
     /// pause metadata sheet arming behind it.
-    private var isAwaitingStreamStart = false
+    @Published private(set) var isAwaitingStreamStart = false
     private(set) var loadWatchdogTask: Task<Void, Never>?
     private var isFailingOver = false
     private var toastClearTask: Task<Void, Never>?
+    private var loadWatchdogGeneration: UInt64?
+    private var loadWatchdogDiscGraceGranted = false
     /// A source that hasn't started within this long is treated as dead.
     private let loadTimeoutSeconds: UInt64 = 30
 
@@ -1161,7 +1169,7 @@ class PlayerViewModel: ObservableObject {
             httpHeaders: httpHeaders,
             streamName: title.isEmpty ? nil : title,
             streamDescription: subtitle.isEmpty ? nil : subtitle,
-            filename: url.lastPathComponent
+            filename: activeFilename ?? url.lastPathComponent
         )
         videoNaturalSize = .zero
         startPolling()
@@ -2071,13 +2079,15 @@ class PlayerViewModel: ObservableObject {
         let imdbId = meta.imdbId ?? (meta.id.hasPrefix("tt") ? meta.id : nil)
         let expectedMetaId = meta.id
         let episodeNumbers = activeEpisodeNumbers
+        let isMovie = !meta.isSeries && episodeNumbers == nil
         skipIntervalLoadTask?.cancel()
         skipIntervalLoadTask = Task { [weak self] in
             let intervals = await IntroDBSkipService.shared.intervals(
                 imdbId: imdbId,
                 season: episodeNumbers?.season,
                 episode: episodeNumbers?.episode,
-                duration: self?.time.duration
+                duration: self?.time.duration,
+                isMovie: isMovie
             )
             await MainActor.run {
                 guard let self,
@@ -2120,32 +2130,41 @@ class PlayerViewModel: ObservableObject {
         if interval.isEnding && autoSkipOutroEnabled {
             return true
         }
+        if interval.isMovieCredits && autoSkipMovieCreditsEnabled {
+            return true
+        }
         return false
     }
 
     private func updateSkipIntervalState() {
         if !didRefreshIntroDBForKnownDuration,
            time.duration > 0,
-           let meta = activeMeta,
-           let numbers = activeEpisodeNumbers {
-            didRefreshIntroDBForKnownDuration = true
-            let imdbId = meta.imdbId ?? (meta.id.hasPrefix("tt") ? meta.id : nil)
-            let expectedMetaId = meta.id
-            let duration = time.duration
-            skipIntervalLoadTask?.cancel()
-            skipIntervalLoadTask = Task { [weak self] in
-                let intervals = await IntroDBSkipService.shared.intervals(
-                    imdbId: imdbId, season: numbers.season, episode: numbers.episode,
-                    duration: duration
-                )
-                await MainActor.run {
-                    guard let self,
-                          !Task.isCancelled,
-                          self.activeMeta?.id == expectedMetaId,
-                          self.activeEpisodeNumbers?.season == numbers.season,
-                          self.activeEpisodeNumbers?.episode == numbers.episode else { return }
-                    self.skipIntervals = intervals
-                    self.updateSkipIntervalState()
+           let meta = activeMeta {
+            let numbers = activeEpisodeNumbers
+            let isMovie = !meta.isSeries && numbers == nil
+            if numbers != nil || isMovie {
+                didRefreshIntroDBForKnownDuration = true
+                let imdbId = meta.imdbId ?? (meta.id.hasPrefix("tt") ? meta.id : nil)
+                let expectedMetaId = meta.id
+                let duration = time.duration
+                skipIntervalLoadTask?.cancel()
+                skipIntervalLoadTask = Task { [weak self] in
+                    let intervals = await IntroDBSkipService.shared.intervals(
+                        imdbId: imdbId,
+                        season: numbers?.season,
+                        episode: numbers?.episode,
+                        duration: duration,
+                        isMovie: isMovie
+                    )
+                    await MainActor.run {
+                        guard let self,
+                              !Task.isCancelled,
+                              self.activeMeta?.id == expectedMetaId,
+                              self.activeEpisodeNumbers?.season == numbers?.season,
+                              self.activeEpisodeNumbers?.episode == numbers?.episode else { return }
+                        self.skipIntervals = intervals
+                        self.updateSkipIntervalState()
+                    }
                 }
             }
         }
@@ -2174,6 +2193,7 @@ class PlayerViewModel: ObservableObject {
               !isSceneDetailVisible,
               sidePanel == nil else {
             if activeSkipInterval != nil { activeSkipInterval = nil }
+            if activeSkipTargetsPostCredits { activeSkipTargetsPostCredits = false }
             if skipSegmentCountdown != nil { skipSegmentCountdown = nil }
             skipSegmentAutoHideDeadline = nil
             return
@@ -2191,14 +2211,22 @@ class PlayerViewModel: ObservableObject {
         }
 
         let interval = skipIntervals.first { segment in
+            !segment.isPostCredits &&
             current >= max(segment.startTime - 0.35, 0) && current < segment.endTime - 0.25
         }
 
         guard let interval else {
             if activeSkipInterval != nil { activeSkipInterval = nil }
+            if activeSkipTargetsPostCredits { activeSkipTargetsPostCredits = false }
             if skipSegmentCountdown != nil { skipSegmentCountdown = nil }
             skipSegmentAutoHideDeadline = nil
             return
+        }
+
+        let postCredits = interval.followingPostCreditsScene(intervals: skipIntervals, duration: time.duration)
+        let targetsPostCredits = (postCredits != nil)
+        if activeSkipTargetsPostCredits != targetsPostCredits {
+            activeSkipTargetsPostCredits = targetsPostCredits
         }
 
         if shouldAutoSkip(interval: interval) &&
@@ -2215,6 +2243,7 @@ class PlayerViewModel: ObservableObject {
         if dismissedSkipIntervalIds.contains(interval.id) {
             if !showControls {
                 if activeSkipInterval != nil { activeSkipInterval = nil }
+                if activeSkipTargetsPostCredits { activeSkipTargetsPostCredits = false }
                 if skipSegmentCountdown != nil { skipSegmentCountdown = nil }
                 skipSegmentAutoHideDeadline = nil
                 return
@@ -2551,9 +2580,13 @@ class PlayerViewModel: ObservableObject {
         currentLoadStarted = false
         let targetURL = activeStreamURL
         let targetGeneration = sessionCoordinator.loadGeneration
-        let timeout = loadTimeoutSeconds
+        if loadWatchdogGeneration != targetGeneration {
+            loadWatchdogGeneration = targetGeneration
+            loadWatchdogDiscGraceGranted = false
+        }
+        let timeoutSeconds = loadTimeoutSeconds
         loadWatchdogTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: timeout * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
             guard !Task.isCancelled, let self,
                   self.sessionCoordinator.loadGeneration == targetGeneration,
                   self.sessionCoordinator.lastLoadError == nil,
@@ -2565,10 +2598,34 @@ class PlayerViewModel: ObservableObject {
                   !self.isFailingOver,
                   self.activeStreamURL == targetURL
             else { return }
+            var elapsedTimeout = timeoutSeconds
+            if self.sessionCoordinator.shouldGrantDiscStartupWatchdogGrace(
+                generation: targetGeneration,
+                graceAlreadyGranted: self.loadWatchdogDiscGraceGranted
+            ) {
+                self.loadWatchdogDiscGraceGranted = true
+                elapsedTimeout += timeoutSeconds
+                print("[TVTrace] ⏳ [LOAD_WATCHDOG_GRACE] Remote disc-image hint reached Aether sourceOpened; allowing one additional \(timeoutSeconds)s startup window (\(elapsedTimeout)s total).")
+                try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
+                guard !Task.isCancelled,
+                      self.sessionCoordinator.loadGeneration == targetGeneration,
+                      self.sessionCoordinator.lastLoadError == nil,
+                      !self.currentLoadStarted,
+                      !self.hasRenderedFirstFrame,
+                      !self.livePlaybackHasStarted,
+                      !self.hasProducedMidFilePosition,
+                      !self.didShutdown,
+                      !self.isFailingOver,
+                      self.activeStreamURL == targetURL
+                else { return }
+            }
             let memReport = TVMemoryDiagnostic.detailedReport(label: "LOAD_WATCHDOG_TIMEOUT")
-            print("[TVTrace] ⚠️ [LOAD_WATCHDOG_TIMEOUT] Source failed to start within \(timeout)s for url=\(targetURL ?? "nil")\n\(memReport)")
+            let diagnosticURL = targetURL.flatMap { URL(string: $0) }.map {
+                AddonTransportUrls.diagnosticDescription(for: $0)
+            } ?? "<redacted URL>"
+            print("[TVTrace] ⚠️ [LOAD_WATCHDOG_TIMEOUT] Source failed to start within \(elapsedTimeout)s for url=\(diagnosticURL)\n\(memReport)")
             if self.isStandalonePlaybackSession {
-                self.status = .error("The stream did not start within \(self.loadTimeoutSeconds) seconds.")
+                self.status = .error("The stream did not start within \(elapsedTimeout) seconds.")
                 return
             }
             if (self.isLiveStream || self.activeMeta?.isSports == true),
@@ -2579,7 +2636,7 @@ class PlayerViewModel: ObservableObject {
                 return
             }
             guard self.reloadCurrentStream != nil else {
-                self.status = .error("The stream did not start within \(self.loadTimeoutSeconds) seconds.")
+                self.status = .error("The stream did not start within \(elapsedTimeout) seconds.")
                 return
             }
             if let url = self.activeStreamURL {
@@ -2590,7 +2647,7 @@ class PlayerViewModel: ObservableObject {
                 LastPlaybackStreamStore.remove(metaId: meta.id, season: numbers?.season, episode: numbers?.episode)
             }
             self.attemptFailover(
-                reason: "The source didn't start within \(self.loadTimeoutSeconds) seconds. Every available source was tried.",
+                reason: "The source didn't start within \(elapsedTimeout) seconds. Every available source was tried.",
                 toast: nil
             )
         }
@@ -2630,7 +2687,9 @@ class PlayerViewModel: ObservableObject {
             )
         }
         guard !WatchedStore.contains(meta: meta) else { return nil }
-        return ContinueWatchingStore.item(for: meta.id)?.resumePosition
+        return ContinueWatchingStore.item(for: meta)?.resumePosition
+            ?? ContinueWatchingStore.item(for: meta.id)?.resumePosition
+            ?? ContinueWatchingStore.resumePosition(for: meta, season: nil, episode: nil)
     }
 
     /// The playing Usenet release turned out too damaged (long runs of
@@ -3063,6 +3122,10 @@ class PlayerViewModel: ObservableObject {
 
     func pollForTesting(using controller: PlaybackEngineControlling) {
         tick(engineOverride: controller)
+    }
+
+    func setAwaitingStreamStartForTesting(_ awaiting: Bool) {
+        isAwaitingStreamStart = awaiting
     }
 
     static func scenePlaybackPollTransition(
@@ -3623,7 +3686,9 @@ class PlayerViewModel: ObservableObject {
         if !isStandalonePlaybackSession && !isLiveStream && watchPartyPlayerBridge == nil {
             let postPlayEnabled = ProfileSettings.current.object(forKey: SettingsKey.postPlayRecommendationsEnabled) as? Bool ?? true
             let hasBlockingOverlay = showSettingsPanel || showScenePanel || isSceneDetailVisible || sidePanel != nil || isScrubbing || showPauseOverlay
-            let endingStartTime = skipIntervals.first(where: \.isEnding)?.startTime
+            let endingInterval = skipIntervals.first(where: \.isEnding)
+            let postCredits = endingInterval?.followingPostCreditsScene(intervals: skipIntervals, duration: time.duration)
+            let endingStartTime: Double? = (postCredits == nil) ? endingInterval?.startTime : nil
             postPlayController.updateTimeline(
                 position: time.current,
                 duration: time.duration,
@@ -4410,6 +4475,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     func skipInterval(_ interval: SkipInterval) {
+        if interval.isPostCredits { return }
         autoSkippedIntervalIds.insert(interval.id)
         dismissedSkipIntervalIds.insert(interval.id)
         autoHiddenSkipIntervalId = interval.id
@@ -4418,10 +4484,13 @@ class PlayerViewModel: ObservableObject {
         if activeSkipInterval?.id == interval.id {
             activeSkipInterval = nil
         }
-        if interval.isEnding {
+        activeSkipTargetsPostCredits = false
+        let postCredits = interval.followingPostCreditsScene(intervals: skipIntervals, duration: time.duration)
+        if interval.isEnding && postCredits == nil {
             postPlayController.showImmediately()
         }
-        seek(to: min(interval.endTime + 0.25, max(time.duration - 0.5, interval.endTime)))
+        let targetTime = postCredits?.startTime ?? interval.endTime
+        seek(to: min(targetTime + 0.25, max(time.duration - 0.5, targetTime)))
         showControls = false
         scheduleControlsHide()
     }
@@ -6295,7 +6364,7 @@ class PlayerViewModel: ObservableObject {
 
     func revealControls() {
         hidePeek()
-        if isScrubbing || controlsAutoHideSuspended || showScenePanel || isSceneDetailVisible { return }
+        if isScrubbing || controlsAutoHideSuspended || showScenePanel || isSceneDetailVisible || isSwitchingSource || isReloadingStream || isAdvancingEpisode || isAwaitingStreamStart { return }
         // Full transport chrome supersedes the pause metadata sheet.
         cancelPauseOverlaySchedule()
         showPauseOverlay = false
@@ -6354,7 +6423,9 @@ class PlayerViewModel: ObservableObject {
     func closeSidePanel() {
         sidePanel = nil
         controlsAutoHideSuspended = false
-        if status == .paused {
+        if isSwitchingSource || isReloadingStream || isAdvancingEpisode || isAwaitingStreamStart {
+            showControls = false
+        } else if status == .paused {
             showControls = false
             schedulePauseOverlay()
         } else {
@@ -6511,6 +6582,7 @@ class PlayerViewModel: ObservableObject {
         status = .buffering
         cancelPauseOverlaySchedule()
         showPauseOverlay = false
+        showControls = false
         engine.pausePlayback()
         return token
     }
@@ -6631,7 +6703,17 @@ class PlayerViewModel: ObservableObject {
     @Published var showScenePanel: Bool = false
     
     var isSceneEnabled: Bool {
-        UserDefaults.standard.object(forKey: SettingsKey.sceneFeatureEnabled) as? Bool ?? true
+        (ProfileSettings.current.object(forKey: SettingsKey.sceneFeatureEnabled) as? Bool)
+            ?? (UserDefaults.standard.object(forKey: SettingsKey.sceneFeatureEnabled) as? Bool)
+            ?? true
+    }
+
+    func setSceneEnabled(_ enabled: Bool) {
+        ProfileSettings.current.set(enabled, forKey: SettingsKey.sceneFeatureEnabled)
+        if !enabled && showScenePanel {
+            closeScene()
+        }
+        objectWillChange.send()
     }
     
     var isSceneDetailVisible: Bool {
@@ -7227,6 +7309,7 @@ class PlayerViewModel: ObservableObject {
                 metaId: activeMeta.id,
                 season: resolvedEpisodeNumbers?.season,
                 episode: resolvedEpisodeNumbers?.episode,
+                meta: activeMeta,
                 profileId: WatchedStore.activeProfileId
             )
             if shouldSaveNuvioSyncProgress {
@@ -7266,6 +7349,7 @@ class PlayerViewModel: ObservableObject {
                 httpHeaders: activeHTTPHeaders,
                 season: season,
                 episode: episode,
+                meta: activeMeta,
                 profileId: WatchedStore.activeProfileId
             )
         } else if completesPlayback {
@@ -7273,6 +7357,7 @@ class PlayerViewModel: ObservableObject {
                 metaId: activeMeta.id,
                 season: season,
                 episode: episode,
+                meta: activeMeta,
                 profileId: WatchedStore.activeProfileId
             )
         }
@@ -7810,7 +7895,7 @@ class PlayerViewModel: ObservableObject {
         explicitSeekProgressCheckpoint = nil
         if let meta = activeMeta {
             let numbers = resolvedEpisodeNumbers
-            LastPlaybackStreamStore.remove(metaId: meta.id, season: numbers?.season, episode: numbers?.episode)
+            LastPlaybackStreamStore.remove(metaId: meta.id, season: numbers?.season, episode: numbers?.episode, meta: meta)
         }
         // Try to silently reload a fresh link before surfacing the error.
         recoverExpiredStream()
@@ -7818,7 +7903,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     private static func expectedDuration(for meta: NuvioMeta) -> Double? {
-        if let stored = ContinueWatchingStore.item(for: meta.id)?.duration, stored >= 60 {
+        if let stored = (ContinueWatchingStore.item(for: meta) ?? ContinueWatchingStore.item(for: meta.id))?.duration, stored >= 60 {
             return stored
         }
         return runtimeSeconds(from: meta.runtime)

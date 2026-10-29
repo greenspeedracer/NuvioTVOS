@@ -8,6 +8,7 @@
 import Foundation
 import SwiftUI
 import UIKit
+import Combine
 import ImageIO
 import AVFoundation
 import AVKit
@@ -15,6 +16,7 @@ import AVKit
 struct DetailsScreen: View {
     let id: String
     let type: String
+    let libraryWatchedContext: LibraryWatchedContext?
     let initialPlaybackRequestID: UInt?
     let onInitialPlaybackRequestConsumed: ((UInt) -> Void)?
     /// (streamURL, httpHeaders, meta, episodeSubtitleLine, streamSubtitles, currentEpisode, orderedEpisodes, actionSession).
@@ -51,6 +53,7 @@ struct DetailsScreen: View {
     var onOpenPerson: ((TmdbPersonMetadata) -> Void)? = nil
     let initiallyPresentStreamPicker: Bool
     let initialStreamPickerEpisode: NuvioVideo?
+    let initialStreamPickerResumePosition: Double?
     /// Episode to select in the episode list on open (from the calendar).
     let initialFocusEpisode: DetailsEpisodeFocus?
     let onInitialStreamPickerPresented: (() -> Void)?
@@ -60,6 +63,7 @@ struct DetailsScreen: View {
 
     @StateObject private var viewModel: DetailsViewModel
     @State private var isStreamPickerPresented = false
+    @State private var pendingStreamPickerResumePosition: Double? = nil
     @State private var isSmartPlaybackPending = false
     @State private var isPreparingPlayback = false
     @State private var isPreparingInitialPlayback = false
@@ -127,14 +131,28 @@ struct DetailsScreen: View {
         }
     }
 
+    private var displayedDetailsUiState: DetailsUiState {
+        var state = viewModel.uiState
+        if let meta = state.meta, let libraryWatchedContext {
+            state.isWatched = WatchedStore.isWatchedForLibrary(
+                meta: meta,
+                source: libraryWatchedContext.source,
+                profileId: libraryWatchedContext.profileId
+            )
+        }
+        return state
+    }
+
     init(
         id: String,
         type: String,
+        libraryWatchedContext: LibraryWatchedContext? = nil,
         repository: CatalogRepository,
         initialPlaybackRequestID: UInt? = nil,
         onInitialPlaybackRequestConsumed: ((UInt) -> Void)? = nil,
         initiallyPresentStreamPicker: Bool = false,
         initialStreamPickerEpisode: NuvioVideo? = nil,
+        initialStreamPickerResumePosition: Double? = nil,
         initialFocusEpisode: DetailsEpisodeFocus? = nil,
         onInitialStreamPickerPresented: (() -> Void)? = nil,
         onWatchPartyMovieReady: ((NuvioMeta) -> Void)? = nil,
@@ -166,6 +184,7 @@ struct DetailsScreen: View {
     ) {
         self.id = id
         self.type = type
+        self.libraryWatchedContext = libraryWatchedContext
         self.initialPlaybackRequestID = initialPlaybackRequestID
         self.onInitialPlaybackRequestConsumed = onInitialPlaybackRequestConsumed
         self.onPlayClick = onPlayClick
@@ -176,11 +195,13 @@ struct DetailsScreen: View {
         self.onOpenPerson = onOpenPerson
         self.initiallyPresentStreamPicker = initiallyPresentStreamPicker
         self.initialStreamPickerEpisode = initialStreamPickerEpisode
+        self.initialStreamPickerResumePosition = initialStreamPickerResumePosition
         self.initialFocusEpisode = initialFocusEpisode
         self.onInitialStreamPickerPresented = onInitialStreamPickerPresented
         self.onWatchPartyMovieReady = onWatchPartyMovieReady
         self.creatingWatchPartyRoom = creatingWatchPartyRoom
         self.onWatchPartyMediaSelected = onWatchPartyMediaSelected
+        _pendingStreamPickerResumePosition = State(initialValue: initialStreamPickerResumePosition)
         _isPreparingInitialPlayback = State(initialValue: initialPlaybackRequestID != nil)
         _playbackPrewarmer = State(initialValue: DetailsPlaybackPrewarmer.engineBacked())
         _viewModel = StateObject(wrappedValue: DetailsViewModel(repository: repository))
@@ -216,6 +237,7 @@ struct DetailsScreen: View {
                 #if os(tvOS)
                 TvDetailsContent(
                     uiState: viewModel.uiState,
+                    libraryWatchedContext: libraryWatchedContext,
                     initialPlayRequestID: readyInitialPlaybackRequestID,
                     initialFocusEpisode: initialFocusEpisode,
                     onInitialPlayRequestConsumed: { requestID in
@@ -278,7 +300,7 @@ struct DetailsScreen: View {
                         isEpisodeMenuPresented = isPresented
                     },
                     onWatchlistClick: { viewModel.toggleWatchlist() },
-                    onWatchedClick: { viewModel.toggleWatched() },
+                    onWatchedClick: { viewModel.toggleWatched(libraryContext: libraryWatchedContext) },
                     mdbListUserRating: viewModel.uiState.mdbListUserRating,
                     showMdbListRating: false,
                     onRateClick: { showingMdbListRating = true },
@@ -306,7 +328,7 @@ struct DetailsScreen: View {
                 .disabled(isStreamPickerPresented || expandedComment != nil || isSmartPlaybackPending || isResolvingDebrid || isPreparingPlayback || isPreparingInitialPlayback)
                 #else
                 MobileDetailsContent(
-                    uiState: viewModel.uiState,
+                    uiState: displayedDetailsUiState,
                     onPlayClick: {
                         if let url = viewModel.uiState.streams.first?.url,
                            let meta = viewModel.uiState.meta {
@@ -314,7 +336,7 @@ struct DetailsScreen: View {
                         }
                     },
                     onWatchlistClick: { viewModel.toggleWatchlist() },
-                    onWatchedClick: { viewModel.toggleWatched() },
+                    onWatchedClick: { viewModel.toggleWatched(libraryContext: libraryWatchedContext) },
                     onShareClick: { shareContent(viewModel.uiState.meta!) },
                     onBack: handleBack
                 )
@@ -380,6 +402,7 @@ struct DetailsScreen: View {
                     },
                     onDismiss: {
                         streamPickerAvailabilityMessage = nil
+                        pendingStreamPickerResumePosition = nil
                         isStreamPickerPresented = false
                     }
                 )
@@ -411,6 +434,7 @@ struct DetailsScreen: View {
                 isResolvingDebrid = false
                 isPreparingPlayback = false
             } else if isStreamPickerPresented {
+                pendingStreamPickerResumePosition = nil
                 isStreamPickerPresented = false
             } else {
                 handleBack()
@@ -583,6 +607,7 @@ struct DetailsScreen: View {
               let meta = viewModel.uiState.meta else { return }
 
         didHandleInitialStreamPicker = true
+        pendingStreamPickerResumePosition = initialStreamPickerResumePosition
         onInitialStreamPickerPresented?()
         isSmartPlaybackPending = false
         // Prefer the entry from the guide this screen just loaded. A Continue
@@ -656,6 +681,7 @@ struct DetailsScreen: View {
                     metaId: metaID,
                     season: season,
                     episode: episodeNumber,
+                    meta: meta,
                     profileId: profileID
                 )
             }
@@ -1468,6 +1494,8 @@ struct DetailsScreen: View {
                         if self.startupBenchmarkToken == startupToken {
                             self.startupBenchmarkToken = nil
                         }
+                        let resumePos = pendingStreamPickerResumePosition
+                        pendingStreamPickerResumePosition = nil
                         dispatchPlayback(
                             localURL.absoluteString,
                             candidate.httpHeaders ?? [:],
@@ -1481,7 +1509,7 @@ struct DetailsScreen: View {
                             candidate.filename,
                             candidate.videoSize,
                             candidate.videoHash,
-                            nil,
+                            resumePos,
                             startupToken,
                             candidate.id,
                             candidate.isNotPlayable
@@ -1513,6 +1541,8 @@ struct DetailsScreen: View {
             if self.startupBenchmarkToken == startupToken {
                 self.startupBenchmarkToken = nil
             }
+            let resumePos = pendingStreamPickerResumePosition
+            pendingStreamPickerResumePosition = nil
             dispatchPlayback(
                 url,
                 stream.httpHeaders ?? [:],
@@ -1526,7 +1556,7 @@ struct DetailsScreen: View {
                 stream.filename,
                 stream.videoSize,
                 stream.videoHash,
-                nil,
+                resumePos,
                 startupToken,
                 stream.id,
                 stream.isNotPlayable
@@ -1551,6 +1581,8 @@ struct DetailsScreen: View {
             if self.startupBenchmarkToken == startupToken {
                 self.startupBenchmarkToken = nil
             }
+            let resumePos = pendingStreamPickerResumePosition
+            pendingStreamPickerResumePosition = nil
             dispatchPlayback(
                 preURL.absoluteString,
                 stream.httpHeaders ?? [:],
@@ -1564,7 +1596,7 @@ struct DetailsScreen: View {
                 preResolvedFilename ?? stream.filename,
                 preResolvedVideoSize ?? stream.videoSize,
                 stream.videoHash,
-                nil,
+                resumePos,
                 startupToken,
                 stream.id,
                 stream.isNotPlayable
@@ -1624,6 +1656,8 @@ struct DetailsScreen: View {
                     if self.startupBenchmarkToken == startupToken {
                         self.startupBenchmarkToken = nil
                     }
+                    let resumePos = pendingStreamPickerResumePosition
+                    pendingStreamPickerResumePosition = nil
                     dispatchPlayback(
                         url.absoluteString,
                         stream.httpHeaders ?? [:],
@@ -1637,7 +1671,7 @@ struct DetailsScreen: View {
                         debridFilename ?? stream.filename,
                         debridVideoSize ?? stream.videoSize,
                         stream.videoHash,
-                        nil,
+                        resumePos,
                         startupToken,
                         stream.id,
                         stream.isNotPlayable
@@ -3645,6 +3679,7 @@ private enum TvDetailsFocusSection: Hashable {
 
 struct TvDetailsContent: View {
     let uiState: DetailsUiState
+    var libraryWatchedContext: LibraryWatchedContext? = nil
     var initialPlayRequestID: UInt? = nil
     var initialFocusEpisode: DetailsEpisodeFocus? = nil
     var onInitialPlayRequestConsumed: ((UInt) -> Void)? = nil
@@ -3693,6 +3728,12 @@ struct TvDetailsContent: View {
     @AppStorage(SettingsKey.trailerPreviewSound) private var trailerPreviewSound = false
     @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
     @AppStorage(SettingsKey.detailsActionsBelowInfo) private var detailsActionsBelowInfo = false
+    @State private var configuredDetailsSections: [TVDetailsSection] = TVDetailsSectionOrder.currentOrder()
+    @State private var disabledDetailsSections: Set<TVDetailsSection> = TVDetailsSectionOrder.disabledSections()
+
+    private var activeDetailsSections: [TVDetailsSection] {
+        configuredDetailsSections.filter { !disabledDetailsSections.contains($0) }
+    }
     @State private var trailerPlayer = AVPlayer()
     @State private var isTrailerPlaying = false
     @State private var isTrailerRenderReady = false
@@ -3897,6 +3938,17 @@ struct TvDetailsContent: View {
         isScrolledDown ? 22 : 0
     }
 
+    private func isWatchedForDetails(_ meta: NuvioMeta) -> Bool {
+        guard let libraryWatchedContext else {
+            return WatchedStore.isWatchedForDisplay(meta: meta)
+        }
+        return WatchedStore.isWatchedForLibrary(
+            meta: meta,
+            source: libraryWatchedContext.source,
+            profileId: libraryWatchedContext.profileId
+        )
+    }
+
     @ViewBuilder
     private func backdropView(for meta: NuvioMeta) -> some View {
         TvDetailsBackdrop(
@@ -3921,6 +3973,7 @@ struct TvDetailsContent: View {
             metaId: meta.id,
             season: season,
             episode: episode,
+            meta: meta,
             profileId: ProfileSettings.activeProfileID
         ) != nil
     }
@@ -3934,7 +3987,7 @@ struct TvDetailsContent: View {
         let canBypassPicker = smartStreamSelection || (reuseLastLink && hasStoredPlaybackStream(for: playTarget))
         TvDetailsActionRow(
             isInWatchlist: uiState.isInWatchlist,
-            isWatched: WatchedStore.isWatchedForDisplay(meta: meta),
+            isWatched: isWatchedForDetails(meta),
             playTitle: playTarget.label,
             playHint: canBypassPicker
                 ? L10n.string("details_play_hint_smart", fallback: "Plays the best link. Hold Select to choose a source manually.")
@@ -3984,6 +4037,246 @@ struct TvDetailsContent: View {
                 || isFullscreenTrailerPresented
                 || !isDetailsFocusReachable(.actions)
         )
+    }
+
+    @ViewBuilder
+    private func renderDetailsSection(
+        _ section: TVDetailsSection,
+        meta: NuvioMeta,
+        episodes: [NuvioVideo],
+        episodeGuide: TvEpisodeGuide,
+        episodePresentation: TvDetailsEpisodePresentation,
+        continueItem: ContinueWatchingItem?,
+        networks: [MetaCompany],
+        productionCompanies: [MetaCompany],
+        scrollProxy: ScrollViewProxy
+    ) -> some View {
+        switch section {
+        case .episodes:
+            if !episodes.isEmpty {
+                TvDetailsEpisodes(
+                    meta: meta,
+                    libraryWatchedContext: libraryWatchedContext,
+                    episodeGuide: episodeGuide,
+                    initialState: episodePresentation.initialState,
+                    presentationRevision: episodePresentation.revision,
+                    seriesRating: meta.rating,
+                    continueItem: continueItem,
+                    isChoosingWatchPartyEpisode: isChoosingWatchPartyEpisode,
+                    onCancelWatchPartySelection: { isChoosingWatchPartyEpisode = false },
+                    onFocus: {
+                        cancelPendingFocusHandoff()
+                        if focusedDetailsSection != .episodes {
+                            focusedDetailsSection = .episodes
+                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
+                                scrollProxy.scrollTo(TvDetailsScrollID.episodesSection, anchor: .top)
+                            }
+                        } else {
+                            var transaction = Transaction(animation: nil)
+                            transaction.disablesAnimations = true
+                            withTransaction(transaction) {
+                                scrollProxy.scrollTo(TvDetailsScrollID.episodesSection, anchor: .top)
+                            }
+                        }
+                    },
+                    onSelect: { video in
+                        stopBackgroundTrailer(manual: false)
+                        if isChoosingWatchPartyEpisode {
+                            isChoosingWatchPartyEpisode = false
+                            onHostWatchParty?(video)
+                        } else {
+                            onEpisodeSelected(video)
+                        }
+                    },
+                    onPlayManually: onEpisodePlayManually != nil ? { video in
+                        stopBackgroundTrailer(manual: false)
+                        onEpisodePlayManually?(video)
+                    } : nil,
+                    onEpisodeMenuPresented: { onEpisodeMenuPresented?($0) },
+                    onBack: handleDetailsBack,
+                    episodeFocus: $episodeFocus,
+                    restrictFocusToKey: restoreEpisodeKey,
+                    entryLocked: focusedDetailsSection != .episodes,
+                    onMoveUpFromSeason: {
+                        handleMoveUpFromEpisodes(using: scrollProxy)
+                    },
+                    onMoveDownFromEpisode: {
+                        handleMoveDownFromEpisodes(using: scrollProxy)
+                    }
+                )
+                .padding(.top, 40)
+                .id(TvDetailsScrollID.episodesSection)
+                .disabled(!isDetailsFocusReachable(.episodes))
+            }
+        case .cast:
+            if hasCastOrTrailer, let meta = uiState.meta {
+                TvDetailsCastAndTrailer(
+                    meta: meta,
+                    people: uiState.people,
+                    onPersonClick: { person in
+                        let clean = person.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                        guard !clean.isEmpty && clean != "cast" else { return }
+                        stopBackgroundTrailer(manual: false)
+                        onOpenPerson?(person)
+                    },
+                    onTrailerClick: {
+                        presentFullscreenTrailer()
+                    },
+                    onBack: handleDetailsBack,
+                    headerFocus: $castHeaderFocus,
+                    entryLocked: focusedDetailsSection != .cast,
+                    onFocus: {
+                        if focusedDetailsSection != .cast {
+                            focusedDetailsSection = .cast
+                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
+                                scrollProxy.scrollTo(TvDetailsScrollID.castSection, anchor: .top)
+                            }
+                        } else {
+                            var transaction = Transaction(animation: nil)
+                            transaction.disablesAnimations = true
+                            withTransaction(transaction) {
+                                scrollProxy.scrollTo(TvDetailsScrollID.castSection, anchor: .top)
+                            }
+                        }
+                    }
+                )
+                .padding(.top, 34)
+                .padding(.bottom, 52)
+                .id(TvDetailsScrollID.castSection)
+                .disabled(
+                    restoreEpisodeKey != nil
+                        || !isDetailsFocusReachable(.cast)
+                )
+            }
+        case .related:
+            if !uiState.moreLikeThis.isEmpty {
+                TvDetailsRelatedRow(
+                    title: L10n.string("settings_tmdb_module_more_like_this", fallback: "More Like This"),
+                    items: uiState.moreLikeThis,
+                    entryLocked: focusedDetailsSection != .related,
+                    onSelect: { item in
+                        stopBackgroundTrailer(manual: false)
+                        onOpenTitle?(item.id, item.type)
+                    },
+                    onBack: handleDetailsBack,
+                    onFocus: {
+                        if focusedDetailsSection != .related {
+                            focusedDetailsSection = .related
+                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
+                                scrollProxy.scrollTo(TvDetailsScrollID.moreLikeThisSection, anchor: .top)
+                            }
+                        } else {
+                            var transaction = Transaction(animation: nil)
+                            transaction.disablesAnimations = true
+                            withTransaction(transaction) {
+                                scrollProxy.scrollTo(TvDetailsScrollID.moreLikeThisSection, anchor: .top)
+                            }
+                        }
+                    }
+                )
+                .padding(.top, 34)
+                .id(TvDetailsScrollID.moreLikeThisSection)
+                .disabled(
+                    restoreEpisodeKey != nil
+                        || !isDetailsFocusReachable(.related)
+                )
+            }
+        case .network:
+            if !networks.isEmpty {
+                TvDetailsProductionRow(
+                    title: L10n.string("details_network", fallback: "Network"),
+                    companies: networks,
+                    entryLocked: focusedDetailsSection != .network,
+                    onSelect: { company in
+                        onOpenProduction?(company)
+                    },
+                    onBack: handleDetailsBack,
+                    onFocus: {
+                        if focusedDetailsSection != .network {
+                            focusedDetailsSection = .network
+                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
+                                scrollProxy.scrollTo(TvDetailsScrollID.networkSection, anchor: .top)
+                            }
+                        } else {
+                            var transaction = Transaction(animation: nil)
+                            transaction.disablesAnimations = true
+                            withTransaction(transaction) {
+                                scrollProxy.scrollTo(TvDetailsScrollID.networkSection, anchor: .top)
+                            }
+                        }
+                    }
+                )
+                .padding(.top, 40)
+                .id(TvDetailsScrollID.networkSection)
+                .disabled(
+                    restoreEpisodeKey != nil
+                        || !isDetailsFocusReachable(.network)
+                )
+            }
+        case .production:
+            if !productionCompanies.isEmpty {
+                TvDetailsProductionRow(
+                    title: L10n.string("details_production", fallback: "Production"),
+                    companies: productionCompanies,
+                    entryLocked: focusedDetailsSection != .production,
+                    onSelect: { company in
+                        onOpenProduction?(company)
+                    },
+                    onBack: handleDetailsBack,
+                    onFocus: {
+                        if focusedDetailsSection != .production {
+                            focusedDetailsSection = .production
+                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
+                                scrollProxy.scrollTo(TvDetailsScrollID.productionSection, anchor: .top)
+                            }
+                        } else {
+                            var transaction = Transaction(animation: nil)
+                            transaction.disablesAnimations = true
+                            withTransaction(transaction) {
+                                scrollProxy.scrollTo(TvDetailsScrollID.productionSection, anchor: .top)
+                            }
+                        }
+                    }
+                )
+                .padding(.top, 40)
+                .id(TvDetailsScrollID.productionSection)
+                .disabled(
+                    restoreEpisodeKey != nil
+                        || !isDetailsFocusReachable(.production)
+                )
+            }
+        case .comments:
+            if !uiState.comments.isEmpty {
+                TvDetailsCommentsRow(
+                    comments: uiState.comments,
+                    entryLocked: focusedDetailsSection != .comments,
+                    onSelect: { comment in
+                        onCommentSelect?(comment)
+                    },
+                    onBack: handleDetailsBack,
+                    onFocus: {
+                        if focusedDetailsSection != .comments {
+                            focusedDetailsSection = .comments
+                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
+                                scrollProxy.scrollTo(TvDetailsScrollID.commentsSection, anchor: .top)
+                            }
+                        } else {
+                            var transaction = Transaction(animation: nil)
+                            transaction.disablesAnimations = true
+                            withTransaction(transaction) {
+                                scrollProxy.scrollTo(TvDetailsScrollID.commentsSection, anchor: .top)
+                            }
+                        }
+                    }
+                )
+                .padding(.top, 40)
+                .id(TvDetailsScrollID.commentsSection)
+                .disabled(
+                    restoreEpisodeKey != nil
+                        || !isDetailsFocusReachable(.comments)
+                )
+            }
+        }
     }
 
     private func handlePlayClick(playTarget: TvDetailsPlayTarget) {
@@ -4043,6 +4336,7 @@ struct TvDetailsContent: View {
                 meta: meta,
                 progressRevision: progressRevision,
                 focusEpisode: initialFocusEpisode,
+                libraryWatchedContext: libraryWatchedContext,
                 continueItemProvider: { currentContinueWatchingItem(for: meta) },
                 playTargetBuilder: { episodes, continueItem, watchedKeys in
                     TvDetailsPlayTargetBuilder.makePlayTarget(
@@ -4104,229 +4398,22 @@ struct TvDetailsContent: View {
                             .padding(.bottom, 52)
                             .frame(height: max(proxy.size.height, 800), alignment: .bottomLeading)
 
-                            if !episodes.isEmpty {
-                                TvDetailsEpisodes(
+                            let productionCompanies = uiState.companies.filter { $0.kind == .production && $0.tmdbId != nil }
+                            let networks = uiState.companies.filter { $0.kind == .network && $0.tmdbId != nil }
+
+                            ForEach(activeDetailsSections, id: \.self) { section in
+                                renderDetailsSection(
+                                    section,
                                     meta: meta,
+                                    episodes: episodes,
                                     episodeGuide: episodeGuide,
-                                    initialState: episodePresentation.initialState,
-                                    presentationRevision: episodePresentation.revision,
-                                    seriesRating: meta.rating,
+                                    episodePresentation: episodePresentation,
                                     continueItem: continueItem,
-                                    isChoosingWatchPartyEpisode: isChoosingWatchPartyEpisode,
-                                    onCancelWatchPartySelection: { isChoosingWatchPartyEpisode = false },
-                                    onFocus: {
-                                        cancelPendingFocusHandoff()
-                                        if focusedDetailsSection != .episodes {
-                                            focusedDetailsSection = .episodes
-                                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                                                scrollProxy.scrollTo(TvDetailsScrollID.episodesSection, anchor: .top)
-                                            }
-                                        } else {
-                                            var transaction = Transaction(animation: nil)
-                                            transaction.disablesAnimations = true
-                                            withTransaction(transaction) {
-                                                scrollProxy.scrollTo(TvDetailsScrollID.episodesSection, anchor: .top)
-                                            }
-                                        }
-                                    },
-                                    onSelect: { video in
-                                        stopBackgroundTrailer(manual: false)
-                                        if isChoosingWatchPartyEpisode {
-                                            isChoosingWatchPartyEpisode = false
-                                            onHostWatchParty?(video)
-                                        } else {
-                                            onEpisodeSelected(video)
-                                        }
-                                    },
-                                    onPlayManually: onEpisodePlayManually != nil ? { video in
-                                        stopBackgroundTrailer(manual: false)
-                                        onEpisodePlayManually?(video)
-                                    } : nil,
-                                    onEpisodeMenuPresented: { onEpisodeMenuPresented?($0) },
-                                    onBack: handleDetailsBack,
-                                    episodeFocus: $episodeFocus,
-                                    restrictFocusToKey: restoreEpisodeKey,
-                                    entryLocked: focusedDetailsSection != .episodes,
-                                    onMoveUpFromSeason: {
-                                        focusPlayFromEpisodes(using: scrollProxy)
-                                    },
-                                    onMoveDownFromEpisode: focusCastHeaderFromEpisodes
-                                )
-                                .padding(.top, 40)
-                                .id(TvDetailsScrollID.episodesSection)
-                                .disabled(!isDetailsFocusReachable(.episodes))
-                            }
-
-                            if hasCastOrTrailer, let meta = uiState.meta {
-                                TvDetailsCastAndTrailer(
-                                    meta: meta,
-                                    people: uiState.people,
-                                    onPersonClick: { person in
-                                        let clean = person.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                                        guard !clean.isEmpty && clean != "cast" else { return }
-                                        stopBackgroundTrailer(manual: false)
-                                        onOpenPerson?(person)
-                                    },
-                                    onTrailerClick: {
-                                        presentFullscreenTrailer()
-                                    },
-                                    onBack: handleDetailsBack,
-                                    headerFocus: $castHeaderFocus,
-                                    entryLocked: focusedDetailsSection != .cast,
-                                    onFocus: {
-                                        if focusedDetailsSection != .cast {
-                                            focusedDetailsSection = .cast
-                                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                                                scrollProxy.scrollTo(TvDetailsScrollID.castSection, anchor: .top)
-                                            }
-                                        } else {
-                                            var transaction = Transaction(animation: nil)
-                                            transaction.disablesAnimations = true
-                                            withTransaction(transaction) {
-                                                scrollProxy.scrollTo(TvDetailsScrollID.castSection, anchor: .top)
-                                            }
-                                        }
-                                    }
-                                )
-                                .padding(.top, 34)
-                                .padding(.bottom, 52)
-                                .id(TvDetailsScrollID.castSection)
-                                .disabled(
-                                    restoreEpisodeKey != nil
-                                        || !isDetailsFocusReachable(.cast)
+                                    networks: networks,
+                                    productionCompanies: productionCompanies,
+                                    scrollProxy: scrollProxy
                                 )
                             }
-
-                                if !uiState.moreLikeThis.isEmpty {
-                                    TvDetailsRelatedRow(
-                                        title: L10n.string("settings_tmdb_module_more_like_this", fallback: "More Like This"),
-                                        items: uiState.moreLikeThis,
-                                        entryLocked: focusedDetailsSection != .related,
-                                        onSelect: { item in
-                                            stopBackgroundTrailer(manual: false)
-                                            onOpenTitle?(item.id, item.type)
-                                        },
-                                        onBack: handleDetailsBack,
-                                        onFocus: {
-                                            if focusedDetailsSection != .related {
-                                                focusedDetailsSection = .related
-                                                withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                                                    scrollProxy.scrollTo(TvDetailsScrollID.moreLikeThisSection, anchor: .top)
-                                                }
-                                            } else {
-                                                var transaction = Transaction(animation: nil)
-                                                transaction.disablesAnimations = true
-                                                withTransaction(transaction) {
-                                                    scrollProxy.scrollTo(TvDetailsScrollID.moreLikeThisSection, anchor: .top)
-                                                }
-                                            }
-                                        }
-                                    )
-                                    .padding(.top, 34)
-                                    .id(TvDetailsScrollID.moreLikeThisSection)
-                                    .disabled(
-                                        restoreEpisodeKey != nil
-                                            || !isDetailsFocusReachable(.related)
-                                    )
-                                }
-
-                                let productionCompanies = uiState.companies.filter { $0.kind == .production && $0.tmdbId != nil }
-                                let networks = uiState.companies.filter { $0.kind == .network && $0.tmdbId != nil }
-
-                                if !networks.isEmpty {
-                                    TvDetailsProductionRow(
-                                        title: L10n.string("details_network", fallback: "Network"),
-                                        companies: networks,
-                                        entryLocked: focusedDetailsSection != .network,
-                                        onSelect: { company in
-                                            onOpenProduction?(company)
-                                        },
-                                        onBack: handleDetailsBack,
-                                        onFocus: {
-                                            if focusedDetailsSection != .network {
-                                                focusedDetailsSection = .network
-                                                withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                                                    scrollProxy.scrollTo(TvDetailsScrollID.networkSection, anchor: .top)
-                                                }
-                                            } else {
-                                                var transaction = Transaction(animation: nil)
-                                                transaction.disablesAnimations = true
-                                                withTransaction(transaction) {
-                                                    scrollProxy.scrollTo(TvDetailsScrollID.networkSection, anchor: .top)
-                                                }
-                                            }
-                                        }
-                                    )
-                                    .padding(.top, 40)
-                                    .id(TvDetailsScrollID.networkSection)
-                                    .disabled(
-                                        restoreEpisodeKey != nil
-                                            || !isDetailsFocusReachable(.network)
-                                    )
-                                }
-
-                                if !productionCompanies.isEmpty {
-                                    TvDetailsProductionRow(
-                                        title: L10n.string("details_production", fallback: "Production"),
-                                        companies: productionCompanies,
-                                        entryLocked: focusedDetailsSection != .production,
-                                        onSelect: { company in
-                                            onOpenProduction?(company)
-                                        },
-                                        onBack: handleDetailsBack,
-                                        onFocus: {
-                                            if focusedDetailsSection != .production {
-                                                focusedDetailsSection = .production
-                                                withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                                                    scrollProxy.scrollTo(TvDetailsScrollID.productionSection, anchor: .top)
-                                                }
-                                            } else {
-                                                var transaction = Transaction(animation: nil)
-                                                transaction.disablesAnimations = true
-                                                withTransaction(transaction) {
-                                                    scrollProxy.scrollTo(TvDetailsScrollID.productionSection, anchor: .top)
-                                                }
-                                            }
-                                        }
-                                    )
-                                    .padding(.top, 40)
-                                    .id(TvDetailsScrollID.productionSection)
-                                    .disabled(
-                                        restoreEpisodeKey != nil
-                                            || !isDetailsFocusReachable(.production)
-                                    )
-                                }
-
-                                if !uiState.comments.isEmpty {
-                                    TvDetailsCommentsRow(
-                                        comments: uiState.comments,
-                                        entryLocked: focusedDetailsSection != .comments,
-                                        onSelect: { comment in
-                                            onCommentSelect?(comment)
-                                        },
-                                        onBack: handleDetailsBack,
-                                        onFocus: {
-                                            if focusedDetailsSection != .comments {
-                                                focusedDetailsSection = .comments
-                                                withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                                                    scrollProxy.scrollTo(TvDetailsScrollID.commentsSection, anchor: .top)
-                                                }
-                                            } else {
-                                                var transaction = Transaction(animation: nil)
-                                                transaction.disablesAnimations = true
-                                                withTransaction(transaction) {
-                                                    scrollProxy.scrollTo(TvDetailsScrollID.commentsSection, anchor: .top)
-                                                }
-                                            }
-                                        }
-                                    )
-                                    .padding(.top, 40)
-                                    .id(TvDetailsScrollID.commentsSection)
-                                    .disabled(
-                                        restoreEpisodeKey != nil
-                                            || !isDetailsFocusReachable(.comments)
-                                    )
-                                }
                             }
                             // Inset and layout metrics matching Android TV.
                             .padding(.leading, 56)
@@ -4406,7 +4493,13 @@ struct TvDetailsContent: View {
                     focusedDetailsSection = .actions
                     DispatchQueue.main.async { actionFocus = .play }
                 }
+                configuredDetailsSections = TVDetailsSectionOrder.currentOrder()
+                disabledDetailsSections = TVDetailsSectionOrder.disabledSections()
                 scheduleBackgroundTrailer(for: meta)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: TVDetailsSectionOrder.changedNotification).receive(on: RunLoop.main)) { _ in
+                configuredDetailsSections = TVDetailsSectionOrder.currentOrder()
+                disabledDetailsSections = TVDetailsSectionOrder.disabledSections()
             }
             .onChange(of: episodePresentation.guide.revision) { _, _ in
                 guard calendarFocusPending,
@@ -4496,6 +4589,9 @@ struct TvDetailsContent: View {
             // hop later — so every one of them has to be able to invalidate this
             // view, not just the mark itself.
             .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification).receive(on: RunLoop.main)) { _ in
+                progressRevision &+= 1
+            }
+            .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.libraryChangedNotification).receive(on: RunLoop.main)) { _ in
                 progressRevision &+= 1
             }
             .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
@@ -4610,6 +4706,66 @@ struct TvDetailsContent: View {
         }
     }
 
+    private func scrollID(for section: TvDetailsFocusSection) -> String {
+        switch section {
+        case .actions: return TvDetailsScrollID.topSection
+        case .episodes: return TvDetailsScrollID.episodesSection
+        case .cast: return TvDetailsScrollID.castSection
+        case .related: return TvDetailsScrollID.moreLikeThisSection
+        case .network: return TvDetailsScrollID.networkSection
+        case .production: return TvDetailsScrollID.productionSection
+        case .comments: return TvDetailsScrollID.commentsSection
+        }
+    }
+
+    private func handleMoveUpFromEpisodes(using scrollProxy: ScrollViewProxy) {
+        guard let currentIndex = detailsFocusOrder.firstIndex(of: .episodes), currentIndex > 0 else {
+            focusPlayFromEpisodes(using: scrollProxy)
+            return
+        }
+        let targetSection = detailsFocusOrder[currentIndex - 1]
+        switch targetSection {
+        case .actions:
+            focusPlayFromEpisodes(using: scrollProxy)
+        case .cast:
+            focusCastHeaderFromEpisodes()
+            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
+                scrollProxy.scrollTo(TvDetailsScrollID.castSection, anchor: .top)
+            }
+        default:
+            detailsFocusMoveGeneration &+= 1
+            pendingPlayFocusGeneration = nil
+            focusedDetailsSection = targetSection
+            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
+                scrollProxy.scrollTo(scrollID(for: targetSection), anchor: .top)
+            }
+        }
+    }
+
+    private func handleMoveDownFromEpisodes(using scrollProxy: ScrollViewProxy) {
+        guard let currentIndex = detailsFocusOrder.firstIndex(of: .episodes),
+              currentIndex + 1 < detailsFocusOrder.count else {
+            return
+        }
+        let targetSection = detailsFocusOrder[currentIndex + 1]
+        switch targetSection {
+        case .cast:
+            focusCastHeaderFromEpisodes()
+            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
+                scrollProxy.scrollTo(TvDetailsScrollID.castSection, anchor: .top)
+            }
+        case .actions:
+            focusPlayFromEpisodes(using: scrollProxy)
+        default:
+            detailsFocusMoveGeneration &+= 1
+            pendingPlayFocusGeneration = nil
+            focusedDetailsSection = targetSection
+            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
+                scrollProxy.scrollTo(scrollID(for: targetSection), anchor: .top)
+            }
+        }
+    }
+
     private var hasCastOrTrailer: Bool {
         guard let meta = uiState.meta else { return false }
         let hasPeople = !uiState.people.isEmpty
@@ -4623,20 +4779,34 @@ struct TvDetailsContent: View {
     /// the focus graph so tvOS cannot skip Cast and land two rows away.
     private var detailsFocusOrder: [TvDetailsFocusSection] {
         var order: [TvDetailsFocusSection] = [.actions]
-        if let meta = uiState.meta, !(meta.videos ?? []).isEmpty {
-            order.append(.episodes)
+        for section in activeDetailsSections {
+            switch section {
+            case .episodes:
+                if let meta = uiState.meta, !(meta.videos ?? []).isEmpty {
+                    order.append(.episodes)
+                }
+            case .cast:
+                if hasCastOrTrailer {
+                    order.append(.cast)
+                }
+            case .related:
+                if !uiState.moreLikeThis.isEmpty {
+                    order.append(.related)
+                }
+            case .network:
+                if uiState.companies.contains(where: { $0.kind == .network && $0.tmdbId != nil }) {
+                    order.append(.network)
+                }
+            case .production:
+                if uiState.companies.contains(where: { $0.kind == .production && $0.tmdbId != nil }) {
+                    order.append(.production)
+                }
+            case .comments:
+                if !uiState.comments.isEmpty {
+                    order.append(.comments)
+                }
+            }
         }
-        if hasCastOrTrailer {
-            order.append(.cast)
-        }
-        if !uiState.moreLikeThis.isEmpty { order.append(.related) }
-        if uiState.companies.contains(where: { $0.kind == .network && $0.tmdbId != nil }) {
-            order.append(.network)
-        }
-        if uiState.companies.contains(where: { $0.kind == .production && $0.tmdbId != nil }) {
-            order.append(.production)
-        }
-        if !uiState.comments.isEmpty { order.append(.comments) }
         return order
     }
 
@@ -4659,7 +4829,7 @@ struct TvDetailsContent: View {
         if RemoteTrackingState.isProgressSourceAuthenticated {
             return TraktProgressService.currentContinueWatchingItem(for: meta)
         }
-        return ContinueWatchingStore.item(for: meta.id)
+        return ContinueWatchingStore.item(for: meta) ?? ContinueWatchingStore.item(for: meta.id)
     }
 
     private func refreshProgressAfterReturn() {
@@ -6873,6 +7043,20 @@ private struct TvEpisodeGuide {
         continueItem: ContinueWatchingItem?,
         watchedKeys: Set<String>
     ) -> NuvioVideo? {
+        TvDetailsInitialEpisodeResolver.resolve(
+            episodes: episodes,
+            continueItem: continueItem,
+            watchedKeys: watchedKeys
+        )
+    }
+}
+
+enum TvDetailsInitialEpisodeResolver {
+    static func resolve(
+        episodes: [NuvioVideo],
+        continueItem: ContinueWatchingItem?,
+        watchedKeys: Set<String>
+    ) -> NuvioVideo? {
         if let numbers = continueItem?.episodeNumbers,
            let progressEpisode = episodes.first(where: {
                $0.season == numbers.season && $0.episode == numbers.episode
@@ -7001,6 +7185,19 @@ private struct TvDetailsEpisodeInitialState {
     let seasonIsWatched: Bool
 }
 
+/// Separates Library-scoped episode indicators from the progress owner used to
+/// select playback. Details can originate in a provider-filtered Library while
+/// Continue Watching and the initial play target remain global.
+struct TvDetailsEpisodeWatchedKeys {
+    let display: Set<String>
+    let playTarget: Set<String>
+
+    init(meta: NuvioMeta, progressSnapshot: WatchedSnapshot, librarySnapshot: WatchedSnapshot?) {
+        playTarget = progressSnapshot.watchedEpisodeKeys(meta: meta)
+        display = librarySnapshot?.catalogWatchedEpisodeKeys(meta: meta) ?? playTarget
+    }
+}
+
 private struct TvDetailsEpisodePresentation {
     let guide: TvEpisodeGuide
     let continueItem: ContinueWatchingItem?
@@ -7016,10 +7213,12 @@ private struct TvDetailsEpisodePresentationRevision: Equatable {
 
 /// Builds episode-derived state synchronously on the first Details render and
 /// refreshes it only when episode metadata or watched/progress state changes.
+@MainActor
 private final class TvDetailsEpisodeCache: ObservableObject {
     private var input: TvEpisodeGuideInput?
     private var lookupIdentity: TvEpisodeLookupIdentity?
     private var progressRevision: Int?
+    private var libraryWatchedContextIdentity: String?
     private var focusEpisode: DetailsEpisodeFocus?
     private var presentation: TvDetailsEpisodePresentation?
 
@@ -7027,6 +7226,7 @@ private final class TvDetailsEpisodeCache: ObservableObject {
         meta: NuvioMeta,
         progressRevision: Int,
         focusEpisode: DetailsEpisodeFocus? = nil,
+        libraryWatchedContext: LibraryWatchedContext? = nil,
         continueItemProvider: () -> ContinueWatchingItem?,
         playTargetBuilder: ([NuvioVideo], ContinueWatchingItem?, Set<String>) -> TvDetailsPlayTarget
     ) -> TvDetailsEpisodePresentation {
@@ -7040,9 +7240,10 @@ private final class TvDetailsEpisodeCache: ObservableObject {
         let guideChanged = self.input != input
         let lookupIdentityChanged = self.lookupIdentity != lookupIdentity
         let progressChanged = self.progressRevision != progressRevision
+        let watchedContextChanged = self.libraryWatchedContextIdentity != libraryWatchedContext?.cacheIdentity
         let focusChanged = self.focusEpisode != focusEpisode
 
-        if guideChanged || lookupIdentityChanged || progressChanged || focusChanged {
+        if guideChanged || lookupIdentityChanged || progressChanged || focusChanged || watchedContextChanged {
             let guideRevision = guideChanged
                 ? (presentation.map { $0.guide.revision &+ 1 } ?? 0)
                 : presentation!.guide.revision
@@ -7050,15 +7251,25 @@ private final class TvDetailsEpisodeCache: ObservableObject {
                 ? TvEpisodeGuide(metaID: input.metaID, videos: input.videos, revision: guideRevision)
                 : presentation!.guide
             let continueItem = continueItemProvider()
-            let watchedSnapshot = WatchedStore.currentSnapshot()
-            let watchedKeys = watchedSnapshot.watchedEpisodeKeys(meta: meta)
-            let episodeWatchCounts = watchedSnapshot.catalogEpisodeWatchCounts(meta: meta)
+            let progressSnapshot = WatchedStore.currentSnapshot()
+            let librarySnapshot = libraryWatchedContext.map {
+                WatchedStore.librarySnapshot(for: $0.source, profileId: $0.profileId)
+            }
+            let watchedKeys = TvDetailsEpisodeWatchedKeys(
+                meta: meta,
+                progressSnapshot: progressSnapshot,
+                librarySnapshot: librarySnapshot
+            )
+            let progressWatchedKeys = watchedKeys.playTarget
+            let displayWatchedKeys = watchedKeys.display
+            let displaySnapshot = librarySnapshot ?? progressSnapshot
+            let episodeWatchCounts = displaySnapshot.catalogEpisodeWatchCounts(meta: meta)
             // A calendar entry asks for a specific episode; otherwise follow
             // progress as before.
             let focusedEpisode = focusEpisode.flatMap { $0.pick(from: guide.episodes) }
             let initialEpisode = focusedEpisode ?? guide.initialEpisode(
                 continueItem: continueItem,
-                watchedKeys: watchedKeys
+                watchedKeys: progressWatchedKeys
             )
             let selectedSeason = initialEpisode?.season ?? guide.defaultSeason()
             let seasonEpisodes = guide.episodesBySeason[selectedSeason] ?? []
@@ -7069,18 +7280,18 @@ private final class TvDetailsEpisodeCache: ObservableObject {
                 indices[entry.element.id] = entry.offset
             }
             let seasonIsWatched = !seasonEpisodes.isEmpty && seasonEpisodes.allSatisfy {
-                watchedKeys.contains("\($0.season):\($0.episode)")
+                displayWatchedKeys.contains("\($0.season):\($0.episode)")
             }
             let initialState = TvDetailsEpisodeInitialState(
                 selectedSeason: selectedSeason,
                 seasonEpisodes: seasonEpisodes,
                 seasonEpisodeIndexByID: seasonEpisodeIndexByID,
                 episodeScrollIndex: episodeScrollIndex,
-                watchedEpisodeKeys: watchedKeys,
+                watchedEpisodeKeys: displayWatchedKeys,
                 episodeWatchCounts: episodeWatchCounts,
                 watchedSummary: WatchedEpisodeSummary.make(
                     videos: guide.episodes,
-                    watchedEpisodeKeys: watchedKeys
+                    watchedEpisodeKeys: displayWatchedKeys
                 ),
                 seasonIsWatched: seasonIsWatched
             )
@@ -7093,7 +7304,7 @@ private final class TvDetailsEpisodeCache: ObservableObject {
             presentation = TvDetailsEpisodePresentation(
                 guide: guide,
                 continueItem: continueItem,
-                playTarget: playTargetBuilder(guide.episodes, continueItem, watchedKeys),
+                playTarget: playTargetBuilder(guide.episodes, continueItem, progressWatchedKeys),
                 initialState: initialState,
                 revision: nextRevision
             )
@@ -7101,6 +7312,7 @@ private final class TvDetailsEpisodeCache: ObservableObject {
             self.lookupIdentity = lookupIdentity
             self.progressRevision = progressRevision
             self.focusEpisode = focusEpisode
+            self.libraryWatchedContextIdentity = libraryWatchedContext?.cacheIdentity
         }
 
         return presentation!
@@ -7109,6 +7321,7 @@ private final class TvDetailsEpisodeCache: ObservableObject {
 
 private struct TvDetailsEpisodes: View {
     let meta: NuvioMeta
+    var libraryWatchedContext: LibraryWatchedContext? = nil
     let episodeGuide: TvEpisodeGuide
     let initialState: TvDetailsEpisodeInitialState
     let presentationRevision: TvDetailsEpisodePresentationRevision
@@ -7146,6 +7359,7 @@ private struct TvDetailsEpisodes: View {
 
     init(
         meta: NuvioMeta,
+        libraryWatchedContext: LibraryWatchedContext? = nil,
         episodeGuide: TvEpisodeGuide,
         initialState: TvDetailsEpisodeInitialState,
         presentationRevision: TvDetailsEpisodePresentationRevision,
@@ -7165,6 +7379,7 @@ private struct TvDetailsEpisodes: View {
         onMoveDownFromEpisode: @escaping () -> Void
     ) {
         self.meta = meta
+        self.libraryWatchedContext = libraryWatchedContext
         self.episodeGuide = episodeGuide
         self.initialState = initialState
         self.presentationRevision = presentationRevision
@@ -7218,6 +7433,9 @@ private struct TvDetailsEpisodes: View {
         .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.continueWatchingChangedNotification).receive(on: RunLoop.main)) { _ in
             refreshWatchedState()
         }
+        .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.libraryChangedNotification).receive(on: RunLoop.main)) { _ in
+            refreshWatchedState()
+        }
         .onReceive(NotificationCenter.default.publisher(for: AddonRatingsService.ratingOrderChangedNotification).receive(on: RunLoop.main)) { _ in
             ratingOrderRevision &+= 1
         }
@@ -7269,9 +7487,13 @@ private struct TvDetailsEpisodes: View {
     }
 
     private func refreshWatchedState() {
-        let snapshot = WatchedStore.currentSnapshot()
+        let snapshot = libraryWatchedContext.map {
+            WatchedStore.librarySnapshot(for: $0.source, profileId: $0.profileId)
+        } ?? WatchedStore.currentSnapshot()
         refreshWatchedState(
-            using: snapshot.watchedEpisodeKeys(meta: meta),
+            using: libraryWatchedContext == nil
+                ? snapshot.watchedEpisodeKeys(meta: meta)
+                : snapshot.catalogWatchedEpisodeKeys(meta: meta),
             episodeWatchCounts: snapshot.catalogEpisodeWatchCounts(meta: meta)
         )
     }
@@ -7396,32 +7618,59 @@ private struct TvDetailsEpisodes: View {
                             onFocus()
                         },
                         onToggleWatched: {
-                            _ = WatchedStore.toggleEpisode(
-                                meta: meta,
-                                season: video.season,
-                                episode: video.episode
-                            )
+                            let isWatched = watchedEpisodeKeys.contains(watchKey)
+                            if let libraryWatchedContext {
+                                _ = libraryWatchedContext.setWatched(
+                                    meta,
+                                    season: video.season,
+                                    episode: video.episode,
+                                    isWatched: !isWatched
+                                )
+                            } else {
+                                _ = WatchedStore.toggleEpisode(
+                                    meta: meta,
+                                    season: video.season,
+                                    episode: video.episode
+                                )
+                            }
                         },
                         onMarkWatchedUpTo: {
-                            WatchedStore.markWatchedUpTo(
-                                meta: meta,
-                                season: video.season,
-                                episode: video.episode
-                            )
+                            if let libraryWatchedContext {
+                                _ = libraryWatchedContext.setWatchedUpTo(
+                                    meta,
+                                    season: video.season,
+                                    episode: video.episode
+                                )
+                            } else {
+                                WatchedStore.markWatchedUpTo(
+                                    meta: meta,
+                                    season: video.season,
+                                    episode: video.episode
+                                )
+                            }
                         },
                         onToggleSeasonWatched: {
-                            WatchedStore.setSeasonWatched(
-                                meta: meta,
-                                season: selectedSeason,
-                                episodes: seasonEpisodes.map(\.episode),
-                                isWatched: !isSeasonWatched
-                            )
+                            if let libraryWatchedContext {
+                                _ = libraryWatchedContext.setSeasonWatched(
+                                    meta,
+                                    season: selectedSeason,
+                                    episodes: seasonEpisodes.map(\.episode),
+                                    isWatched: !isSeasonWatched
+                                )
+                            } else {
+                                WatchedStore.setSeasonWatched(
+                                    meta: meta,
+                                    season: selectedSeason,
+                                    episodes: seasonEpisodes.map(\.episode),
+                                    isWatched: !isSeasonWatched
+                                )
+                            }
                         },
                         onMenuOpened: { onEpisodeMenuPresented(true) },
                         onMenuClosed: { onEpisodeMenuPresented(false) },
                         action: { onSelect(video) },
                         onPlayManually: onPlayManually != nil ? { onPlayManually?(video) } : nil,
-                        smartStreamSelection: smartStreamSelection || (reuseLastLink && LastPlaybackStreamStore.load(metaId: meta.id, season: video.season, episode: video.episode, profileId: ProfileSettings.activeProfileID) != nil),
+                        smartStreamSelection: smartStreamSelection || (reuseLastLink && LastPlaybackStreamStore.load(metaId: meta.id, season: video.season, episode: video.episode, meta: meta, profileId: ProfileSettings.activeProfileID) != nil),
                         onBack: onBack,
                         focus: episodeFocus,
                         restrictFocusToKey: effectiveFocusRestriction,

@@ -19,9 +19,9 @@ struct AudioProcessingSettings: Sendable, Equatable {
     var reduceLoudSounds = false
 }
 
-/// FFmpeg software audio decode: compressed AVPackets -> multichannel Float32 PCM in CMSampleBuffers for
-/// AVSampleBufferAudioRenderer. The opt-in FEL path may replace this with TrueHD Atmos -> APAC packets;
-/// EAC3+JOC continues through the native AVPlayer path.
+/// FFmpeg software audio decoder: compressed AVPackets -> multichannel interleaved Float32 PCM in CMSampleBuffers
+/// for AVSampleBufferAudioRenderer. Uses libswresample to interleaved Float32 at source rate/channels (up to 7.1)
+/// with proper AudioChannelLayout. Atmos formats use their dedicated compressed or APAC producer.
 final class AudioDecoder: @unchecked Sendable {
 
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
@@ -30,12 +30,9 @@ final class AudioDecoder: @unchecked Sendable {
     /// avcodec_flush_buffers could race an in-flight avcodec_send_packet on the same context (UB).
     /// Mirrors SoftwareVideoDecoder's lock discipline.
     private let stateLock = NSLock()
+    private var _feedEpoch: UInt64 = 0
     private var swrContext: OpaquePointer?
     private var audioFormatDescription: CMAudioFormatDescription?
-#if TrueHDObjectAudio
-    private var softwareSpatialAudioDecoderStorage: AnyObject?
-    private var spatialAudioFailureMessage: String?
-#endif
 
     /// Source stream time base for PTS conversion.
     private var timeBase: AVRational = AVRational(num: 1, den: 90000)
@@ -74,12 +71,20 @@ final class AudioDecoder: @unchecked Sendable {
     }
 
     private(set) var sampleRate: Int32 = 0
+    /// The channels the decoder OUTPUTS: the source's, or fewer under an `AudioShaping` cap.
     private(set) var channels: Int32 = 0
 
-    func open(
-        stream: UnsafeMutablePointer<AVStream>,
-        spatialAudioLayout: SpatialSpeakerLayout? = nil
-    ) throws {
+    var feedEpoch: UInt64 {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _feedEpoch
+    }
+
+    /// AE#923. Set before `open`; a change mid-session arrives as a new decoder or a re-anchor.
+    var shaping = AudioShaping()
+    private var dynamics: AudioDynamicsProcessor?
+
+    func open(stream: UnsafeMutablePointer<AVStream>) throws {
         guard let codecpar = stream.pointee.codecpar else {
             throw AudioDecoderError.noCodecParameters
         }
@@ -88,31 +93,6 @@ final class AudioDecoder: @unchecked Sendable {
         sampleRate = codecpar.pointee.sample_rate
         channels = codecpar.pointee.ch_layout.nb_channels
         if channels <= 0 || channels > 8 { channels = 2 }
-
-#if TrueHDObjectAudio
-        if #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *),
-           let spatialAudioLayout {
-            do {
-                softwareSpatialAudioDecoderStorage = try SoftwareSpatialAudioDecoder(
-                    stream: stream,
-                    layout: spatialAudioLayout
-                )
-                sampleRate = Int32(SpatialAudioBridge.sampleRate)
-                channels = Int32(spatialAudioLayout.channelCount)
-                EngineLog.emit(
-                    "[AudioDecoder] selected \((softwareSpatialAudioDecoderStorage as? SoftwareSpatialAudioDecoder)?.pipelineName ?? "TrueHD Atmos → APAC")",
-                    category: .swPlayback
-                )
-                return
-            } catch {
-                softwareSpatialAudioDecoderStorage = nil
-                EngineLog.emit(
-                    "[AudioDecoder] spatial APAC setup unavailable (\(error)); using PCM decode",
-                    category: .swPlayback
-                )
-            }
-        }
-#endif
 
         guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
             throw AudioDecoderError.unsupportedCodec
@@ -143,18 +123,18 @@ final class AudioDecoder: @unchecked Sendable {
     func decode(packet: UnsafeMutablePointer<AVPacket>) -> [CMSampleBuffer] {
         stateLock.lock()
         defer { stateLock.unlock() }
-#if TrueHDObjectAudio
-        if #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *),
-           let softwareSpatialAudioDecoder = softwareSpatialAudioDecoderStorage as? SoftwareSpatialAudioDecoder {
-            guard softwareSpatialAudioDecoder.isActive else { return [] }
-            do {
-                return try softwareSpatialAudioDecoder.decode(packet: packet)
-            } catch {
-                spatialAudioFailureMessage = String(describing: error)
-                return []
-            }
-        }
-#endif
+        return decodeLocked(packet)
+    }
+
+    func decode(packet: UnsafeMutablePointer<AVPacket>, epoch: UInt64) -> [CMSampleBuffer] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard epoch == _feedEpoch else { return [] }
+        return decodeLocked(packet)
+    }
+
+    /// Caller holds `stateLock`, including the producer-epoch check.
+    private func decodeLocked(_ packet: UnsafeMutablePointer<AVPacket>) -> [CMSampleBuffer] {
         guard let ctx = codecContext else { return [] }
         var results: [CMSampleBuffer] = []
 
@@ -211,6 +191,7 @@ final class AudioDecoder: @unchecked Sendable {
         if frame.pointee.sample_rate > 0 { sampleRate = frame.pointee.sample_rate }
         let frameChannels = frame.pointee.ch_layout.nb_channels
         if frameChannels > 0 && frameChannels <= 8 { channels = frameChannels }
+        if shaping.isActive { channels = shaping.outputChannels(forSource: channels) }
 
         var outLayout = AVChannelLayout()
         // #401: this is the order the stamped layout has to name, so both come from one place.
@@ -244,8 +225,17 @@ final class AudioDecoder: @unchecked Sendable {
             0,
             nil
         )
-        guard ret >= 0, swrContext != nil else { return false }
-        guard swr_init(swrContext) >= 0 else {
+        guard ret >= 0, let swr = swrContext else { return false }
+        if shaping.isActive {
+            AudioShapingMatrix.apply(to: swr, input: &inLayout, output: &outLayout,
+                                     dialogueGain: shaping.dialogueGain)
+            dynamics = AudioDynamicsProcessor(compressor: shaping.clamped.compressor, sampleRate: sampleRate)
+            EngineLog.emit("[AudioDecoder] AE#923 shaping \(shaping.summary): "
+                           + "\(frameChannels)ch -> \(channels)ch", category: .swPlayback)
+        } else {
+            dynamics = nil
+        }
+        guard swr_init(swr) >= 0 else {
             swr_free(&swrContext)
             return false
         }
@@ -270,14 +260,7 @@ final class AudioDecoder: @unchecked Sendable {
     func flush() {
         stateLock.lock()
         defer { stateLock.unlock() }
-#if TrueHDObjectAudio
-        if #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *),
-           let softwareSpatialAudioDecoder = softwareSpatialAudioDecoderStorage as? SoftwareSpatialAudioDecoder {
-            softwareSpatialAudioDecoder.startSegment()
-            spatialAudioFailureMessage = nil
-            return
-        }
-#endif
+        _feedEpoch &+= 1
         guard let ctx = codecContext else { return }
         avcodec_flush_buffers(ctx)
         // Drop the coalesced samples; after a seek they'd be at the wrong PTS anyway.
@@ -285,6 +268,7 @@ final class AudioDecoder: @unchecked Sendable {
         // Re-anchor the gapless clock to the post-seek PTS on the next emitted buffer.
         clock.reset()
         audioProcessor.reset()
+        dynamics?.reset()
         #if DEBUG
         _loggedZeroConvert = false
         #endif
@@ -297,18 +281,18 @@ final class AudioDecoder: @unchecked Sendable {
     func drain() -> [CMSampleBuffer] {
         stateLock.lock()
         defer { stateLock.unlock() }
-#if TrueHDObjectAudio
-        if #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *),
-           let softwareSpatialAudioDecoder = softwareSpatialAudioDecoderStorage as? SoftwareSpatialAudioDecoder {
-            guard softwareSpatialAudioDecoder.isActive else { return [] }
-            do {
-                return try softwareSpatialAudioDecoder.drain()
-            } catch {
-                spatialAudioFailureMessage = String(describing: error)
-                return []
-            }
-        }
-#endif
+        return drainLocked()
+    }
+
+    func endOfStream(epoch: UInt64) -> [CMSampleBuffer] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard epoch == _feedEpoch else { return [] }
+        return drainLocked()
+    }
+
+    /// Caller holds `stateLock`, including the producer-epoch check.
+    private func drainLocked() -> [CMSampleBuffer] {
         guard let ctx = codecContext else { return [] }
         var results: [CMSampleBuffer] = []
 
@@ -334,16 +318,23 @@ final class AudioDecoder: @unchecked Sendable {
         return results
     }
 
+    /// Preserve the PCM decoder's coalesced tail when the generic software host reaches EOF.
+    func endOfStream() -> [CMSampleBuffer] { drain() }
+
+    func tapBuffers(
+        for packet: UnsafeMutablePointer<AVPacket>,
+        produced: [CMSampleBuffer],
+        epoch: UInt64
+    ) -> [CMSampleBuffer] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return epoch == _feedEpoch ? produced : []
+    }
+
     func close() {
         stateLock.lock()
         defer { stateLock.unlock() }
-#if TrueHDObjectAudio
-        if #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) {
-            (softwareSpatialAudioDecoderStorage as? SoftwareSpatialAudioDecoder)?.close()
-        }
-        softwareSpatialAudioDecoderStorage = nil
-        spatialAudioFailureMessage = nil
-#endif
+        _feedEpoch &+= 1
         if codecContext != nil {
             avcodec_free_context(&codecContext)
         }
@@ -356,82 +347,6 @@ final class AudioDecoder: @unchecked Sendable {
         swrContext = nil
         audioFormatDescription = nil
         audioProcessor.reset()
-    }
-
-    var isUsingSoftwareSpatialAudio: Bool {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-#if TrueHDObjectAudio
-        if #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) {
-            return (softwareSpatialAudioDecoderStorage as? SoftwareSpatialAudioDecoder)?.isRouteEligible == true
-        }
-        return false
-#else
-        return false
-#endif
-    }
-
-    var hasSoftwareSpatialAudioRoute: Bool {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-#if TrueHDObjectAudio
-        if #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) {
-            return softwareSpatialAudioDecoderStorage is SoftwareSpatialAudioDecoder
-        }
-        return false
-#else
-        return false
-#endif
-    }
-
-    var spatialAudioPipelineName: String? {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-#if TrueHDObjectAudio
-        if #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) {
-            return (softwareSpatialAudioDecoderStorage as? SoftwareSpatialAudioDecoder)?.pipelineName
-        }
-        return nil
-#else
-        return nil
-#endif
-    }
-
-    var objectAudioActivity: ObjectAudioActivity? {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-#if TrueHDObjectAudio
-        if #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) {
-            return (softwareSpatialAudioDecoderStorage as? SoftwareSpatialAudioDecoder)?.objectAudioActivity
-        }
-        return nil
-#else
-        return nil
-#endif
-    }
-
-    /// Read and clear a runtime APAC failure after `decode` / `drain` has released `stateLock`.
-    func takeSpatialAudioFailure() -> String? {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-#if TrueHDObjectAudio
-        defer { spatialAudioFailureMessage = nil }
-        return spatialAudioFailureMessage
-#else
-        return nil
-#endif
-    }
-
-    func stopSpatialAudioAfterFailure(_ message: String) {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-#if TrueHDObjectAudio
-        if #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *),
-           let softwareSpatialAudioDecoder = softwareSpatialAudioDecoderStorage as? SoftwareSpatialAudioDecoder {
-            softwareSpatialAudioDecoder.stopAfterFailure()
-            spatialAudioFailureMessage = message
-        }
-#endif
     }
 
     deinit {
@@ -522,6 +437,11 @@ final class AudioDecoder: @unchecked Sendable {
         }
         #endif
         guard convertedSamples > 0 else { return }
+        if dynamics != nil {
+            tempBuffer.withMemoryRebound(to: Float.self, capacity: Int(convertedSamples) * Int(channels)) {
+                dynamics?.process($0, frames: Int(convertedSamples), channels: Int(channels))
+            }
+        }
 
         let sampleFrames = Int(convertedSamples)
         tempBuffer.withMemoryRebound(to: Float.self, capacity: sampleFrames * Int(channels)) { interleaved in
@@ -627,9 +547,6 @@ final class AudioDecoder: @unchecked Sendable {
     }
 }
 
-/// Stateful, linked-channel PCM processing for the app-owned FFmpeg routes. The adaptive gain
-/// follows the intent of `dynaudnorm`; Boost adds a presence-band EQ, and Reduce Loud Sounds uses a
-/// linked compressor followed by a peak guard. States persist between decoded frames.
 struct AudioProcessingDSP {
     private var settings = AudioProcessingSettings()
     private var sampleRate = 0

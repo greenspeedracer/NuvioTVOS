@@ -6,7 +6,46 @@ enum TraktConfig {
     /// OAuth endpoints moved to the dedicated auth host; the data API stays on
     /// `apiBaseURL`. (Trakt docs, 2026: "Use auth.trakt.tv for all OAuth requests.")
     static let authBaseURL = "https://auth.trakt.tv"
-    static let redirectURI = "urn:ietf:wg:oauth:2.0:oob"
+    static let legacyRedirectURI = "urn:ietf:wg:oauth:2.0:oob"
+    static let defaultRedirectURI = "http://localhost:5173/callback"
+
+    static func redirectURI(in store: UserDefaults) -> String {
+        let stored = store.string(forKey: SettingsKey.traktRedirectURI)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return stored.isEmpty ? inferredRedirectURI(in: store) : stored
+    }
+
+    /// Pins the profile's legacy or new-app default before credentials are first
+    /// saved, so later client ID changes cannot silently change refresh requests.
+    @discardableResult
+    static func initializeRedirectURI(in store: UserDefaults) -> String {
+        let stored = store.string(forKey: SettingsKey.traktRedirectURI)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !stored.isEmpty {
+            if store.string(forKey: SettingsKey.traktRedirectURI) != stored {
+                store.set(stored, forKey: SettingsKey.traktRedirectURI)
+            }
+            return stored
+        }
+
+        let inferred = inferredRedirectURI(in: store)
+        store.set(inferred, forKey: SettingsKey.traktRedirectURI)
+        return inferred
+    }
+
+    /// Blank input keeps the profile's pinned URI. Custom values are stored
+    /// exactly as entered after trimming surrounding whitespace.
+    @discardableResult
+    static func setRedirectURI(_ value: String, in store: UserDefaults) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let selected = trimmed.isEmpty ? redirectURI(in: store) : trimmed
+        store.set(selected, forKey: SettingsKey.traktRedirectURI)
+        return selected
+    }
+
+    private static func inferredRedirectURI(in store: UserDefaults) -> String {
+        clientID(in: store).isEmpty ? defaultRedirectURI : legacyRedirectURI
+    }
 
     static var clientID: String {
         clientID(in: ProfileSettings.current)
@@ -49,7 +88,7 @@ enum TraktConnectionMode {
     case connected
 }
 
-enum TraktWatchProgressSource: String, CaseIterable, Codable {
+enum TraktWatchProgressSource: String, CaseIterable, Codable, Hashable, Sendable {
     case trakt = "TRAKT"
     case simkl = "SIMKL"
     case mdblist = "MDBLIST"
@@ -67,7 +106,7 @@ enum TraktWatchProgressSource: String, CaseIterable, Codable {
     }
 }
 
-enum TraktLibrarySourceMode: String, CaseIterable {
+enum TraktLibrarySourceMode: String, CaseIterable, Hashable, Sendable {
     case trakt = "TRAKT"
     case simkl = "SIMKL"
     case mdblist = "MDBLIST"
@@ -358,6 +397,9 @@ enum TraktSettingsStore {
     static let continueWatchingChangedNotification = Notification.Name(
         "nuvio.tv.trakt.continueWatchingSettings.changed"
     )
+    static let continueWatchingSourceInvalidatedNotification = Notification.Name(
+        "nuvio.tv.trakt.continueWatchingSource.invalidated"
+    )
     static let libraryChangedNotification = Notification.Name(
         "nuvio.tv.trakt.librarySettings.changed"
     )
@@ -377,6 +419,14 @@ enum TraktSettingsStore {
             ProfileSettings.current.set(normalized, forKey: SettingsKey.traktContinueWatchingDaysCap)
             NotificationCenter.default.post(name: continueWatchingChangedNotification, object: nil)
         }
+    }
+
+    static func notifyContinueWatchingSourceInvalidated(
+        for source: TraktWatchProgressSource,
+        in store: UserDefaults = ProfileSettings.current
+    ) {
+        guard ProfileSettings.isActiveStore(store), watchProgressSource(in: store) == source else { return }
+        NotificationCenter.default.post(name: continueWatchingSourceInvalidatedNotification, object: nil)
     }
 
     static var showMetaComments: Bool {
@@ -532,6 +582,7 @@ enum RemoteTrackingState {
             let scope = profileScope ?? MdbListRuntimeSession.profileScope()
             let tokens = mdbListTokenStorage ?? MdbListKeychainTokenStorage()
             return MdbListAuthStore.state(in: store, profileScope: scope, tokenStorage: tokens).hasOAuthTokens
+                || MdbListRuntimeSession.hasAPIKey(in: store)
         case .wetrakr:
             return ProfileSettings.isActiveStore(store)
                 && WeTrakrRuntimeSession.authenticatedState(store: store, profileScope: profileScope) != nil
@@ -652,6 +703,7 @@ enum RemoteTrackingState {
             let scope = profileScope ?? MdbListRuntimeSession.profileScope()
             let tokens = mdbListTokenStorage ?? MdbListKeychainTokenStorage()
             return MdbListAuthStore.state(in: store, profileScope: scope, tokenStorage: tokens).hasOAuthTokens
+                || MdbListRuntimeSession.hasAPIKey(in: store)
         case .wetrakr:
             return ProfileSettings.isActiveStore(store)
                 && WeTrakrRuntimeSession.authenticatedState(store: store) != nil
@@ -877,6 +929,7 @@ final class TraktAuthService {
         guard hasRequiredCredentials() else {
             throw TraktServiceError.message("Enter your Trakt Client ID first.")
         }
+        TraktConfig.initializeRedirectURI(in: store)
 
         let state = currentState()
         if let deviceCode = state.deviceCode,
@@ -987,6 +1040,11 @@ final class TraktAuthService {
         }
     }
 
+    /// Response ownership checks and auth mutations stay on MainActor so they
+    /// cannot interleave with a profile's Trakt Redirect URI settings commit.
+    /// The network await suspends the actor; validation and save/clear resume
+    /// together after the response arrives.
+    @MainActor
     func refreshTokenIfNeeded(force: Bool = false) async -> Bool {
         guard ProfileSettings.isActiveStore(store), hasRequiredCredentials() else { return false }
         let state = currentState()
@@ -995,15 +1053,16 @@ final class TraktAuthService {
         let capturedProfileID = ProfileSettings.activeProfileID
         let capturedClientID = clientID
         let capturedBindingID = TraktAuthStore.accountBindingID(in: store)
+        let capturedRedirectURI = TraktConfig.redirectURI(in: store)
 
         do {
             let response: HTTPResult<TraktTokenResponse> = try await postResult(
                 path: "oauth/token",
                 body: TraktRefreshTokenRequest(
                     refreshToken: refreshToken,
-                    clientID: clientID,
+                    clientID: capturedClientID,
                     clientSecret: clientSecretOrNil,
-                    redirectURI: TraktConfig.redirectURI
+                    redirectURI: capturedRedirectURI
                 ),
                 authorized: false
             )
@@ -1014,7 +1073,9 @@ final class TraktAuthService {
                 && latestState.refreshToken == refreshToken
                 && capturedBindingID == TraktAuthStore.accountBindingID(in: store)
             guard let token = response.value, (200..<300).contains(response.statusCode) else {
-                if isCapturedSession && (response.statusCode == 401 || response.statusCode == 403) {
+                if isCapturedSession
+                    && TraktConfig.redirectURI(in: store) == capturedRedirectURI
+                    && (response.statusCode == 401 || response.statusCode == 403) {
                     TraktAuthStore.clearAuth(store: store)
                 }
                 return false
@@ -1274,8 +1335,13 @@ enum TraktScrobbleAction: String {
 
 @MainActor
 struct TraktProgressService {
+    static let continueWatchingSnapshotChangedNotification = Notification.Name(
+        "nuvio.tv.trakt.continueWatchingSnapshot.changed"
+    )
+
     private static let completionPercent = 90.0
-    private static let maxItems = 20
+    nonisolated private static let maxItems = 20
+    static let maxHomeContinueWatchingSeeds = 36
     /// Long enough to outlive an app relaunch plus Simkl's 20-second per-user
     /// scrobble lock. Kept to an hour so a checkpoint the server never confirms
     /// (for example the title was marked watched on another device) cannot linger
@@ -1466,6 +1532,26 @@ struct TraktProgressService {
         }
     }
 
+    /// The last fetched list for this profile and provider, if one is cached.
+    /// Callers use this for stable membership checks without reading playback
+    /// positions or starting another provider request.
+    static func currentContinueWatchingItems(
+        source sourceOverride: TraktWatchProgressSource? = nil
+    ) -> [ContinueWatchingItem]? {
+        pruneExpiredLocalCheckpoints()
+        let profileId = ContinueWatchingStore.activeProfileId
+        let source = sourceOverride ?? TraktSettingsStore.watchProgressSource
+        let remoteItems = continueWatchingSnapshots.first {
+            $0.profileId == profileId && $0.source == source
+        }?.items ?? []
+        return mergingLocalPlaybackCheckpoints(
+            into: remoteItems,
+            source: source,
+            profileId: profileId,
+            limit: maxItems
+        )
+    }
+
     /// Retain the measured stream timeline for every provider receiving scrobbles.
     /// Provider playback lists can otherwise reconstruct seconds from a different runtime.
     static func recordLocalPlaybackForScrobbleSources(
@@ -1591,15 +1677,21 @@ struct TraktProgressService {
         let profileScope: String
         let source: TraktWatchProgressSource
         let updateDisplayedSnapshot: Bool
+        let replaceSnapshot: Bool
 
         @MainActor
-        init(source: TraktWatchProgressSource, updateDisplayedSnapshot: Bool) {
+        init(
+            source: TraktWatchProgressSource,
+            updateDisplayedSnapshot: Bool,
+            replaceSnapshot: Bool = true
+        ) {
             profileId = ContinueWatchingStore.activeProfileId
             settingsProfileId = ProfileSettings.activeProfileID
             store = ProfileSettings.current
             profileScope = ProfileSettings.activeProfileScope
             self.source = source
             self.updateDisplayedSnapshot = updateDisplayedSnapshot
+            self.replaceSnapshot = replaceSnapshot
         }
     }
 
@@ -1609,37 +1701,133 @@ struct TraktProgressService {
     @MainActor
     static func finalizeContinueWatchingFetch(
         _ items: [ContinueWatchingItem],
-        context: ContinueWatchingFetchContext
+        context: ContinueWatchingFetchContext,
+        displayPredicate: ((ContinueWatchingItem) -> Bool)? = nil,
+        displaySort: (([ContinueWatchingItem]) -> [ContinueWatchingItem])? = nil
     ) -> [ContinueWatchingItem]? {
         guard !Task.isCancelled,
               context.profileId == ContinueWatchingStore.activeProfileId,
               context.settingsProfileId == ProfileSettings.activeProfileID,
               ProfileSettings.isActiveStore(context.store) else { return nil }
-        guard context.updateDisplayedSnapshot else { return items }
+        guard context.updateDisplayedSnapshot else {
+            guard let displayPredicate else { return items }
+            return selectContinueWatchingItemsForDisplay(
+                items,
+                predicate: displayPredicate,
+                sort: displaySort
+            )
+        }
         guard context.source == TraktSettingsStore.watchProgressSource else { return nil }
 
         let resolvedItems = mergingLocalPlaybackCheckpoints(
             into: items,
             source: context.source,
-            profileId: context.profileId
+            profileId: context.profileId,
+            limit: displayPredicate == nil ? maxItems : nil
         )
+        let displayedItems: [ContinueWatchingItem]
+        if let displayPredicate {
+            displayedItems = selectContinueWatchingItemsForDisplay(
+                resolvedItems,
+                predicate: displayPredicate,
+                sort: displaySort
+            )
+        } else {
+            displayedItems = resolvedItems
+        }
+        let snapshotItems: [ContinueWatchingItem]
+        if displayPredicate == nil {
+            snapshotItems = resolvedItems
+        } else {
+            var snapshotMetaIDs = Set<String>()
+            snapshotItems = (displayedItems + Array(resolvedItems.prefix(maxItems))).filter {
+                snapshotMetaIDs.insert($0.meta.id).inserted
+            }
+        }
+        let previousItems = continueWatchingSnapshots.first {
+            $0.profileId == context.profileId && $0.source == context.source
+        }?.items ?? []
+        let retainedItems = context.replaceSnapshot ? [] : previousItems.filter { previous in
+            !snapshotItems.contains { WatchedStore.sameContent($0.meta, previous.meta) }
+        }
         replaceContinueWatchingSnapshot(
-            resolvedItems,
+            snapshotItems + retainedItems,
             source: context.source,
             profileId: context.profileId
         )
-        return resolvedItems
+        return displayedItems
+    }
+
+    /// Resolve a bounded seed pool concurrently. Each result is restored to
+    /// candidate order before returning, regardless of completion order.
+    static func resolveContinueWatchingMetadata<Seed>(
+        from seeds: [Seed],
+        candidateLimit: Int,
+        resolve: @escaping (Seed) async -> ContinueWatchingItem?
+    ) async -> [ContinueWatchingItem]? {
+        guard candidateLimit > 0 else { return [] }
+        let candidates = Array(seeds.prefix(candidateLimit))
+        guard !Task.isCancelled else { return nil }
+        let tasks = candidates.enumerated().map { index, seed in
+            Task { @MainActor in
+                (index, await resolve(seed))
+            }
+        }
+        return await withTaskCancellationHandler {
+            var indexedItems: [(Int, ContinueWatchingItem)] = []
+            for task in tasks {
+                guard !Task.isCancelled else { return nil }
+                let (index, item) = await task.value
+                if let item {
+                    indexedItems.append((index, item))
+                }
+            }
+            guard !Task.isCancelled else { return nil }
+            return indexedItems.sorted { $0.0 < $1.0 }.map(\.1)
+        } onCancel: {
+            tasks.forEach { $0.cancel() }
+        }
+    }
+
+    /// Apply Home eligibility and title-level deduplication only after all
+    /// checkpoints are merged, then order and cap the visible row.
+    static func selectContinueWatchingItemsForDisplay(
+        _ items: [ContinueWatchingItem],
+        predicate: (ContinueWatchingItem) -> Bool,
+        sort: (([ContinueWatchingItem]) -> [ContinueWatchingItem])? = nil
+    ) -> [ContinueWatchingItem] {
+        var seenMetaIDs = Set<String>()
+        let eligibleUniqueItems = items.filter {
+            predicate($0) && seenMetaIDs.insert($0.meta.id).inserted
+        }
+        let orderedItems = sort?(eligibleUniqueItems) ?? eligibleUniqueItems
+        return Array(orderedItems.prefix(maxItems))
+    }
+
+    /// Separate Upcoming is a presentation split performed after selection.
+    /// Rank its combined pool by the default recency order so upcoming entries
+    /// still compete for the Home 20-item limit before `setContinueWatching` splits it.
+    static func sortContinueWatchingForDisplaySelection(
+        _ items: [ContinueWatchingItem],
+        preference: String
+    ) -> [ContinueWatchingItem] {
+        let selectionPreference = preference == "Separate Upcoming Row" ? "Default" : preference
+        return ContinueWatchingSortPolicy.sorted(items, preference: selectionPreference)
     }
 
     static func fetchContinueWatching(
         repository: CatalogRepository,
         source sourceOverride: TraktWatchProgressSource? = nil,
-        updateDisplayedSnapshot: Bool = true
+        updateDisplayedSnapshot: Bool = true,
+        displayPredicate: ((ContinueWatchingItem) -> Bool)? = nil,
+        displaySort: (([ContinueWatchingItem]) -> [ContinueWatchingItem])? = nil,
+        replaceSnapshot: Bool = true
     ) async -> [ContinueWatchingItem]? {
         let context = await MainActor.run {
             ContinueWatchingFetchContext(
                 source: sourceOverride ?? TraktSettingsStore.watchProgressSource,
-                updateDisplayedSnapshot: updateDisplayedSnapshot
+                updateDisplayedSnapshot: updateDisplayedSnapshot,
+                replaceSnapshot: replaceSnapshot
             )
         }
         let source = context.source
@@ -1788,30 +1976,58 @@ struct TraktProgressService {
         let uniqueSeeds = recentSeeds.filter {
             usedContentIDs.insert($0.contentID).inserted
         }
-        let metadataTasks = uniqueSeeds.prefix(maxItems).enumerated().map { index, seed in
-            Task { @MainActor in
-                (index, seed.title, await makeItem(from: seed, repository: repository))
-            }
-        }
-        var indexedItems: [(Int, ContinueWatchingItem)] = []
-        for task in metadataTasks {
-            guard !Task.isCancelled else {
+        let items: [ContinueWatchingItem]
+        if displayPredicate != nil {
+            guard let resolvedItems = await resolveContinueWatchingMetadata(
+                from: uniqueSeeds,
+                candidateLimit: maxHomeContinueWatchingSeeds,
+                resolve: { seed in
+                    let item = await makeItem(from: seed, repository: repository)
+                    #if DEBUG
+                    if item == nil {
+                        print("[ContinueWatching] Trakt metadata omitted \(seed.title)")
+                    }
+                    #endif
+                    return item
+                }
+            ) else {
                 #if DEBUG
                 print("[ContinueWatching] Trakt metadata assembly cancelled")
                 #endif
                 return nil
             }
-            let (index, title, item) = await task.value
-            if let item {
-                indexedItems.append((index, item))
-            } else {
-                #if DEBUG
-                print("[ContinueWatching] Trakt metadata omitted \(title)")
-                #endif
+            items = resolvedItems
+        } else {
+            let metadataTasks = uniqueSeeds.prefix(maxItems).enumerated().map { index, seed in
+                Task { @MainActor in
+                    (index, seed.title, await makeItem(from: seed, repository: repository))
+                }
             }
+            var indexedItems: [(Int, ContinueWatchingItem)] = []
+            for task in metadataTasks {
+                guard !Task.isCancelled else {
+                    #if DEBUG
+                    print("[ContinueWatching] Trakt metadata assembly cancelled")
+                    #endif
+                    return nil
+                }
+                let (index, title, item) = await task.value
+                if let item {
+                    indexedItems.append((index, item))
+                } else {
+                    #if DEBUG
+                    print("[ContinueWatching] Trakt metadata omitted \(title)")
+                    #endif
+                }
+            }
+            items = indexedItems.sorted { $0.0 < $1.0 }.map(\.1)
         }
-        let items = indexedItems.sorted { $0.0 < $1.0 }.map(\.1)
-        guard let resolvedItems = finalizeContinueWatchingFetch(items, context: context) else {
+        guard let resolvedItems = finalizeContinueWatchingFetch(
+            items,
+            context: context,
+            displayPredicate: displayPredicate,
+            displaySort: displaySort
+        ) else {
             return nil
         }
         #if DEBUG
@@ -1850,7 +2066,8 @@ struct TraktProgressService {
     static func mergingLocalPlaybackCheckpoints(
         into remoteItems: [ContinueWatchingItem],
         source: TraktWatchProgressSource,
-        profileId: String? = ContinueWatchingStore.activeProfileId
+        profileId: String? = ContinueWatchingStore.activeProfileId,
+        limit: Int? = maxItems
     ) -> [ContinueWatchingItem] {
         pruneExpiredLocalCheckpoints()
         let checkpoints = localPlaybackCheckpoints.filter {
@@ -1931,11 +2148,9 @@ struct TraktProgressService {
             }
         }
 
-        return Array(
-            merged
-                .sorted { $0.lastWatchedAt > $1.lastWatchedAt }
-                .prefix(maxItems)
-        )
+        let orderedItems = merged.sorted { $0.lastWatchedAt > $1.lastWatchedAt }
+        guard let limit else { return orderedItems }
+        return Array(orderedItems.prefix(max(0, limit)))
     }
 
     private static func pruneExpiredLocalCheckpoints() {
@@ -1950,12 +2165,29 @@ struct TraktProgressService {
         source: TraktWatchProgressSource,
         profileId: String?
     ) {
+        let previousIdentity = continueWatchingSnapshots.first {
+            $0.profileId == profileId && $0.source == source
+        }.map { continueWatchingIdentity($0.items) }
+        let nextIdentity = continueWatchingIdentity(items)
         continueWatchingSnapshots.removeAll {
             $0.profileId == profileId && $0.source == source
         }
         continueWatchingSnapshots.append(
             ContinueWatchingSnapshot(profileId: profileId, source: source, items: items)
         )
+        if previousIdentity != nextIdentity {
+            NotificationCenter.default.post(name: continueWatchingSnapshotChangedNotification, object: nil)
+        }
+    }
+
+    private static func continueWatchingIdentity(_ items: [ContinueWatchingItem]) -> String {
+        Set(items.map {
+            let imdb = NuvioMeta.canonicalImdbID(from: $0.meta.imdbId ?? "") ?? ""
+            let tmdb = $0.meta.tmdbId.map(String.init) ?? ""
+            return "\($0.meta.canonicalType):\($0.meta.id):\(imdb):\(tmdb)"
+        })
+            .sorted()
+            .joined(separator: ",")
     }
 
     /// Returns whether the snapshot actually lost a row.
@@ -2616,11 +2848,13 @@ struct TraktHistoryService {
     private enum PendingHistoryWrite {
         case mutation(WatchedStore.PendingProviderMutation)
         case completion(WatchedPlaybackCompletionUpload)
+        case libraryMutation(WatchedLibraryMutationUpload)
 
         var changedAt: Date {
             switch self {
             case .mutation(let mutation): return mutation.changedAt
             case .completion(let completion): return completion.watchedAt
+            case .libraryMutation(let mutation): return mutation.changedAt
             }
         }
 
@@ -2628,6 +2862,7 @@ struct TraktHistoryService {
             switch self {
             case .mutation(let mutation): return "0:\(mutation.id)"
             case .completion(let completion): return "1:\(completion.id)"
+            case .libraryMutation(let mutation): return "2:\(mutation.id)"
             }
         }
 
@@ -2635,6 +2870,7 @@ struct TraktHistoryService {
             switch self {
             case .mutation(let mutation): return mutation.isWatched ? 1 : 0
             case .completion: return 2
+            case .libraryMutation(let mutation): return mutation.isWatched ? 1 : 0
             }
         }
     }
@@ -2955,12 +3191,20 @@ struct TraktHistoryService {
 
         let mutations = WatchedStore.pendingProviderMutations(provider: .trakt, profileId: profileId)
         let completions = WatchedStore.pendingPlaybackCompletions(provider: .trakt, profileId: profileId)
+        let libraryMutations = WatchedStore.pendingLibraryMutations(
+            provider: .trakt,
+            profileId: profileId,
+            readyOnly: true
+        )
         let writes = mutations
             .filter { $0.accountID == expectedAccountID }
             .map(PendingHistoryWrite.mutation)
             + completions
                 .filter { $0.accountID == expectedAccountID }
                 .map(PendingHistoryWrite.completion)
+            + libraryMutations
+                .filter { $0.accountID == expectedAccountID && $0.profileID == profileId }
+                .map(PendingHistoryWrite.libraryMutation)
         let orderedWrites = writes.sorted { lhs, rhs in
             if lhs.changedAt != rhs.changedAt { return lhs.changedAt < rhs.changedAt }
             if lhs.priorityAtEqualTime != rhs.priorityAtEqualTime {
@@ -2971,6 +3215,9 @@ struct TraktHistoryService {
 
         let hasDeferredAccountWork = mutations.contains { $0.accountID != expectedAccountID }
             || completions.contains { $0.accountID != expectedAccountID }
+            || libraryMutations.contains {
+                $0.accountID != expectedAccountID || $0.profileID != profileId
+            }
         let service = TraktAuthService(session: session, store: store)
         for write in orderedWrites {
             guard isCurrentTraktAccount(
@@ -2999,6 +3246,28 @@ struct TraktHistoryService {
                     store: store,
                     profileId: profileId,
                     expectedAccountID: expectedAccountID
+                ) else { return false }
+
+            case .libraryMutation(let mutation):
+                guard await uploadLibraryMutation(mutation, using: service) else {
+                    _ = WatchedStore.deferLibraryMutation(
+                        id: mutation.id,
+                        provider: .trakt,
+                        accountID: expectedAccountID,
+                        profileId: profileId
+                    )
+                    return false
+                }
+                guard isCurrentTraktAccount(
+                    store: store,
+                    profileId: profileId,
+                    expectedAccountID: expectedAccountID
+                ) else { return false }
+                guard WatchedStore.acknowledgeLibraryMutation(
+                    id: mutation.id,
+                    provider: .trakt,
+                    accountID: expectedAccountID,
+                    profileId: profileId
                 ) else { return false }
             }
         }
@@ -3030,6 +3299,34 @@ struct TraktHistoryService {
             }
             // A reset is satisfied if Trakt deleted the row or confirms there
             // was no matching history item to remove.
+            return result.deleted != nil || (result.notFound?.total ?? 0) > 0
+        } catch {
+            return false
+        }
+    }
+
+    private static func uploadLibraryMutation(
+        _ pending: WatchedLibraryMutationUpload,
+        using service: TraktAuthService
+    ) async -> Bool {
+        let episodes = pending.episodes.isEmpty
+            ? pending.episode.map { [$0] } ?? []
+            : pending.episodes
+        guard let request = mutation(
+            for: pending.meta,
+            season: pending.season,
+            episodes: episodes,
+            watchedAt: pending.isWatched ? minuteISO8601(pending.changedAt) : nil
+        ) else { return false }
+        do {
+            let result: TraktHistoryWriteResponseDTO = try await service.authorizedPost(
+                path: pending.isWatched ? "sync/history" : "sync/history/remove",
+                body: request
+            )
+            guard result.itemErrors.orEmpty.isEmpty else { return false }
+            if pending.isWatched {
+                return result.added != nil && (result.notFound?.total ?? 0) == 0
+            }
             return result.deleted != nil || (result.notFound?.total ?? 0) > 0
         } catch {
             return false
@@ -3266,26 +3563,36 @@ struct TraktHistoryService {
 
         let service = TraktAuthService(store: store)
         guard await service.refreshTokenIfNeeded() else { return false }
+        guard let expectedAccountID = completionAccountID(in: store, profileId: targetProfileId) else { return false }
 
         // Durable resets and playback completions share one account-bound lane.
         // Unbound/old-account mutations stay queued instead of being sent to a
         // newly linked Trakt account.
         _ = await flushPendingPlaybackCompletions(store: store, profileId: targetProfileId)
-        guard ProfileSettings.isActiveStore(store),
-              WatchedStore.activeProfileId == targetProfileId,
-              ProfileSettings.activeProfileID == targetProfileId else { return false }
+        guard isCurrentTraktAccount(
+            store: store,
+            profileId: targetProfileId,
+            expectedAccountID: expectedAccountID
+        ) else { return false }
         let syncStartedAt = Date()
         let result = await fetchWatchedHistorySnapshot(using: service)
-        guard result.receivedResponse else { return false }
+        guard result.receivedResponse,
+              isCurrentTraktAccount(
+                store: store,
+                profileId: targetProfileId,
+                expectedAccountID: expectedAccountID
+              ) else { return false }
         // Network requests above can outlive the profile that initiated them.
         // Never apply one profile's Trakt account to another profile's store.
         guard WatchedStore.activeProfileId == targetProfileId else { return false }
         guard result.isComplete else {
             // A partial response is still useful for importing new marks, but
             // absence is authoritative only when both Trakt collections loaded.
-            return WatchedStore.mergeRemote(
-                result.items.map { $0.adding(source: .trakt) },
-                confirmsTombstoneDeletions: false
+            return WatchedStore.mergeTraktPartialSnapshot(
+                result.items,
+                syncStartedAt: syncStartedAt,
+                currentAccountID: expectedAccountID,
+                profileId: targetProfileId
             )
         }
         return WatchedStore.reconcileTraktSnapshot(
@@ -3432,6 +3739,7 @@ struct TraktHistoryService {
                     name: TraktSettingsStore.continueWatchingChangedNotification,
                     object: nil
                 )
+                TraktSettingsStore.notifyContinueWatchingSourceInvalidated(for: .trakt, in: store)
             }
             return true
         } catch {
@@ -3921,6 +4229,12 @@ private extension Optional where Wrapped: RangeReplaceableCollection {
 
 // MARK: - Library
 
+/// Carries a profile's UserDefaults store across the async boundary. UserDefaults
+/// supports concurrent access; ProfileSettings.current itself is captured on MainActor.
+private struct TraktLibraryDefaultsStore: @unchecked Sendable {
+    let value: UserDefaults
+}
+
 /// Loads the Trakt-backed library without writing it into `LibraryStore`.
 /// Trakt's library surface mirrors the other Nuvio clients: Watchlist plus
 /// items from the user's personal lists.
@@ -3970,13 +4284,22 @@ struct TraktLibraryService {
         requireSelectedSource: Bool = true,
         onSnapshot: LibraryMetadataHydrator.SnapshotHandler? = nil
     ) async -> [LibraryStoreItem]? {
-        let store = await MainActor.run { ProfileSettings.current }
-        let profileID = await MainActor.run { LibraryStore.activeProfileId }
-        let settingsProfileID = await MainActor.run { ProfileSettings.activeProfileID }
-        let context = await MainActor.run { TraktLibraryMutationContext() }
-        guard (!requireSelectedSource || TraktSettingsStore.librarySourceMode(in: store) == .trakt),
-              TraktAuthStore.isAuthenticated(in: store),
-              (!requireSelectedSource || context != nil) else {
+        let (store, profileID, settingsProfileID, hasLibraryContext, isLibraryContextCurrent) = await MainActor.run {
+            let context = TraktLibraryMutationContext()
+            let isContextCurrent: @MainActor @Sendable () -> Bool = {
+                context?.isCurrent == true
+            }
+            return (
+                TraktLibraryDefaultsStore(value: ProfileSettings.current),
+                LibraryStore.activeProfileId,
+                ProfileSettings.activeProfileID,
+                context != nil,
+                isContextCurrent
+            )
+        }
+        guard (!requireSelectedSource || TraktSettingsStore.librarySourceMode(in: store.value) == .trakt),
+              TraktAuthStore.isAuthenticated(in: store.value),
+              (!requireSelectedSource || hasLibraryContext) else {
             return []
         }
 
@@ -3984,16 +4307,16 @@ struct TraktLibraryService {
             guard !Task.isCancelled,
                   LibraryStore.activeProfileId == profileID,
                   ProfileSettings.activeProfileID == settingsProfileID,
-                  ProfileSettings.isActiveStore(store),
-                  TraktAuthStore.isAuthenticated(in: store) else { return false }
+                  ProfileSettings.isActiveStore(store.value),
+                  TraktAuthStore.isAuthenticated(in: store.value) else { return false }
             if requireSelectedSource {
-                return TraktSettingsStore.librarySourceMode(in: store) == .trakt
-                    && context?.isCurrent == true
+                return TraktSettingsStore.librarySourceMode(in: store.value) == .trakt
+                    && isLibraryContextCurrent()
             }
             return true
         }
 
-        let service = TraktAuthService(store: store)
+        let service = TraktAuthService(store: store.value)
         guard await service.refreshTokenIfNeeded() else { return nil }
         guard await isCurrent() else { return nil }
 
@@ -4486,6 +4809,7 @@ final class TraktSettingsViewModel: ObservableObject {
                 name: TraktSettingsStore.continueWatchingChangedNotification,
                 object: nil
             )
+            TraktSettingsStore.notifyContinueWatchingSourceInvalidated(for: .trakt, in: store)
             _ = await service.fetchUserSettings()
             if let stats = await service.fetchUserStats() {
                 TraktAuthStore.saveCachedStats(stats, store: store)

@@ -334,13 +334,64 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
 }
 
 /// Main content view - entry point for the app with screen routing
+struct DetailsNavigationEntry {
+    let id: String
+    let type: String
+    let libraryWatchedContext: LibraryWatchedContext?
+}
+
+@MainActor
+struct DetailsNavigationContextTransition {
+    let backStackEntry: DetailsNavigationEntry
+    let activeLibraryWatchedContext: LibraryWatchedContext?
+
+    static func pushingCurrentDetails(
+        id: String,
+        type: String,
+        libraryWatchedContext: LibraryWatchedContext?
+    ) -> DetailsNavigationContextTransition {
+        DetailsNavigationContextTransition(
+            backStackEntry: DetailsNavigationEntry(
+                id: id,
+                type: type,
+                libraryWatchedContext: libraryWatchedContext
+            ),
+            activeLibraryWatchedContext: nil
+        )
+    }
+
+    static func openingRelatedTitle(
+        from entry: DetailsNavigationEntry
+    ) -> DetailsNavigationContextTransition {
+        DetailsNavigationContextTransition(
+            backStackEntry: entry,
+            activeLibraryWatchedContext: nil
+        )
+    }
+
+    static func restoring(_ entry: DetailsNavigationEntry) -> LibraryWatchedContext? {
+        entry.libraryWatchedContext
+    }
+
+    static func playbackContext(
+        origin: PlaybackOrigin,
+        currentLibraryWatchedContext: LibraryWatchedContext?
+    ) -> LibraryWatchedContext? {
+        switch origin {
+        case .details: return currentLibraryWatchedContext
+        case .main, .cloudLibrary: return nil
+        }
+    }
+}
+
 struct ContentView: View {
     private struct PartyDetailsDestination {
         let screen: TVScreen
         let tab: TVTab
-        let backStack: [(id: String, type: String)]
+        let backStack: [DetailsNavigationEntry]
         let returnDestination: DetailsReturnDestination
         let collectionContext: CollectionPlaybackContext?
+        let libraryWatchedContext: LibraryWatchedContext?
     }
 
     private struct PartyDetailsOrigin {
@@ -397,6 +448,7 @@ struct ContentView: View {
     @State private var playbackCurrentEpisode: NuvioVideo?
     @State private var playbackIsActionPlaybackSession = false
     @State private var playbackOrigin: PlaybackOrigin = .main
+    @State private var playbackLibraryWatchedContext: LibraryWatchedContext?
     @State private var playbackFilename: String?
     @State private var playbackSourceID: String?
     @State private var playbackVideoSize: Int64?
@@ -407,8 +459,10 @@ struct ContentView: View {
     @State private var playbackDidStart = false
     @State private var playbackCollectionContext: CollectionPlaybackContext?
     @State private var detailsCollectionContext: CollectionPlaybackContext?
+    @State private var detailsLibraryWatchedContext: LibraryWatchedContext?
     @State private var reopenStreamPickerOnDetails = false
     @State private var reopenStreamPickerEpisode: NuvioVideo?
+    @State private var reopenStreamPickerResumePosition: Double?
     /// Episode to select when Details opens from the calendar.
     @State private var detailsFocusEpisode: DetailsEpisodeFocus?
     /// Title whose liquid-glass quick-actions menu is showing (long-press on a
@@ -429,13 +483,13 @@ struct ContentView: View {
     @State private var continueWatchingPlaybackTask: Task<Void, Never>?
     @State private var pendingDeepLinkURL: URL?
     /// Details title to restore when leaving a production company browse.
-    @State private var productionBrowseReturn: (id: String, type: String)?
+    @State private var productionBrowseReturn: DetailsNavigationEntry?
     /// Details title to restore when leaving a person browse.
-    @State private var personBrowseReturn: (id: String, type: String)?
+    @State private var personBrowseReturn: DetailsNavigationEntry?
     /// Titles to walk back through when Details opened Details ("More like
     /// this"). Empty means the current Details is the root of its chain and back
     /// belongs to its recorded return destination.
-    @State private var detailsBackStack: [(id: String, type: String)] = []
+    @State private var detailsBackStack: [DetailsNavigationEntry] = []
     @State private var nextDetailsPlaybackRequestID: UInt = 0
     @State private var pendingDetailsPlaybackRequestID: UInt?
     @State private var presentedAppNoticeDetails: AppNotice?
@@ -1016,8 +1070,10 @@ struct ContentView: View {
             withAnimation(.easeInOut(duration: 0.24)) {
                 if let ret = productionBrowseReturn {
                     activeScreen = .details(id: ret.id, type: ret.type)
+                    detailsLibraryWatchedContext = DetailsNavigationContextTransition.restoring(ret)
                 } else {
                     activeScreen = .main
+                    detailsLibraryWatchedContext = nil
                 }
                 productionBrowseReturn = nil
             }
@@ -1025,8 +1081,10 @@ struct ContentView: View {
             withAnimation(.easeInOut(duration: 0.24)) {
                 if let ret = personBrowseReturn {
                     activeScreen = .details(id: ret.id, type: ret.type)
+                    detailsLibraryWatchedContext = DetailsNavigationContextTransition.restoring(ret)
                 } else {
                     activeScreen = .main
+                    detailsLibraryWatchedContext = nil
                 }
                 personBrowseReturn = nil
             }
@@ -1045,6 +1103,7 @@ struct ContentView: View {
         withAnimation(.easeInOut(duration: 0.24)) {
             if let previous = detailsBackStack.popLast() {
                 activeScreen = .details(id: previous.id, type: previous.type)
+                detailsLibraryWatchedContext = DetailsNavigationContextTransition.restoring(previous)
             } else {
                 switch detailsReturnDestination {
                 case .main:
@@ -1053,6 +1112,7 @@ struct ContentView: View {
                     activeScreen = .collectionFolder(folder, collectionTitle: collectionTitle)
                 }
                 detailsReturnDestination = .main
+                detailsLibraryWatchedContext = nil
             }
         }
     }
@@ -1066,7 +1126,8 @@ struct ContentView: View {
         returnDestination: DetailsReturnDestination = .main,
         startPlayback: Bool = false,
         collectionContext: CollectionPlaybackContext? = nil,
-        focusEpisode: DetailsEpisodeFocus? = nil
+        focusEpisode: DetailsEpisodeFocus? = nil,
+        libraryWatchedContext: LibraryWatchedContext? = nil
     ) {
         TVHomeDebugTrace.log(
             "details.open.root id=\(id) type=\(type) returnDest=\(returnDestination)"
@@ -1074,12 +1135,14 @@ struct ContentView: View {
         detailsBackStack.removeAll()
         detailsCollectionContext = collectionContext
         detailsFocusEpisode = focusEpisode
+        detailsLibraryWatchedContext = libraryWatchedContext
         detailsReturnDestination = returnDestination
         if startPlayback {
             nextDetailsPlaybackRequestID &+= 1
             pendingDetailsPlaybackRequestID = nextDetailsPlaybackRequestID
             reopenStreamPickerOnDetails = false
             reopenStreamPickerEpisode = nil
+            reopenStreamPickerResumePosition = nil
         } else {
             pendingDetailsPlaybackRequestID = nil
         }
@@ -1489,7 +1552,9 @@ struct ContentView: View {
             )
         }
         guard !WatchedStore.contains(meta: meta) else { return nil }
-        return ContinueWatchingStore.item(for: meta.id)?.resumePosition
+        return ContinueWatchingStore.item(for: meta)?.resumePosition
+            ?? ContinueWatchingStore.item(for: meta.id)?.resumePosition
+            ?? ContinueWatchingStore.resumePosition(for: meta, season: nil, episode: nil)
     }
 
     private static func seasonSortKey(_ season: Int) -> Int {
@@ -1536,6 +1601,7 @@ struct ContentView: View {
                 metaId: item.meta.id,
                 season: item.season,
                 episode: item.episode,
+                meta: item.meta,
                 profileId: profileId
             )
         let streamURL = storedStream?.url ?? ""
@@ -1632,6 +1698,9 @@ struct ContentView: View {
                 withAnimation(.easeInOut(duration: 0.28)) {
                     isResolvingContinueWatchingStream = false
                     resolvingContinueWatchingItem = nil
+                    reopenStreamPickerOnDetails = true
+                    reopenStreamPickerEpisode = context.current ?? Self.manualPlaybackEpisode(for: item)
+                    reopenStreamPickerResumePosition = startFromBeginning ? nil : Self.resumePosition(for: item)
                     openDetailsRoot(id: item.meta.id, type: item.meta.type, collectionContext: provenance)
                 }
             }
@@ -1648,6 +1717,7 @@ struct ContentView: View {
             continueWatchingMenuItem = nil
             reopenStreamPickerOnDetails = true
             reopenStreamPickerEpisode = episode
+            reopenStreamPickerResumePosition = Self.resumePosition(for: item)
             openDetailsRoot(
                 id: item.meta.id, type: item.meta.type,
                 collectionContext: collectionContext(id: item.meta.id, type: item.meta.type, resuming: true)
@@ -1905,7 +1975,8 @@ struct ContentView: View {
         watchPartyOwner.message = nil
         let destination = PartyDetailsDestination(
             screen: activeScreen, tab: selectedTab, backStack: detailsBackStack,
-            returnDestination: detailsReturnDestination, collectionContext: detailsCollectionContext
+            returnDestination: detailsReturnDestination, collectionContext: detailsCollectionContext,
+            libraryWatchedContext: detailsLibraryWatchedContext
         )
         let detailsGeneration = detailsDidDisappearGeneration
         partyDetailsOrigin = nil
@@ -1964,10 +2035,12 @@ struct ContentView: View {
         creatingParty = false; choosingPartySource = false
         pendingDetailsPlaybackRequestID = nil
         reopenStreamPickerOnDetails = false
+        reopenStreamPickerResumePosition = nil
         reopenStreamPickerEpisode = nil
         detailsBackStack = origin.destination.backStack
         detailsReturnDestination = origin.destination.returnDestination
         detailsCollectionContext = origin.destination.collectionContext
+        detailsLibraryWatchedContext = origin.destination.libraryWatchedContext
         selectedTab = origin.destination.tab
         withAnimation(.easeInOut(duration: 0.24)) {
             activeScreen = origin.destination.screen
@@ -2333,7 +2406,9 @@ struct ContentView: View {
                 playbackIsActionPlaybackSession = false
                 playbackEpisodes = target.meta.isSeries ? (target.meta.videos ?? []) : []
                 playbackCurrentEpisode = target.episode
-                reopenStreamPickerOnDetails = false; reopenStreamPickerEpisode = nil
+                reopenStreamPickerOnDetails = false
+                reopenStreamPickerEpisode = nil
+                reopenStreamPickerResumePosition = nil
                 pendingDetailsPlaybackRequestID = nil
                 let subtitle = target.episode.map { "S\($0.season) · E\($0.episode) · \($0.title)" } ?? ""
                 presentBuiltInPlayer(
@@ -2387,6 +2462,10 @@ struct ContentView: View {
         }
         playbackOrigin = origin
         playbackCollectionContext = collectionContext
+        playbackLibraryWatchedContext = DetailsNavigationContextTransition.playbackContext(
+            origin: origin,
+            currentLibraryWatchedContext: detailsLibraryWatchedContext
+        )
         if origin == .main {
             // Direct Continue Watching playback can return to Details for a
             // series, without calling openDetailsRoot first.
@@ -2607,7 +2686,9 @@ struct ContentView: View {
                                 // Keep the originating Details screen in the
                                 // same navigation chain. Otherwise backing out
                                 // of the selected title falls all the way home.
-                                detailsBackStack.append((id: ret.id, type: ret.type))
+                                let transition = DetailsNavigationContextTransition.openingRelatedTitle(from: ret)
+                                detailsBackStack.append(transition.backStackEntry)
+                                detailsLibraryWatchedContext = transition.activeLibraryWatchedContext
                                 activeScreen = .details(id: title.id, type: title.type)
                             } else {
                                 openDetailsRoot(id: title.id, type: title.type)
@@ -2619,8 +2700,10 @@ struct ContentView: View {
                         withAnimation(.easeInOut(duration: 0.24)) {
                             if let ret = productionBrowseReturn {
                                 activeScreen = .details(id: ret.id, type: ret.type)
+                                detailsLibraryWatchedContext = DetailsNavigationContextTransition.restoring(ret)
                             } else {
                                 activeScreen = .main
+                                detailsLibraryWatchedContext = nil
                             }
                             productionBrowseReturn = nil
                         }
@@ -2642,7 +2725,9 @@ struct ContentView: View {
                                 // Keep the originating Details screen in the
                                 // same navigation chain. Otherwise backing out
                                 // of the selected title falls all the way home.
-                                detailsBackStack.append((id: ret.id, type: ret.type))
+                                let transition = DetailsNavigationContextTransition.openingRelatedTitle(from: ret)
+                                detailsBackStack.append(transition.backStackEntry)
+                                detailsLibraryWatchedContext = transition.activeLibraryWatchedContext
                                 activeScreen = .details(id: title.id, type: title.type)
                             } else {
                                 openDetailsRoot(id: title.id, type: title.type)
@@ -2654,8 +2739,10 @@ struct ContentView: View {
                         withAnimation(.easeInOut(duration: 0.24)) {
                             if let ret = personBrowseReturn {
                                 activeScreen = .details(id: ret.id, type: ret.type)
+                                detailsLibraryWatchedContext = DetailsNavigationContextTransition.restoring(ret)
                             } else {
                                 activeScreen = .main
+                                detailsLibraryWatchedContext = nil
                             }
                             personBrowseReturn = nil
                         }
@@ -2715,6 +2802,7 @@ struct ContentView: View {
                 creatingParty = true; choosingPartySource = false
                 reopenStreamPickerOnDetails = false
                 reopenStreamPickerEpisode = nil
+                reopenStreamPickerResumePosition = nil
                 selectedTab = .search
             },
             onChoosePartySource: { media in
@@ -2818,6 +2906,15 @@ struct ContentView: View {
                     )
                 }
             },
+            onNavigateToLibraryDetails: { contentId, contentType, watchedContext in
+                withAnimation(.easeInOut(duration: 0.28)) {
+                    openDetailsRoot(
+                        id: contentId,
+                        type: contentType,
+                        libraryWatchedContext: watchedContext
+                    )
+                }
+            },
             onPlayTitle: { contentId, contentType in
                 withAnimation(.easeInOut(duration: 0.28)) {
                     openDetailsRoot(
@@ -2896,7 +2993,8 @@ struct ContentView: View {
                     subtitle: "",
                     externalSubtitles: [],
                     resumeFrom: nil,
-                    origin: .cloudLibrary
+                    origin: .cloudLibrary,
+                    filename: meta.name
                 )
             },
             onOpenCalendarEntry: { entry in
@@ -2924,6 +3022,7 @@ struct ContentView: View {
         return DetailsScreen(
             id: contentId,
             type: contentType,
+            libraryWatchedContext: detailsLibraryWatchedContext,
             repository: CinemetaCatalogRepository(),
             initialPlaybackRequestID: pendingDetailsPlaybackRequestID,
             onInitialPlaybackRequestConsumed: { requestID in
@@ -2932,10 +3031,13 @@ struct ContentView: View {
             },
             initiallyPresentStreamPicker: reopenStreamPickerOnDetails,
             initialStreamPickerEpisode: reopenStreamPickerEpisode,
+            initialStreamPickerResumePosition: reopenStreamPickerResumePosition,
             initialFocusEpisode: detailsFocusEpisode.flatMap { $0.metaID == contentId ? $0 : nil },
             onInitialStreamPickerPresented: {
                 reopenStreamPickerOnDetails = false
                 reopenStreamPickerEpisode = nil
+                reopenStreamPickerResumePosition = nil
+                reopenStreamPickerResumePosition = nil
             },
             onWatchPartyMovieReady: { meta in
                 guard creatingParty, !meta.isSeries else { return }
@@ -2950,7 +3052,9 @@ struct ContentView: View {
                 if let url = URL(string: streamUrlString) {
                     let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
                     reopenStreamPickerOnDetails = false
+        reopenStreamPickerResumePosition = nil
                     reopenStreamPickerEpisode = nil
+                    reopenStreamPickerResumePosition = nil
                     playbackEpisodes = episodes
                     playbackCurrentEpisode = currentEpisode
                     presentPlayback(
@@ -2980,19 +3084,33 @@ struct ContentView: View {
                 createWatchPartyFromDetails(meta: meta, episode: episode)
             } : nil,
             onOpenTitle: { nextId, nextType in
-                detailsBackStack.append((id: contentId, type: contentType))
+                let transition = DetailsNavigationContextTransition.pushingCurrentDetails(
+                    id: contentId,
+                    type: contentType,
+                    libraryWatchedContext: detailsLibraryWatchedContext
+                )
+                detailsBackStack.append(transition.backStackEntry)
+                detailsLibraryWatchedContext = transition.activeLibraryWatchedContext
                 withAnimation(.easeInOut(duration: 0.28)) {
                     activeScreen = .details(id: nextId, type: nextType)
                 }
             },
             onOpenProduction: { company in
-                productionBrowseReturn = (contentId, contentType)
+                productionBrowseReturn = DetailsNavigationEntry(
+                    id: contentId,
+                    type: contentType,
+                    libraryWatchedContext: detailsLibraryWatchedContext
+                )
                 withAnimation(.easeInOut(duration: 0.28)) {
                     activeScreen = .productionBrowse(company)
                 }
             },
             onOpenPerson: { person in
-                personBrowseReturn = (contentId, contentType)
+                personBrowseReturn = DetailsNavigationEntry(
+                    id: contentId,
+                    type: contentType,
+                    libraryWatchedContext: detailsLibraryWatchedContext
+                )
                 withAnimation(.easeInOut(duration: 0.28)) {
                     activeScreen = .personBrowse(person)
                 }
@@ -3017,7 +3135,8 @@ struct ContentView: View {
                     subtitle: "",
                     externalSubtitles: [],
                     resumeFrom: nil,
-                    origin: .cloudLibrary
+                    origin: .cloudLibrary,
+                    filename: meta.name
                 )
             },
             onBack: {
@@ -3151,6 +3270,8 @@ struct ContentView: View {
             if candidate.isDebridResolvable {
                 PlaybackStartupTiming.markSourcePicked(stream: candidate, token: startupToken)
                 var resolvedURL: URL? = nil
+                var resolvedFilename = candidate.filename
+                var resolvedVideoSize = candidate.videoSize
                 var providerName = debrid.selectedKind.rawValue
                 if debrid.isEnabled {
                     let result = await debrid.resolvedURL(
@@ -3158,8 +3279,10 @@ struct ContentView: View {
                         season: season,
                         episode: episode
                     )
-                    if case let .success(url, _, _)? = result {
+                    if case let .success(url, filename, videoSize)? = result {
                         resolvedURL = url
+                        resolvedFilename = filename ?? candidate.filename
+                        resolvedVideoSize = videoSize ?? candidate.videoSize
                     } else if case .rateLimited? = result {
                         print("[NuvioTVApp] Debrid provider \(providerName) rate-limited (HTTP 429); halting candidate sweep.")
                         break
@@ -3198,9 +3321,9 @@ struct ContentView: View {
                     subtitles: candidate.subtitles,
                     streamName: candidate.name,
                     streamDescription: candidate.description,
-                    filename: candidate.filename,
+                    filename: resolvedFilename,
                     addonName: candidate.addonName,
-                    videoSize: candidate.videoSize,
+                    videoSize: resolvedVideoSize,
                     videoHash: candidate.videoHash,
                     provider: providerName,
                     bingeGroup: candidate.bingeGroup ?? StreamQualityTags.syntheticBingeGroup(for: candidate),
@@ -3335,6 +3458,8 @@ struct ContentView: View {
 
         if stream.isDebridResolvable {
             var resolvedURL: URL? = nil
+            var resolvedFilename = stream.filename
+            var resolvedVideoSize = stream.videoSize
             var providerName = debrid.selectedKind.rawValue
             if debrid.isEnabled {
                 let result = await debrid.resolvedURL(
@@ -3342,8 +3467,10 @@ struct ContentView: View {
                     season: season,
                     episode: episode
                 )
-                if case let .success(url, _, _)? = result {
+                if case let .success(url, filename, videoSize)? = result {
                     resolvedURL = url
+                    resolvedFilename = filename ?? stream.filename
+                    resolvedVideoSize = videoSize ?? stream.videoSize
                 } else if case .rateLimited? = result {
                     print("[NuvioTVApp] Debrid provider \(providerName) rate-limited (HTTP 429) for stream.")
                     return nil
@@ -3381,9 +3508,9 @@ struct ContentView: View {
                 subtitles: stream.subtitles,
                 streamName: stream.name,
                 streamDescription: stream.description,
-                filename: stream.filename,
+                filename: resolvedFilename,
                 addonName: stream.addonName,
-                videoSize: stream.videoSize,
+                videoSize: resolvedVideoSize,
                 videoHash: stream.videoHash,
                 provider: providerName,
                 bingeGroup: bingeGroup,
@@ -3619,7 +3746,12 @@ struct ContentView: View {
                 withAnimation(.easeInOut(duration: 0.28)) {
                     reopenStreamPickerOnDetails = true
                     reopenStreamPickerEpisode = playbackCurrentEpisode
-                    openDetailsRoot(id: meta.id, type: meta.type, collectionContext: provenance)
+                    openDetailsRoot(
+                        id: meta.id,
+                        type: meta.type,
+                        collectionContext: provenance,
+                        libraryWatchedContext: playbackLibraryWatchedContext
+                    )
                 }
             },
             onFinished: isActionPlaybackSession ? {
@@ -3727,12 +3859,15 @@ struct ContentView: View {
                 reopenStreamPickerEpisode = reopenStreamPickerOnDetails ? playbackCurrentEpisode : nil
                 activeScreen = .details(id: meta.id, type: meta.type)
             case .cloudLibrary:
+                detailsLibraryWatchedContext = nil
                 activeScreen = .cloudLibrary
             case .main:
+                detailsLibraryWatchedContext = nil
                 activeScreen = (isTrailer || isActionPlaybackSession || meta.isSeries)
                     ? .details(id: meta.id, type: meta.type)
                     : .main
             }
+            playbackLibraryWatchedContext = nil
         }
     }
 }
@@ -4143,6 +4278,7 @@ private struct TVMainTabView: View {
     let onSignIn: () -> Void
     let onSignOut: () -> Void
     let onNavigateToDetails: (String, String) -> Void
+    var onNavigateToLibraryDetails: ((String, String, LibraryWatchedContext) -> Void)? = nil
     let onPlayTitle: (String, String) -> Void
     let onRequestAccountRefresh: (Bool) -> Void
     let onOpenCollectionFolder: (TVCollectionFolderItem, String) -> Void
@@ -4313,6 +4449,15 @@ private struct TVMainTabView: View {
             viewModel: libraryViewModel,
             store: ProfileSettings.store(for: activeProfile?.id),
             onContentClick: onNavigateToDetails,
+            onLibraryContentClick: { contentId, contentType, watchedContext in
+                if let onNavigateToLibraryDetails {
+                    onNavigateToLibraryDetails(contentId, contentType, watchedContext)
+                } else {
+                    withAnimation(.easeInOut(duration: 0.28)) {
+                        onNavigateToDetails(contentId, contentType)
+                    }
+                }
+            },
             onLongPress: onLongPressCard,
             onOpenCloudLibrary: onOpenCloudLibrary,
             onPlayCloudFile: onPlayCloudFile
@@ -9040,7 +9185,14 @@ struct TVHomeView: View {
         print("[ContinueWatching][Home] refreshContinueWatchingFromSelectedSource: fetching from remote provider \(source.rawValue)")
         let items = await TraktProgressService.fetchContinueWatching(
             repository: repository,
-            source: source
+            source: source,
+            displayPredicate: shouldDisplayContinueWatchingItem,
+            displaySort: { items in
+                TraktProgressService.sortContinueWatchingForDisplaySelection(
+                    items,
+                    preference: continueWatchingSort
+                )
+            }
         )
         guard !Task.isCancelled else {
             return
@@ -10360,6 +10512,172 @@ private actor TVHomeCatalogSnapshotWriter {
     }
 }
 
+/// Section identifier for custom ordering on the Details screen.
+enum TVDetailsSection: String, CaseIterable, Identifiable, Codable {
+    case episodes
+    case cast
+    case related
+    case network
+    case production
+    case comments
+
+    var id: String { rawValue }
+
+    init?(caseInsensitive: String) {
+        let normalized = caseInsensitive.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch normalized {
+        case "episodes":
+            self = .episodes
+        case "cast":
+            self = .cast
+        case "more_like_this", "morelikethis", "related":
+            self = .related
+        case "network", "networks":
+            self = .network
+        case "production", "companies":
+            self = .production
+        case "comments":
+            self = .comments
+        default:
+            return nil
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .episodes:
+            return L10n.string("settings_meta_episodes", fallback: "Episodes")
+        case .cast:
+            return L10n.string("details_creator_and_cast", fallback: "Cast & Crew")
+        case .related:
+            return L10n.string("settings_tmdb_module_more_like_this", fallback: "More Like This")
+        case .network:
+            return L10n.string("details_network", fallback: "Networks")
+        case .production:
+            return L10n.string("details_production", fallback: "Production")
+        case .comments:
+            return L10n.string("details_comments", fallback: "Comments")
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .episodes:
+            return L10n.string("tvos_settings_details_section_episodes_subtitle", fallback: "Season selector and episode cards")
+        case .cast:
+            return L10n.string("tvos_settings_details_section_cast_subtitle", fallback: "Creators, actors, and trailer button")
+        case .related:
+            return L10n.string("tvos_settings_details_section_related_subtitle", fallback: "Similar and recommended titles")
+        case .network:
+            return L10n.string("tvos_settings_details_section_network_subtitle", fallback: "Broadcast and streaming networks")
+        case .production:
+            return L10n.string("tvos_settings_details_section_production_subtitle", fallback: "Production companies and studios")
+        case .comments:
+            return L10n.string("tvos_settings_details_section_comments_subtitle", fallback: "Trakt reviews and viewer comments")
+        }
+    }
+}
+
+/// User-controlled ordering and visibility of sections on the Details screen (Settings → Layout → Details Sections).
+enum TVDetailsSectionOrder {
+    static let changedNotification = Notification.Name("nuvio.tv.detailsSectionOrder.changed")
+    static let defaultOrder: [TVDetailsSection] = [.episodes, .cast, .related, .network, .production, .comments]
+
+    static func currentOrder(in settings: UserDefaults = ProfileSettings.current) -> [TVDetailsSection] {
+        var result: [TVDetailsSection] = []
+        var seen = Set<TVDetailsSection>()
+
+        if let data = settings.data(forKey: SettingsKey.detailsSectionOrder),
+           let rawKeys = try? JSONDecoder().decode([String].self, from: data) {
+            for raw in rawKeys {
+                if let section = TVDetailsSection(caseInsensitive: raw), seen.insert(section).inserted {
+                    result.append(section)
+                }
+            }
+        }
+
+        // Append any default sections not present in saved order to preserve forward compatibility
+        for section in defaultOrder {
+            if seen.insert(section).inserted {
+                result.append(section)
+            }
+        }
+        return result
+    }
+
+    static func disabledSections(in settings: UserDefaults = ProfileSettings.current) -> Set<TVDetailsSection> {
+        guard let data = settings.data(forKey: SettingsKey.detailsSectionDisabled),
+              let rawKeys = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        var disabled = Set<TVDetailsSection>()
+        for raw in rawKeys {
+            if let section = TVDetailsSection(caseInsensitive: raw) {
+                disabled.insert(section)
+            }
+        }
+        return disabled
+    }
+
+    static func isSectionEnabled(_ section: TVDetailsSection, in settings: UserDefaults = ProfileSettings.current) -> Bool {
+        !disabledSections(in: settings).contains(section)
+    }
+
+    static func activeSections(in settings: UserDefaults = ProfileSettings.current) -> [TVDetailsSection] {
+        let disabled = disabledSections(in: settings)
+        return currentOrder(in: settings).filter { !disabled.contains($0) }
+    }
+
+    static func activeSectionCount(in settings: UserDefaults = ProfileSettings.current) -> Int {
+        activeSections(in: settings).count
+    }
+
+    static func setSectionEnabled(_ section: TVDetailsSection, isEnabled: Bool, in settings: UserDefaults = ProfileSettings.current) {
+        var disabled = disabledSections(in: settings)
+        if isEnabled {
+            disabled.remove(section)
+        } else {
+            disabled.insert(section)
+        }
+        let rawKeys = disabled.map(\.rawValue).sorted()
+        if let data = try? JSONEncoder().encode(rawKeys) {
+            settings.set(data, forKey: SettingsKey.detailsSectionDisabled)
+        }
+        notifyChange()
+    }
+
+    static func saveOrder(_ order: [TVDetailsSection], in settings: UserDefaults = ProfileSettings.current) {
+        var seen = Set<TVDetailsSection>()
+        var normalized: [TVDetailsSection] = []
+        for section in order {
+            if seen.insert(section).inserted {
+                normalized.append(section)
+            }
+        }
+        for section in defaultOrder {
+            if seen.insert(section).inserted {
+                normalized.append(section)
+            }
+        }
+        let rawKeys = normalized.map(\.rawValue)
+        if let data = try? JSONEncoder().encode(rawKeys) {
+            settings.set(data, forKey: SettingsKey.detailsSectionOrder)
+        }
+        notifyChange()
+    }
+
+    static func resetToDefaults(in settings: UserDefaults = ProfileSettings.current) {
+        settings.removeObject(forKey: SettingsKey.detailsSectionOrder)
+        settings.removeObject(forKey: SettingsKey.detailsSectionDisabled)
+        notifyChange()
+    }
+
+    private static func notifyChange() {
+        ProfileSettings.notifySettingsChanged()
+        NotificationCenter.default.post(name: changedNotification, object: nil)
+    }
+}
+
 /// Keeps catalogs used only inside synced collection folders out of top-level
 /// Home rows. Inputs are explicit so the matching rule remains deterministic.
 enum CatalogHomeVisibilityResolver {
@@ -11322,7 +11640,7 @@ private struct TVGridHeroSlideshowView: View {
         if RemoteTrackingState.isProgressSourceAuthenticated {
             return TraktProgressService.currentContinueWatchingItem(for: meta)
         }
-        return ContinueWatchingStore.item(for: meta.id)
+        return ContinueWatchingStore.item(for: meta) ?? ContinueWatchingStore.item(for: meta.id)
     }
 
     private func refreshHeroPlayTargetFromCurrentData() {
