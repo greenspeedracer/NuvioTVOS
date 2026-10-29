@@ -173,10 +173,10 @@ jobs:
         run: |
           python3 - <<'PY'
           import sys
- 
+
           base = "tvosApp/NuvioTV/Sources/"
- 
- 
+
+
           def patch(path, edits):
               p = base + path
               s = open(p).read()
@@ -185,18 +185,18 @@ jobs:
                   s = s.replace(old, new)
               open(p, "w").write(s)
               print("patched", p)
- 
- 
+
+
           labels_enum = r'''enum StreamSourceLabels {
               struct Entry {
                   let streamName: String?
                   let addonName: String?
               }
- 
+
               private static let lock = NSLock()
               private static var labels: [String: Entry] = [:]
               private static let maxEntries = 800
- 
+
               static func flattened(_ value: String?) -> String? {
                   guard let value else { return nil }
                   let text = value
@@ -205,7 +205,7 @@ jobs:
                       .joined(separator: " ")
                   return text.isEmpty ? nil : text
               }
- 
+
               static func record(_ stream: NuvioStream) {
                   guard let addon = flattened(stream.addonName) else { return }
                   let id = stream.id
@@ -217,7 +217,7 @@ jobs:
                   }
                   labels[id] = label
               }
- 
+
               static func label(for id: String?) -> Entry? {
                   guard let id, !id.isEmpty else { return nil }
                   lock.lock()
@@ -225,9 +225,9 @@ jobs:
                   return labels[id]
               }
           }
- 
+
           '''
- 
+
           patch("Core/Streams/StreamQualityTags.swift", [
               (
                   "/// Profile-scoped memory of the exact playable link",
@@ -246,58 +246,66 @@ jobs:
                   "            episode: episode,\n            savedAt: savedAt,\n            streamName: streamName,\n            addonName: addonName\n        )\n",
               ),
               (
-                  "        var records = loadRecords(profileId: profileId)\n        records[trimmedMetaId] = record\n        persistRecords(records, profileId: profileId)\n",
+                  "        var records = loadRecords(profileId: profileId)\n        let keys = candidateKeys(for: trimmedMetaId, meta: meta)\n        for key in keys {\n            records[key] = record\n        }\n        persistRecords(records, profileId: profileId)\n",
                   """        var records = loadRecords(profileId: profileId)
-                  var merged = record
-                  if streamName == nil, addonName == nil,
-                     let existing = records[trimmedMetaId], existing.url == cleanUrl {
-                      merged = Record(
-                          url: record.url,
-                          httpHeaders: record.httpHeaders,
-                          season: record.season,
-                          episode: record.episode,
-                          savedAt: record.savedAt,
-                          streamName: existing.streamName,
-                          addonName: existing.addonName
-                      )
+                  let keys = candidateKeys(for: trimmedMetaId, meta: meta)
+                  for key in keys {
+                      var merged = record
+                      if streamName == nil, addonName == nil,
+                         let existing = records[key], existing.url == cleanUrl {
+                          merged = Record(
+                              url: record.url,
+                              httpHeaders: record.httpHeaders,
+                              season: record.season,
+                              episode: record.episode,
+                              savedAt: record.savedAt,
+                              streamName: existing.streamName,
+                              addonName: existing.addonName
+                          )
+                      }
+                      records[key] = merged
                   }
-                  records[trimmedMetaId] = merged
                   persistRecords(records, profileId: profileId)
           """,
               ),
               (
-                  "    static func remove(\n        metaId: String,\n        season: Int? = nil,\n        episode: Int? = nil,\n        profileId: String? = nil\n    ) {\n",
+                  "    static func remove(\n        metaId: String,\n        season: Int? = nil,\n        episode: Int? = nil,\n        meta: NuvioMeta? = nil,\n        profileId: String? = nil\n    ) {\n",
                   """    static func labels(
                   metaId: String,
                   season: Int?,
                   episode: Int?,
                   url: String,
+                  meta: NuvioMeta? = nil,
                   profileId: String? = nil
               ) -> (streamName: String?, addonName: String?)? {
                   let trimmedMetaId = metaId.trimmingCharacters(in: .whitespacesAndNewlines)
                   guard !trimmedMetaId.isEmpty else { return nil }
- 
+
                   lock.lock()
                   defer { lock.unlock() }
- 
-                  guard let record = loadRecords(profileId: profileId)[trimmedMetaId],
-                        record.season == season,
-                        record.episode == episode,
-                        record.url == url,
-                        record.streamName != nil || record.addonName != nil else { return nil }
-                  return (record.streamName, record.addonName)
+
+                  let records = loadRecords(profileId: profileId)
+                  for key in candidateKeys(for: trimmedMetaId, meta: meta) {
+                      guard let record = records[key],
+                            matchesEpisode(recordSeason: record.season, recordEpisode: record.episode, requestedSeason: season, requestedEpisode: episode),
+                            record.url == url,
+                            record.streamName != nil || record.addonName != nil else { continue }
+                      return (record.streamName, record.addonName)
+                  }
+                  return nil
               }
- 
+
               static func remove(
                   metaId: String,
                   season: Int? = nil,
                   episode: Int? = nil,
+                  meta: NuvioMeta? = nil,
                   profileId: String? = nil
               ) {
           """,
               ),
           ])
- 
+
           patch("Data/Repository/StreamsRepository.swift", [
               (
                   "        return NuvioStream(\n            url: parsed.directURL,\n            name: displayName,\n",
@@ -308,7 +316,7 @@ jobs:
                   "            notPlayable: isNotPlayable ? true : nil\n        )\n        StreamSourceLabels.record(stream)\n        return stream\n    }\n",
               ),
           ])
- 
+
           vm_methods = r'''    var sourceNameLine: String? {
                   let parts = [
                       StreamSourceLabels.flattened(sourceLabelAddon),
@@ -316,7 +324,7 @@ jobs:
                   ].compactMap { $0 }
                   return parts.isEmpty ? nil : parts.joined(separator: "  •  ")
               }
- 
+
               private func resolveSourceLabels(url: URL, meta: NuvioMeta, episode: NuvioVideo?, sourceID: String?) {
                   sourceMeasuredLine = nil
                   if let label = StreamSourceLabels.label(for: sourceID) {
@@ -329,6 +337,7 @@ jobs:
                       season: episode?.season,
                       episode: episode?.episode,
                       url: url.absoluteString,
+                      meta: meta,
                       profileId: WatchedStore.activeProfileId
                   ) {
                       sourceLabelStream = stored.streamName
@@ -338,7 +347,7 @@ jobs:
                   sourceLabelStream = nil
                   sourceLabelAddon = nil
               }
- 
+
               private func refreshSourceMeasuredLine() {
                   let info = engine.playbackDebugInfo
                   var parts: [String] = []
@@ -356,7 +365,7 @@ jobs:
                   }
                   sourceMeasuredLine = parts.isEmpty ? nil : parts.joined(separator: "  •  ")
               }
- 
+
               private static func sourceResolutionText(_ value: String) -> String? {
                   let dims = value
                       .components(separatedBy: "×")
@@ -371,12 +380,12 @@ jobs:
                   default: return "\(dims[1])p"
                   }
               }
- 
+
               private static func sourceCodecText(_ value: String) -> String? {
                   let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
                   return text.isEmpty || text == "Unknown" ? nil : text
               }
- 
+
               private static func sourceRangeText(_ value: String) -> String? {
                   let source = value
                       .components(separatedBy: " → ")
@@ -385,16 +394,16 @@ jobs:
                   if source.isEmpty { return nil }
                   return source == "HDR10/PQ" ? "HDR10" : source
               }
- 
+
               private static func sourceAverageBitrateText(_ value: String) -> String? {
                   guard let regex = try? NSRegularExpression(pattern: #"avg mux ([0-9]+(?:\.[0-9]+)?) Mbit/s"#),
                         let match = regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)),
                         let range = Range(match.range(at: 1), in: value) else { return nil }
                   return "\(value[range]) Mbps"
               }
- 
+
           '''
- 
+
           patch("ViewModels/PlayerViewModel.swift", [
               (
                   "    private var activeAddonName: String?\n    private var activeProviderName: String?\n",
@@ -413,8 +422,8 @@ jobs:
                   "                schedulePauseOverlay()\n                saveProgress(force: true, eventAction: .pause)\n                refreshSourceMeasuredLine()\n            }\n",
               ),
               (
-                  "                episode: episode,\n                profileId: WatchedStore.activeProfileId\n            )\n        } else if completesPlayback {\n",
-                  "                episode: episode,\n                profileId: WatchedStore.activeProfileId,\n                streamName: sourceLabelStream,\n                addonName: sourceLabelAddon\n            )\n        } else if completesPlayback {\n",
+                  "                episode: episode,\n                meta: activeMeta,\n                profileId: WatchedStore.activeProfileId\n            )\n        } else if completesPlayback {\n",
+                  "                episode: episode,\n                meta: activeMeta,\n                profileId: WatchedStore.activeProfileId,\n                streamName: sourceLabelStream,\n                addonName: sourceLabelAddon\n            )\n        } else if completesPlayback {\n",
               ),
               (
                   "        showPauseOverlay = false\n        // Show progress bar and transport controls when paused\n        showControls = true\n",
@@ -425,7 +434,7 @@ jobs:
                   vm_methods + "    func isCurrentSource(_ stream: NuvioStream) -> Bool {\n",
               ),
           ])
- 
+
           controls_old = """                            if !viewModel.subtitle.isEmpty {
                                           Text(viewModel.subtitle)
                                               .font(.system(size: 21, weight: .medium))
