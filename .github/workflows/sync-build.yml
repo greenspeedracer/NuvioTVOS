@@ -65,7 +65,7 @@ jobs:
           repository: 'bobsupra/NuvioTVOS'
           ref: ${{ steps.get_tag.outputs.target_tag }}
           submodules: recursive
-      
+
       - name: Show source info on the paused controls
         if: steps.get_tag.outputs.should_build == 'true'
         run: |
@@ -333,31 +333,32 @@ jobs:
               ),
           ])
 
-          controls_old = """                            if !viewModel.subtitle.isEmpty {
-                                          Text(viewModel.subtitle)
-                                              .font(.system(size: 21, weight: .medium))
-                                              .foregroundColor(.white.opacity(0.68))
-                                              .lineLimit(1)
-                                      }
+          controls_old = """            if let subtitle = playbackSubtitle {
+                          Text(subtitle)
+                              .font(.system(size: 21, weight: .medium))
+                              .foregroundColor(.white.opacity(0.76))
+                              .lineLimit(1)
+                      }
           """
           controls_new = controls_old + """
-                                      if viewModel.status == .paused {
-                                          if let line = viewModel.sourceNameLine {
-                                              Text(line)
-                                                  .font(.system(size: 21, weight: .medium))
-                                                  .foregroundColor(.white.opacity(0.68))
-                                                  .lineLimit(1)
-                                          }
-                                          if let line = viewModel.sourceMeasuredLine {
-                                              Text(line)
-                                                  .font(.system(size: 21, weight: .medium))
-                                                  .foregroundColor(.white.opacity(0.68))
-                                                  .lineLimit(1)
-                                          }
-                                      }
+                      if viewModel.status == .paused {
+                          if let line = viewModel.sourceNameLine {
+                              Text(line)
+                                  .font(.system(size: 21, weight: .medium))
+                                  .foregroundColor(.white.opacity(0.76))
+                                  .lineLimit(1)
+                          }
+                          if let line = viewModel.sourceMeasuredLine {
+                              Text(line)
+                                  .font(.system(size: 21, weight: .medium))
+                                  .foregroundColor(.white.opacity(0.76))
+                                  .lineLimit(1)
+                          }
+                      }
           """
           patch("UI/Player/PlayerControls.swift", [(controls_old, controls_new)])
           PY
+
 
       - name: Show Xcode version
         if: steps.get_tag.outputs.should_build == 'true'
