@@ -289,6 +289,8 @@ enum SettingsKey {
 
     static let trueHDSpatialAudio = "nuvio.tv.settings.playback.trueHDSpatialAudio"
     static let preferDualLayerDolbyVision = "nuvio.tv.settings.playback.preferDualLayerDolbyVision"
+    static let lowResUpscaling = "nuvio.tv.settings.playback.lowResUpscaling"
+    static let losslessAudioBridge = "nuvio.tv.settings.playback.losslessAudioBridge"
     static let playerEngine = "nuvio.tv.settings.playback.playerEngine"
     static let trickplayServer = "nuvio.tv.settings.playback.trickplayServer"
     static let externalPlayer = "nuvio.tv.settings.playback.externalPlayer"
@@ -343,7 +345,25 @@ enum SettingsKey {
     static let playerShowSources = "nuvio.tv.settings.playback.showSources"
     static let playerShowSubtitles = "nuvio.tv.settings.playback.showSubtitles"
     static let playerShowAudio = "nuvio.tv.settings.playback.showAudio"
+    /// JSON `[String]` of player transport button ids in preferred order.
+    static let playerButtonOrder = "nuvio.tv.settings.playback.playerButtonOrder"
+    /// JSON `[String]` of InSight tab ids in preferred order.
+    static let sceneTabOrder = "nuvio.tv.settings.playback.sceneTabOrder"
+    /// JSON `[String]` of InSight tab ids hidden from the panel.
+    static let sceneTabDisabled = "nuvio.tv.settings.playback.sceneTabDisabled"
     static let seekPreviewEnabled = "nuvio.tv.settings.playback.seekPreviewEnabled"
+    static let seekPreviewBeyondBuffer = "nuvio.tv.settings.playback.seekPreviewBeyondBuffer"
+    /// Seekr (seekr.tv) API key for seek previews; kept in the Nuvio account like the other settings.
+    static let seekrApiKey = "nuvio.tv.settings.playback.seekrApiKey"
+    /// Whether Seekr is asked at all (on by default); the key stays saved while it is off.
+    static let seekrEnabled = "nuvio.tv.settings.playback.seekrEnabled"
+    /// The opening's and the ending's color on the timeline ("#RRGGBB", see `PlaybackChapters.colorChoices`).
+    static let timelineOpeningColor = "nuvio.tv.settings.playback.timelineOpeningColor"
+    static let timelineEndingColor = "nuvio.tv.settings.playback.timelineEndingColor"
+    /// Whether the opening and the ending are colored on the timeline (off by default).
+    static let timelineSegmentsEnabled = "nuvio.tv.settings.playback.timelineSegmentsEnabled"
+    /// Legacy preference retained for compatibility; seeking snap is always enabled.
+    static let timelineSnapEnabled = "nuvio.tv.settings.playback.timelineSnapEnabled"
     static let showLoadingStatus = "nuvio.tv.settings.playback.showLoadingStatus"
     static let audioDelayPersistEnabled = "nuvio.tv.settings.playback.audioDelayPersistEnabled"
     static let persistentAudioDelayMs = "nuvio.tv.settings.playback.persistentAudioDelayMs"
@@ -405,7 +425,7 @@ enum SettingsKey {
         cinemetaDisabled, deletedLocalAddons,
         smbServers, smbLibraryIndex, smbLocalRowEnabled,
         jellyfinServers, jellyfinLibraryIndex, jellyfinLocalRowEnabled,
-        playerEngine, trueHDSpatialAudio, preferDualLayerDolbyVision, trickplayServer, externalPlayer, smartStreamSelection, reuseLastLink, reuseLastLinkCacheHours, rememberLastSourceFocus, smartStreamUseTopResult, smartStreamQuality, smartSubtitleMatching,
+        playerEngine, trueHDSpatialAudio, preferDualLayerDolbyVision, lowResUpscaling, losslessAudioBridge, trickplayServer, externalPlayer, smartStreamSelection, reuseLastLink, reuseLastLinkCacheHours, rememberLastSourceFocus, smartStreamUseTopResult, smartStreamQuality, smartSubtitleMatching,
         backgroundStreamPreFetch,
         cachedOnlyStreams, preferHardwareDecodedStreams, preserveAddonStreamOrder, streamSortOption, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
         autoPlayNext, autoPlayNextCountdown, autoSkipIntro, autoSkipRecap, autoSkipOutro, autoSkipMovieCredits, streamAutoPlayPreferBingeGroup, streamAutoPlayReuseBingeGroup, postPlayRecommendationsEnabled, trailersEnabled, backgroundTrailersEnabled, trailerPreviewSound, trailerDelay,
@@ -413,9 +433,10 @@ enum SettingsKey {
         subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
         forcedSubtitles, subtitleSize, frameRateMatching, networkCache, hybridDiskCacheEnabled, hybridDiskCacheLimitGB, playbackTrackSelections, showAudioLanguages,
         externalPlayerForwardSubtitles, assOverrideMode,
-        playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, seekPreviewEnabled, showLoadingStatus,
+        playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, playerButtonOrder, seekPreviewEnabled, seekPreviewBeyondBuffer, seekrApiKey, seekrEnabled, showLoadingStatus,
+        timelineOpeningColor, timelineEndingColor, timelineSegmentsEnabled, timelineSnapEnabled,
         audioDelayPersistEnabled, persistentAudioDelayMs,
-        sceneFeatureEnabled,
+        sceneFeatureEnabled, sceneTabOrder, sceneTabDisabled,
         fastNavigation, smoothFocus, playbackDiagnostics, playbackDebug, focusHighlighter,
         iCloudSyncEnabled, iCloudLastSyncDate
     ] + SubtitleStyleKey.all
@@ -503,7 +524,9 @@ enum SubtitleStyleDefaults {
     static let textSize = 100        // percent, 5...220
     static let bold = false
     static let verticalAlignment = SubtitleVerticalPosition.bottom.rawValue
-    static let bottomOffset = 20     // 0...160, raises subtitles off the bottom edge
+    static let bottomOffset = 20     // Positive raises bottom-aligned captions; negative lowers them.
+    // Cancel the base 22-point margin at the minimum without moving text offscreen.
+    static let bottomOffsetRange = -22...160
     static let horizontalMargin = 25 // 0...200, left+right inset (mpv default is 25)
     static let letterSpacing = 0     // -8...40, negative squeezes, positive opens the text
     static let textColor = "#FFFFFF"
@@ -560,7 +583,9 @@ struct SubtitleStyle {
             textSize: min(220, max(5, intValue(SubtitleStyleKey.textSize, SubtitleStyleDefaults.textSize))),
             bold: boolValue(SubtitleStyleKey.bold, SubtitleStyleDefaults.bold),
             verticalAlignment: stringValue(SubtitleStyleKey.verticalAlignment, SubtitleStyleDefaults.verticalAlignment),
-            bottomOffset: intValue(SubtitleStyleKey.bottomOffset, SubtitleStyleDefaults.bottomOffset),
+            bottomOffset: min(SubtitleStyleDefaults.bottomOffsetRange.upperBound,
+                              max(SubtitleStyleDefaults.bottomOffsetRange.lowerBound,
+                                  intValue(SubtitleStyleKey.bottomOffset, SubtitleStyleDefaults.bottomOffset))),
             horizontalMargin: intValue(SubtitleStyleKey.horizontalMargin, SubtitleStyleDefaults.horizontalMargin),
             letterSpacing: intValue(SubtitleStyleKey.letterSpacing, SubtitleStyleDefaults.letterSpacing),
             textColorHex: stringValue(SubtitleStyleKey.textColor, SubtitleStyleDefaults.textColor),
@@ -603,8 +628,12 @@ struct SubtitleStyle {
 
     /// `sub-scale` — relative subtitle text size.
     var subScale: Double { min(max(Double(textSize) / 100.0, 0.05), 3.0) }
-    /// `sub-margin-y` — lifts captions off the bottom edge (22 is mpv's default).
-    var subMarginY: Int { 22 + min(max(bottomOffset, 0), 160) }
+    /// Shared vertical margin for mpv and host-rendered captions. Negative
+    /// adjustments reduce the existing 22-point base margin down to zero.
+    var subMarginY: Int {
+        22 + min(max(bottomOffset, SubtitleStyleDefaults.bottomOffsetRange.lowerBound),
+                 SubtitleStyleDefaults.bottomOffsetRange.upperBound)
+    }
     /// `sub-margin-x` — left+right screen inset in scaled pixels.
     var subMarginX: Int { min(max(horizontalMargin, 0), 200) }
     /// `sub-spacing` — extra letter spacing; negative squeezes, positive opens.
@@ -1264,6 +1293,7 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.theme) private var theme = SettingsAccent.white.rawValue
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @AppStorage(SettingsKey.font) private var appFont = "Inter"
     /// BCP-47 app UI language tag; empty string means System default.
     @AppStorage(SettingsKey.language) private var appLanguageTag = ""
     @AppStorage(SettingsKey.audioLanguage) private var audioLanguage = "System"
@@ -1339,6 +1369,9 @@ struct SettingsView: View {
                 // first right-press lands on the first row regardless of which pill
                 // it came from. Cleared once focus enters so re-entry isn't blocked.
                 .environment(\.settingsEntryLocked, focusedCategory != nil && !detailVisited)
+                // Back from a setting returns focus to its selected category;
+                // Back from the category list remains handled by the TabView.
+                .onExitCommand { focusedCategory = selectedCategory }
             }
             .disabled(presentedLanguagePicker != nil || presentedProfilePinMode != nil)
             .allowsHitTesting(presentedLanguagePicker == nil && presentedProfilePinMode == nil)
@@ -2249,6 +2282,7 @@ private struct AppearanceSettingsView: View {
 
     @AppStorage(SettingsKey.theme) private var theme = SettingsAccent.white.rawValue
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @AppStorage(SettingsKey.font) private var appFont = "Inter"
     /// BCP-47 language tag; empty string means System default (matches Android TV).
     @AppStorage(SettingsKey.language) private var languageTag = ""
     @AppStorage(SettingsKey.amoled) private var amoled = false
@@ -2353,14 +2387,7 @@ private struct AppearanceSettingsView: View {
                 }
 
                 if !customPosterURLPattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    ForEach(CustomPosterScreen.allCases.filter { $0 != .tvRecommendations }) { screen in
-                        SettingsToggleRow(
-                            title: "Apply to \(screen.title)",
-                            subtitle: "Use custom poster artwork on \(screen.title.lowercased()) cards.",
-                            isOn: customPosterScreenBinding(for: screen),
-                            accentColor: accentColor
-                        )
-                    }
+                    customPosterScreens
                 }
             }
 
@@ -2407,12 +2434,27 @@ private struct AppearanceSettingsView: View {
             }
 
             SettingsGroup(
-                title: L10n.string("appearance_font_and_language", fallback: "Language"),
+                title: L10n.string("appearance_font_and_language", fallback: "Font and Language"),
                 subtitle: L10n.string(
                     "appearance_font_and_language_subtitle",
-                    fallback: "Choose the locale used throughout the app"
+                    fallback: "Choose the typeface and locale used throughout the app"
                 )
             ) {
+                SettingsChoiceRow(
+                    title: L10n.string("appearance_font", fallback: "App Font"),
+                    subtitle: L10n.string(
+                        "appearance_font_subtitle",
+                        fallback: "Choose your preferred font"
+                    ),
+                    selection: $appFont,
+                    options: AppFont.allCases.map(\.rawValue),
+                    optionLabels: Dictionary(uniqueKeysWithValues: AppFont.allCases.map { ($0.rawValue, $0.displayName) }),
+                    accentColor: accentColor
+                )
+                .onChange(of: appFont) { _, newValue in
+                    AppFontManager.shared.setFont(AppFont.fromStored(newValue), persist: true)
+                }
+
                 // Same SettingsActionRow + LanguagePickerWindow pattern as Preferred Audio.
                 SettingsActionRow(
                     title: L10n.string("appearance_language", fallback: "App Language"),
@@ -2429,6 +2471,10 @@ private struct AppearanceSettingsView: View {
             }
         }
         .onAppear {
+            let resolvedFont = AppFont.fromStored(appFont)
+            if appFont != resolvedFont.rawValue {
+                appFont = resolvedFont.rawValue
+            }
             // Migrate legacy English display names (e.g. "English") to BCP-47 tags.
             let resolved = AppLanguage.fromStored(languageTag)
             if languageTag != resolved.tag {
@@ -2496,6 +2542,19 @@ private struct AppearanceSettingsView: View {
                 customPosterEnabledScreens = CustomPosterScreen.storageValue(for: screens)
             }
         )
+    }
+
+    @ViewBuilder
+    private var customPosterScreens: some View {
+        let screens = CustomPosterScreen.allCases.filter { $0 != .tvRecommendations }
+        ForEach(screens) { screen in
+            SettingsToggleRow(
+                title: "Apply to \(screen.title)",
+                subtitle: "Use custom poster artwork on \(screen.title.lowercased()) cards.",
+                isOn: customPosterScreenBinding(for: screen),
+                accentColor: accentColor
+            )
+        }
     }
 }
 
@@ -3736,6 +3795,8 @@ private struct LayoutDiscoverySettingsView: View {
                     showingDetailsSectionsSettings = true
                 }
             }
+
+            TopShelfSettingsGroup(accentColor: accentColor)
         }
         .task {
             heroRatingSourceOptions = await AddonRatingsService.availableHeroRatingSources()
@@ -3905,6 +3966,283 @@ private struct HeroCatalogSelectionRow: View {
                 && !$0.id.hasPrefix(TVHomeSection.collectionIdPrefix)
                 && TVHomeCatalogOrder.isRowEnabled($0, context: visibility)
         }
+    }
+}
+
+/// What the Apple TV home screen shows for the app when it sits in the top row
+/// of the Dock. Device-wide (one shelf per Apple TV), saved by
+/// `TopShelfConfigurationStore`, which redraws the shelf on every change.
+private struct TopShelfSettingsGroup: View {
+    let accentColor: Color
+    @State private var configuration = TopShelfConfigurationStore.load()
+    @State private var catalogs: [TopShelfFeedRow] = []
+    @State private var backgroundStatus = TopShelfBackgroundRefresh.lastStatus
+
+    private static let styleLabels: [TopShelfConfiguration.Style: (key: String, fallback: String)] = [
+        .carouselDetails: ("tvos_settings_topshelf_style_carousel_details", "Just Carousel"),
+        .rows: ("tvos_settings_topshelf_style_rows", "Landscape Posters"),
+        .posters: ("tvos_settings_topshelf_style_posters", "Posters"),
+    ]
+
+    var body: some View {
+        SettingsGroup(
+            title: L10n.string("tvos_settings_topshelf_group", fallback: "Top Shelf"),
+            subtitle: L10n.string(
+                "tvos_settings_topshelf_group_subtitle",
+                fallback: "What the Apple TV home screen shows when Nuvio is in the top row of the Dock"
+            )
+        ) {
+            if !TopShelfFeedStore.isAvailable {
+                SettingsInfoRow(
+                    title: L10n.string("tvos_settings_topshelf_status", fallback: "Top Shelf"),
+                    value: L10n.string("tvos_settings_topshelf_unavailable", fallback: "Unavailable")
+                )
+            }
+
+            SettingsOptionRow(
+                title: L10n.string("tvos_settings_topshelf_style", fallback: "Style"),
+                subtitle: L10n.string(
+                    "tvos_settings_topshelf_style_subtitle",
+                    fallback: "A full-screen carousel, or rows of cards or posters"
+                ),
+                selection: Binding(
+                    get: { configuration.style.rawValue },
+                    set: { raw in
+                        guard let style = TopShelfConfiguration.Style(rawValue: raw) else { return }
+                        update { $0.style = style }
+                    }
+                ),
+                options: TopShelfConfiguration.Style.allCases.map(\.rawValue),
+                accentColor: accentColor,
+                optionLabel: { raw in
+                    guard let style = TopShelfConfiguration.Style(rawValue: raw),
+                          let label = Self.styleLabels[style] else { return raw }
+                    return L10n.string(label.key, fallback: label.fallback)
+                }
+            )
+
+            if configuration.style.isCarousel {
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_topshelf_trailers", fallback: "Trailers"),
+                    subtitle: L10n.string(
+                        "tvos_settings_topshelf_trailers_subtitle",
+                        fallback: "Stay on a title and the carousel plays its trailer, in the best quality available"
+                    ),
+                    isOn: Binding(
+                        get: { configuration.playsTrailers },
+                        set: { isOn in update { $0.playsTrailers = isOn } }
+                    ),
+                    accentColor: accentColor
+                )
+            }
+
+            chipSection(
+                title: L10n.string("tvos_settings_topshelf_sources", fallback: "Content"),
+                subtitle: L10n.string(
+                    "tvos_settings_topshelf_sources_subtitle",
+                    fallback: "Choose any mix. The carousel shows up to 15 titles, a share from each."
+                )
+            ) {
+                TopShelfChipButton(
+                    title: L10n.string("home_continue_watching", fallback: "Continue Watching"),
+                    isSelected: configuration.includesContinueWatching
+                ) { update { $0.includesContinueWatching.toggle() } }
+                if !configuration.mergesUpNext {
+                    TopShelfChipButton(
+                        title: L10n.string("cw_badge_next_up", fallback: "Up Next").capitalized,
+                        isSelected: configuration.includesUpNext
+                    ) { update { $0.includesUpNext.toggle() } }
+                }
+                TopShelfChipButton(
+                    title: L10n.string("tvos_settings_topshelf_today", fallback: "Today"),
+                    isSelected: configuration.includesToday
+                ) { update { $0.includesToday.toggle() } }
+                TopShelfChipButton(
+                    title: L10n.string("nav_library", fallback: "Library"),
+                    isSelected: configuration.includesLibrary
+                ) { update { $0.includesLibrary.toggle() } }
+            }
+
+            SettingsToggleRow(
+                title: L10n.string("tvos_settings_topshelf_merge_up_next", fallback: "Up Next in Continue Watching"),
+                subtitle: L10n.string(
+                    "tvos_settings_topshelf_merge_up_next_subtitle",
+                    fallback: "One row, in the order Home shows them"
+                ),
+                isOn: Binding(
+                    get: { configuration.mergesUpNext },
+                    set: { isOn in update { $0.mergesUpNext = isOn } }
+                ),
+                accentColor: accentColor
+            )
+
+            if catalogs.isEmpty {
+                SettingsInfoRow(
+                    title: L10n.string("tvos_settings_topshelf_catalogs", fallback: "Home Catalogs"),
+                    value: L10n.string("tvos_settings_open_home_once", fallback: "Open Home once")
+                )
+            } else {
+                chipSection(
+                    title: L10n.string("tvos_settings_topshelf_catalogs", fallback: "Home Catalogs"),
+                    subtitle: L10n.string(
+                        "tvos_settings_topshelf_catalogs_subtitle",
+                        fallback: "Shown in Home order. Until you choose, the first Home catalog."
+                    )
+                ) {
+                    ForEach(catalogs, id: \.id) { catalog in
+                        TopShelfChipButton(
+                            title: catalog.title ?? catalog.id,
+                            isSelected: isCatalogSelected(catalog.id)
+                        ) { toggleCatalog(catalog.id) }
+                    }
+                }
+            }
+
+            // When the system last let Nuvio refresh the catalogs in the background.
+            SettingsInfoRow(
+                title: L10n.string("tvos_settings_topshelf_background", fallback: "Background Refresh"),
+                value: backgroundStatusText
+            )
+        }
+        .onAppear(perform: loadCatalogs)
+    }
+
+    private var backgroundStatusText: String {
+        guard let status = backgroundStatus else {
+            return L10n.string("tvos_settings_topshelf_background_never", fallback: "Not yet")
+        }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+        formatter.doesRelativeDateFormatting = true
+        var parts = [formatter.string(from: status.date)]
+        if status.rows > 0 {
+            parts.append(String(
+                format: L10n.string("tvos_settings_topshelf_background_rows", fallback: "catalogs: %d"),
+                status.rows))
+        }
+        if !status.complete {
+            parts.append(L10n.string("tvos_settings_topshelf_background_partial", fallback: "incomplete"))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func chipSection<Chips: View>(
+        title: String,
+        subtitle: String,
+        @ViewBuilder chips: () -> Chips
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(title)
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundColor(.white)
+                Text(subtitle)
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundColor(.white.opacity(0.56))
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 14) { chips() }
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 6)
+            }
+            .focusSection()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, 8)
+        .animation(.easeInOut(duration: 0.2), value: configuration)
+    }
+
+    private func isCatalogSelected(_ id: String) -> Bool {
+        if let ids = configuration.catalogRowIDs { return ids.contains(id) }
+        return id == catalogs.first?.id
+    }
+
+    private func toggleCatalog(_ id: String) {
+        var selected = configuration.catalogRowIDs ?? catalogs.prefix(1).map(\.id)
+        if let index = selected.firstIndex(of: id) {
+            selected.remove(at: index)
+        } else {
+            selected.append(id)
+        }
+        // Home order; a chosen catalog missing from Home right now stays chosen.
+        let offered = catalogs.map(\.id)
+        let ordered = offered.filter(selected.contains) + selected.filter { !offered.contains($0) }
+        update { $0.catalogRowIDs = ordered }
+    }
+
+    private func update(_ change: (inout TopShelfConfiguration) -> Void) {
+        var next = configuration
+        change(&next)
+        next.starringLabel = L10n.string("details_cast", fallback: "Cast")
+        next.directorLabel = L10n.string("details_director", fallback: "Director")
+        configuration = next
+        TopShelfConfigurationStore.save(next)
+    }
+
+    private func loadCatalogs() {
+        configuration = TopShelfConfigurationStore.load()
+        backgroundStatus = TopShelfBackgroundRefresh.lastStatus
+        catalogs = (TopShelfFeedStore.read(.catalog)?.catalogRows ?? []).filter { !$0.entries.isEmpty }
+    }
+}
+
+/// A Top Shelf source chip whose state reads at a glance on a TV: a green check and
+/// tint when on, an empty circle and dimmed text when off, both kept while focused.
+private struct TopShelfChipButton: View {
+    let title: String
+    let isSelected: Bool
+    let action: () -> Void
+
+    @FocusState private var focused: Bool
+    private static let onColor = Color(red: 0.19, green: 0.78, blue: 0.48)
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundColor(iconColor)
+                Text(title)
+                    .font(.system(size: 22, weight: isSelected ? .bold : .semibold))
+                    .foregroundColor(textColor)
+            }
+            .padding(.leading, 18)
+            .padding(.trailing, 26)
+            .frame(height: 52)
+            .background(chipBackground, in: Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(borderColor, lineWidth: focused ? AppFocusOutline.width : (isSelected ? 2 : 1))
+            )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($focused)
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(focused ? 1.05 : 1)
+        .animation(.easeOut(duration: 0.12), value: focused)
+        .animation(.easeOut(duration: 0.12), value: isSelected)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private var iconColor: Color {
+        if isSelected { return Self.onColor }
+        return focused ? .black.opacity(0.45) : .white.opacity(0.4)
+    }
+
+    private var textColor: Color {
+        if focused { return .black }
+        return isSelected ? .white : .white.opacity(0.5)
+    }
+
+    private var chipBackground: Color {
+        if focused { return .white }
+        return isSelected ? Self.onColor.opacity(0.28) : Color.white.opacity(0.04)
+    }
+
+    private var borderColor: Color {
+        if focused { return AppFocusOutline.color }
+        return isSelected ? Self.onColor.opacity(0.9) : Color.white.opacity(0.15)
     }
 }
 
@@ -8296,6 +8634,8 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.playerEngine) private var playerEngine = "Auto"
     @AppStorage(SettingsKey.trueHDSpatialAudio) private var trueHDSpatialAudio = false
     @AppStorage(SettingsKey.preferDualLayerDolbyVision) private var preferDualLayerDolbyVision = false
+    @AppStorage(SettingsKey.lowResUpscaling) private var lowResUpscaling = true
+    @AppStorage(SettingsKey.losslessAudioBridge) private var losslessAudioBridge = false
     @AppStorage(SettingsKey.externalPlayer) private var externalPlayer = ExternalPlayer.builtIn.rawValue
     @AppStorage(SettingsKey.externalPlayerForwardSubtitles) private var externalPlayerForwardSubtitles = true
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
@@ -8321,6 +8661,14 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.streamAutoPlayPreferBingeGroup) private var streamAutoPlayPreferBingeGroup = true
     @AppStorage(SettingsKey.streamAutoPlayReuseBingeGroup) private var streamAutoPlayReuseBingeGroup = true
     @AppStorage(SettingsKey.seekPreviewEnabled) private var seekPreviewEnabled = true
+    @AppStorage(SettingsKey.seekPreviewBeyondBuffer) private var seekPreviewBeyondBuffer = false
+    @AppStorage(SettingsKey.seekrApiKey) private var seekrApiKey = ""
+    @AppStorage(SettingsKey.seekrEnabled) private var seekrEnabled = false
+    @AppStorage(SettingsKey.timelineOpeningColor) private var timelineOpeningColor = PlaybackChapters.defaultOpeningColor
+    @AppStorage(SettingsKey.timelineEndingColor) private var timelineEndingColor = PlaybackChapters.defaultEndingColor
+    @AppStorage(SettingsKey.timelineSegmentsEnabled) private var timelineSegmentsEnabled = false
+    @State private var seekrKeyCheck: SeekrKeyCheck = .unchecked
+    @State private var seekrKeyCheckTask: Task<Void, Never>?
     @AppStorage(SettingsKey.showLoadingStatus) private var showLoadingStatus = true
     @AppStorage(SettingsKey.postPlayRecommendationsEnabled) private var postPlayRecommendationsEnabled = true
     @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
@@ -8349,6 +8697,9 @@ private struct PlaybackSettingsView: View {
     @State private var streamBadgeImportError: String?
     @State private var isImportingStreamBadges = false
     @State private var streamBadgeSettingsRevision = 0
+    @State private var showingPlayerButtonSettings = false
+    @State private var showingInSightSectionsSettings = false
+    @State private var inSightSectionsEnabledCount = TVSceneTabOrder.enabledTabCount()
 
     private let engines = ["Auto", "AetherEngine", "MPVKit"]
     private let externalPlayers = ExternalPlayer.settingsOptions
@@ -8361,6 +8712,57 @@ private struct PlaybackSettingsView: View {
     private let diskCacheLimitOptions = ["5 GB", "10 GB", "20 GB", "30 GB", "50 GB"]
     private let streamSortModes = StreamSortOption.allCases.map(\.rawValue)
     private let lastLinkCacheOptions = ["1 Hour", "6 Hours", "12 Hours", "1 Day", "2 Days", "3 Days", "7 Days"]
+
+    private enum SeekrKeyCheck {
+        case unchecked, checking, valid, invalid, unreachable
+    }
+
+    /// The key's check after "Saved in your Nuvio account.", colored: green accepted, red not.
+    private var seekrKeyStatus: (text: String, color: Color)? {
+        switch seekrKeyCheck {
+        case .unchecked:
+            return nil
+        case .checking:
+            return (L10n.string("tvos_settings_seekr_checking", fallback: "Checking the key with Seekr…"),
+                    .white.opacity(0.56))
+        case .valid:
+            return ("✓ " + L10n.string("tvos_settings_seekr_valid", fallback: "Seekr accepts the key."),
+                    Color(red: 0.30, green: 0.85, blue: 0.45))
+        case .invalid:
+            return ("✕ " + L10n.string("tvos_settings_seekr_invalid", fallback: "Seekr doesn't accept this key."),
+                    Color(red: 1.0, green: 0.42, blue: 0.40))
+        case .unreachable:
+            return (L10n.string("tvos_settings_seekr_unreachable", fallback: "Seekr couldn't be reached to check the key."),
+                    Color(red: 1.0, green: 0.78, blue: 0.30))
+        }
+    }
+
+    private func commitSeekrApiKey() {
+        let key = seekrApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if key != seekrApiKey { seekrApiKey = key }
+        checkSeekrApiKey()
+    }
+
+    /// Asks Seekr whether it accepts the key: when the settings open, on Done, and a moment
+    /// after any other change (the iPhone keyboard, the account sync). No preview lookup.
+    private func checkSeekrApiKey(afterNanoseconds delay: UInt64 = 0) {
+        seekrKeyCheckTask?.cancel()
+        let key = seekrApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else {
+            seekrKeyCheckTask = nil
+            seekrKeyCheck = .unchecked
+            return
+        }
+        seekrKeyCheckTask = Task { @MainActor in
+            if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+            guard !Task.isCancelled else { return }
+            seekrKeyCheck = .checking
+            let valid = await SeekrTrickplay.validate(apiKey: key)
+            guard !Task.isCancelled,
+                  seekrApiKey.trimmingCharacters(in: .whitespacesAndNewlines) == key else { return }
+            seekrKeyCheck = valid.map { $0 ? SeekrKeyCheck.valid : SeekrKeyCheck.invalid } ?? .unreachable
+        }
+    }
 
     private func lastLinkCacheLabel(for hours: Int) -> String {
         switch hours {
@@ -8396,10 +8798,10 @@ private struct PlaybackSettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             SettingsGroup(
-                title: L10n.string("tvos_playback_player", fallback: "Player"),
+                title: L10n.string("tvos_settings_player_audio_video", fallback: "Player & Audio/Video"),
                 subtitle: L10n.string(
-                    "tvos_playback_player_subtitle",
-                    fallback: "Playback engine and episode flow"
+                    "tvos_settings_player_audio_video_subtitle",
+                    fallback: "Engine, audio, and video output"
                 )
             ) {
                 SettingsOptionRow(
@@ -8428,6 +8830,19 @@ private struct PlaybackSettingsView: View {
 
                 SettingsToggleRow(
                     title: L10n.string(
+                        "tvos_settings_lossless_audio_bridge",
+                        fallback: "Lossless Audio Bridge (eARC / AVR)"
+                    ),
+                    subtitle: L10n.string(
+                        "tvos_settings_lossless_audio_bridge_subtitle",
+                        fallback: "AetherEngine only. Transcodes non-streamable surround audio (TrueHD, DTS-HD MA, Opus) to 24-bit 7.1 LPCM for AVRs and eARC soundbars. Off uses 5.1 Dolby Digital Plus for ARC compatibility."
+                    ),
+                    isOn: $losslessAudioBridge,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string(
                         "tvos_settings_prefer_dual_layer_dolby_vision",
                         fallback: "Full Dolby Vision P7 FEL (Experimental)"
                     ),
@@ -8436,6 +8851,19 @@ private struct PlaybackSettingsView: View {
                         fallback: "AetherEngine only. Enable Spatial Audio for supported Atmos/DTS:X on FEL playback; otherwise PCM. Applies next playback."
                     ),
                     isOn: $preferDualLayerDolbyVision,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string(
+                        "tvos_settings_low_res_upscaling",
+                        fallback: "Super Resolution & MetalFX Upscaling"
+                    ),
+                    subtitle: L10n.string(
+                        "tvos_settings_low_res_upscaling_subtitle",
+                        fallback: "AetherEngine only. Uses on-device Neural Engine super-resolution and MetalFX to upscale sub-1080p SDR content (480p, 576p, 720p) to native 4K. Applies next playback."
+                    ),
+                    isOn: $lowResUpscaling,
                     accentColor: accentColor
                 )
 
@@ -8458,33 +8886,6 @@ private struct PlaybackSettingsView: View {
                 )
                 .opacity(externalPlayer == ExternalPlayer.builtIn.rawValue ? 0.46 : 1)
                 .disabled(externalPlayer == ExternalPlayer.builtIn.rawValue)
-
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_post_play_recommendations", fallback: "Post-Play Recommendations"),
-                    subtitle: L10n.string(
-                        "tvos_settings_post_play_recommendations_subtitle",
-                        fallback: "Show paged recommendations with trailer previews and quick play when reaching the end of movies or series."
-                    ),
-                    isOn: $postPlayRecommendationsEnabled,
-                    accentColor: accentColor
-                )
-
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_seeking_preview", fallback: "Seeking Preview"),
-                    subtitle: L10n.string("tvos_settings_seeking_preview_subtitle", fallback: "Show thumbnail previews while scrubbing through video"),
-                    isOn: $seekPreviewEnabled,
-                    accentColor: accentColor
-                )
-
-                SettingsToggleRow(
-                    title: L10n.string("playback_show_loading_status", fallback: "Show loading status"),
-                    subtitle: L10n.string(
-                        "playback_show_loading_status_sub",
-                        fallback: "Display step-by-step progress while the player is initializing."
-                    ),
-                    isOn: $showLoadingStatus,
-                    accentColor: accentColor
-                )
 
                 SettingsOptionRow(
                     title: L10n.string("tvos_settings_frame_rate_matching", fallback: "Frame Rate Matching"),
@@ -8532,84 +8933,151 @@ private struct PlaybackSettingsView: View {
                         accentColor: accentColor
                     )
                 }
-            }
-
-            SettingsGroup(
-                title: L10n.string("tvos_playback_player_buttons", fallback: "Player Buttons"),
-                subtitle: L10n.string(
-                    "tvos_playback_player_buttons_subtitle",
-                    fallback: "Customize which control buttons appear in the video player"
-                )
-            ) {
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_player_pip", fallback: "Picture in Picture"),
-                    subtitle: L10n.string(
-                        "tvos_settings_player_pip_subtitle",
-                        fallback: "Show the Picture in Picture button in player controls"
-                    ),
-                    isOn: $playerShowPiP,
-                    accentColor: accentColor
-                )
-
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_player_episodes", fallback: "Episodes Button"),
-                    subtitle: L10n.string(
-                        "tvos_settings_player_episodes_subtitle",
-                        fallback: "Show the Episodes panel button when watching series"
-                    ),
-                    isOn: $playerShowEpisodes,
-                    accentColor: accentColor
-                )
-
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_player_sources", fallback: "Streams & Sources Button"),
-                    subtitle: L10n.string(
-                        "tvos_settings_player_sources_subtitle",
-                        fallback: "Show the alternate streams and sources button"
-                    ),
-                    isOn: $playerShowSources,
-                    accentColor: accentColor
-                )
-
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_player_subtitles", fallback: "Subtitles Button"),
-                    subtitle: L10n.string(
-                        "tvos_settings_player_subtitles_subtitle",
-                        fallback: "Show the native subtitle selector button in player controls"
-                    ),
-                    isOn: $playerShowSubtitles,
-                    accentColor: accentColor
-                )
-
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_player_audio", fallback: "Audio & Sound Button"),
-                    subtitle: L10n.string(
-                        "tvos_settings_player_audio_subtitle",
-                        fallback: "Show the native audio and sound adjustments button in player controls"
-                    ),
-                    isOn: $playerShowAudio,
-                    accentColor: accentColor
-                )
-
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_player_scene", fallback: "Scene (InSight)"),
-                    subtitle: L10n.string(
-                        "tvos_settings_player_scene_subtitle",
-                        fallback: "Press Down during playback to recognize cast members and songs currently playing"
-                    ),
-                    isOn: $sceneFeatureEnabled,
-                    accentColor: accentColor
-                )
 
             }
 
             SettingsGroup(
-                title: L10n.string("playback_auto_skip_segments", fallback: "Automatic Skipping"),
+                title: L10n.string("tvos_settings_seeking_previews", fallback: "Seeking Previews"),
                 subtitle: L10n.string(
-                    "playback_auto_skip_segments_sub",
-                    fallback: "Choose which segments skip automatically"
+                    "tvos_settings_seeking_previews_subtitle",
+                    fallback: "Thumbnail previews and Seekr setup"
                 )
             ) {
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_seeking_preview", fallback: "Seeking Preview"),
+                    subtitle: L10n.string("tvos_settings_seeking_preview_subtitle", fallback: "Show thumbnail previews while scrubbing through video"),
+                    isOn: $seekPreviewEnabled,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_seeking_preview_beyond_buffer", fallback: "Previews Beyond the Buffer"),
+                    subtitle: L10n.string(
+                        "tvos_settings_seeking_preview_beyond_buffer_subtitle",
+                        fallback: "Also load previews from the server during playback, over a separate connection, while the buffer is healthy. Off: only while paused."
+                    ),
+                    isOn: $seekPreviewBeyondBuffer,
+                    accentColor: accentColor
+                )
+                .disabled(!seekPreviewEnabled)
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_timeline_segments", fallback: "Opening & Ending on the Timeline"),
+                    subtitle: L10n.string(
+                        "tvos_settings_timeline_segments_subtitle",
+                        fallback: "Color the opening and the ending on the timeline"
+                    ),
+                    isOn: $timelineSegmentsEnabled,
+                    accentColor: accentColor
+                )
+
+                SubtitleColorRow(
+                    title: L10n.string("tvos_settings_timeline_opening_color", fallback: "Opening Color"),
+                    subtitle: L10n.string(
+                        "tvos_settings_timeline_opening_color_subtitle",
+                        fallback: "The opening on the timeline and its badge in Chapters"
+                    ),
+                    selection: $timelineOpeningColor,
+                    accentColor: accentColor,
+                    colors: PlaybackChapters.colorChoices
+                )
+
+                SubtitleColorRow(
+                    title: L10n.string("tvos_settings_timeline_ending_color", fallback: "Ending Color"),
+                    subtitle: L10n.string(
+                        "tvos_settings_timeline_ending_color_subtitle",
+                        fallback: "The ending on the timeline and its badge in Chapters"
+                    ),
+                    selection: $timelineEndingColor,
+                    accentColor: accentColor,
+                    colors: PlaybackChapters.colorChoices
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_seekr_enabled", fallback: "Use Seekr"),
+                    subtitle: L10n.string(
+                        "tvos_settings_seekr_enabled_subtitle",
+                        fallback: "Seekr (seekr.tv) serves ready-made seek-preview thumbnails for movies and series."
+                    ),
+                    isOn: $seekrEnabled,
+                    accentColor: accentColor,
+                    isAvailable: !seekrApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                )
+                .disabled(!seekPreviewEnabled)
+
+                SettingsNativeTextFieldRow(
+                    title: L10n.string("tvos_settings_seekr_api_key", fallback: "Seekr API Key"),
+                    subtitle: L10n.string(
+                        "tvos_settings_seekr_api_key_subtitle",
+                        fallback: "Get your API key at seekr.tv/join. Saved in your Nuvio account."
+                    ),
+                    placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
+                    text: $seekrApiKey,
+                    isSecure: true,
+                    status: seekrKeyStatus?.text,
+                    statusColor: seekrKeyStatus?.color ?? .white.opacity(0.56),
+                    onCommit: commitSeekrApiKey
+                )
+                .disabled(!seekPreviewEnabled)
+                .onAppear {
+                    if seekrKeyCheck == .unchecked { checkSeekrApiKey() }
+                }
+                .onChange(of: seekrApiKey) { _, _ in
+                    checkSeekrApiKey(afterNanoseconds: 1_000_000_000)
+                }
+            }
+
+            SettingsFeatureSummaryCard(
+                featureName: L10n.string("tvos_playback_player_buttons", fallback: "Player Buttons"),
+                status: settingsCountSummary(visiblePlayerButtonCount, singular: "active player button", plural: "active player buttons"),
+                actionSubtitle: L10n.string(
+                    "tvos_settings_player_buttons_manage_subtitle",
+                    fallback: "Choose which player buttons appear and arrange their left-to-right order"
+                ),
+                accentColor: accentColor
+            ) {
+                showingPlayerButtonSettings = true
+            }
+
+            SettingsFeatureSummaryCard(
+                featureName: L10n.string("tvos_settings_insight_sections", fallback: "InSight Sections"),
+                status: settingsCountSummary(inSightSectionsEnabledCount, singular: "section enabled", plural: "sections enabled"),
+                actionSubtitle: L10n.string(
+                    "tvos_settings_insight_sections_manage_subtitle",
+                    fallback: "Enable InSight, choose its tabs, and arrange them in the panel"
+                ),
+                accentColor: accentColor
+            ) {
+                showingInSightSectionsSettings = true
+            }
+
+            SettingsGroup(
+                title: L10n.string("tvos_settings_playback_behavior", fallback: "Playback Behavior"),
+                subtitle: L10n.string(
+                    "tvos_settings_playback_behavior_subtitle",
+                    fallback: "Automatic playback and segment controls"
+                )
+            ) {
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_post_play_recommendations", fallback: "Post-Play Recommendations"),
+                    subtitle: L10n.string(
+                        "tvos_settings_post_play_recommendations_subtitle",
+                        fallback: "Show paged recommendations with trailer previews and quick play when reaching the end of movies or series."
+                    ),
+                    isOn: $postPlayRecommendationsEnabled,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("playback_show_loading_status", fallback: "Show loading status"),
+                    subtitle: L10n.string(
+                        "playback_show_loading_status_sub",
+                        fallback: "Display step-by-step progress while the player is initializing."
+                    ),
+                    isOn: $showLoadingStatus,
+                    accentColor: accentColor
+                )
+
                 SettingsToggleRow(
                     title: L10n.string("auto_skip_intro", fallback: "Intro / Opening"),
                     subtitle: L10n.string(
@@ -8659,6 +9127,43 @@ private struct PlaybackSettingsView: View {
                     isOn: $autoPlayNext,
                     accentColor: accentColor
                 )
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_autoplay_trailers", fallback: "Autoplay Trailers"),
+                    subtitle: L10n.string("tvos_settings_start_previews_after_focus_settles", fallback: "Start previews after focus settles"),
+                    isOn: $trailersEnabled,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_background_trailers", fallback: "Background Trailers"),
+                    subtitle: L10n.string("tvos_settings_background_trailers_subtitle", fallback: "Play automatic trailers in the background on detail pages"),
+                    isOn: $backgroundTrailersEnabled,
+                    accentColor: accentColor
+                )
+                .opacity(trailersEnabled ? 1 : 0.46)
+                .disabled(!trailersEnabled)
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_trailer_preview_sound", fallback: "Trailer Preview Sound"),
+                    subtitle: L10n.string("tvos_settings_play_sound_for_focused_card_trailers", fallback: "Play sound for focused-card trailers"),
+                    isOn: $trailerPreviewSound,
+                    accentColor: accentColor
+                )
+                .opacity(trailersEnabled ? 1 : 0.46)
+                .disabled(!trailersEnabled)
+
+                SettingsStepperRow(
+                    title: L10n.string("tvos_settings_trailer_delay", fallback: "Trailer Delay"),
+                    subtitle: L10n.string("tvos_settings_seconds_before_autoplay_starts", fallback: "Seconds before autoplay starts"),
+                    value: $trailerDelay,
+                    range: 0...15,
+                    step: 1,
+                    suffix: "s",
+                    accentColor: accentColor
+                )
+                .opacity(trailersEnabled ? 1 : 0.46)
+                .disabled(!trailersEnabled)
             }
 
             SettingsGroup(title: L10n.string("tvos_settings_smart_playback", fallback: "Smart Playback"), subtitle: L10n.string("tvos_settings_automatically_choose_streams_and_matchin_9ca69e9f", fallback: "Automatically choose streams and matching subtitles")) {
@@ -8795,7 +9300,15 @@ private struct PlaybackSettingsView: View {
                 )
             }
 
-            streamBadgesSettings
+            SettingsGroup(
+                title: L10n.string("tvos_settings_stream_badges", fallback: "Stream Badges"),
+                subtitle: L10n.string(
+                    "tvos_settings_stream_badges_subtitle",
+                    fallback: "Show the same stream badge packs and source details as Android TV"
+                )
+            ) {
+                streamBadgeSettingsRows
+            }
 
             SettingsGroup(
                 title: L10n.string("tvos_playback_audio_subtitles", fallback: "Audio & Subtitle Languages"),
@@ -8852,55 +9365,72 @@ private struct PlaybackSettingsView: View {
                 )
             }
 
-            SettingsGroup(title: L10n.string("tmdb_trailers_title", fallback: "Trailers"), subtitle: L10n.string("tvos_settings_preview_playback_on_details_and_focused_posters", fallback: "Preview playback on details and focused posters")) {
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_autoplay_trailers", fallback: "Autoplay Trailers"),
-                    subtitle: L10n.string("tvos_settings_start_previews_after_focus_settles", fallback: "Start previews after focus settles"),
-                    isOn: $trailersEnabled,
-                    accentColor: accentColor
-                )
-
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_background_trailers", fallback: "Background Trailers"),
-                    subtitle: L10n.string("tvos_settings_background_trailers_subtitle", fallback: "Play automatic trailers in the background on detail pages"),
-                    isOn: $backgroundTrailersEnabled,
-                    accentColor: accentColor
-                )
-                .opacity(trailersEnabled ? 1 : 0.46)
-                .disabled(!trailersEnabled)
-
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_trailer_preview_sound", fallback: "Trailer Preview Sound"),
-                    subtitle: L10n.string("tvos_settings_play_sound_for_focused_card_trailers", fallback: "Play sound for focused-card trailers"),
-                    isOn: $trailerPreviewSound,
-                    accentColor: accentColor
-                )
-                .opacity(trailersEnabled ? 1 : 0.46)
-                .disabled(!trailersEnabled)
-
-                SettingsStepperRow(
-                    title: L10n.string("tvos_settings_trailer_delay", fallback: "Trailer Delay"),
-                    subtitle: L10n.string("tvos_settings_seconds_before_autoplay_starts", fallback: "Seconds before autoplay starts"),
-                    value: $trailerDelay,
-                    range: 0...15,
-                    step: 1,
-                    suffix: "s",
-                    accentColor: accentColor
-                )
-                .opacity(trailersEnabled ? 1 : 0.46)
-                .disabled(!trailersEnabled)
-            }
-
         }
         .onReceive(NotificationCenter.default.publisher(for: StreamBadgeSettingsStore.changedNotification).receive(on: RunLoop.main)) { _ in
             streamBadgeSettingsRevision &+= 1
         }
+        .onReceive(NotificationCenter.default.publisher(for: TVSceneTabOrder.changedNotification).receive(on: RunLoop.main)) { _ in
+            refreshInSightSectionsSummary()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ProfileSettings.settingsChangedNotification).receive(on: RunLoop.main)) { _ in
+            refreshInSightSectionsSummary()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification).receive(on: RunLoop.main)) { _ in
+            refreshInSightSectionsSummary()
+        }
         .onAppear {
+            refreshInSightSectionsSummary()
             let canonical = PlayerEngineSetting.migrated(from: playerEngine).settingsRawValue
             if playerEngine != canonical {
                 playerEngine = canonical
             }
         }
+        .fullScreenCover(isPresented: $showingPlayerButtonSettings) {
+            SettingsFeatureSettingsSheet(
+                title: L10n.string("tvos_playback_player_buttons", fallback: "Player Buttons"),
+                subtitle: L10n.string(
+                    "tvos_settings_player_buttons_manage_subtitle",
+                    fallback: "Choose which player buttons appear and arrange their left-to-right order"
+                )
+            ) {
+                PlayerButtonsSettingsSection(
+                    accentColor: accentColor,
+                    playerShowPiP: $playerShowPiP,
+                    playerShowEpisodes: $playerShowEpisodes,
+                    playerShowSources: $playerShowSources,
+                    playerShowSubtitles: $playerShowSubtitles,
+                    playerShowAudio: $playerShowAudio
+                )
+            }
+            .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+        .fullScreenCover(isPresented: $showingInSightSectionsSettings) {
+            SettingsFeatureSettingsSheet(
+                title: L10n.string("tvos_settings_insight_sections", fallback: "InSight Sections"),
+                subtitle: L10n.string(
+                    "tvos_settings_insight_sections_manage_subtitle",
+                    fallback: "Enable InSight, choose its tabs, and arrange them in the panel"
+                )
+            ) {
+                InSightSectionsSettingsSection(
+                    accentColor: accentColor,
+                    sceneFeatureEnabled: $sceneFeatureEnabled
+                )
+            }
+            .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+    }
+
+    private var visiblePlayerButtonCount: Int {
+        [playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio]
+            .filter { $0 }
+            .count
+    }
+
+    private func refreshInSightSectionsSummary() {
+        let count = TVSceneTabOrder.enabledTabCount()
+        guard inSightSectionsEnabledCount != count else { return }
+        inSightSectionsEnabledCount = count
     }
 
     private var audioLanguageSummary: String {
@@ -8921,11 +9451,12 @@ private struct PlaybackSettingsView: View {
         return "\(ordered[0]), \(ordered[1]) +\(ordered.count - 2)"
     }
 
-    private var streamBadgesSettings: some View {
+    @ViewBuilder
+    private var streamBadgeSettingsRows: some View {
         // Keep the view dependent on badge-store updates, but do not replace its
         // identity: replacing it after a placement change sends tvOS focus back
         // to the first row in the group.
-        _ = streamBadgeSettingsRevision
+        let _ = streamBadgeSettingsRevision
         let importedRules = StreamBadgeSettingsStore.snapshot.rules
         let placementBinding = Binding<String>(
             get: { streamBadgePlacement == StreamBadgePlacement.top.rawValue ? "Top" : "Bottom" },
@@ -8936,79 +9467,71 @@ private struct PlaybackSettingsView: View {
             }
         )
 
-        return SettingsGroup(
-            title: L10n.string("tvos_settings_stream_badges", fallback: "Stream Badges"),
-            subtitle: L10n.string(
-                "tvos_settings_stream_badges_subtitle",
-                fallback: "Show the same stream badge packs and source details as Android TV"
-            )
-        ) {
-            SettingsToggleRow(
-                title: L10n.string("tvos_settings_file_size_badges", fallback: "File Size Badges"),
-                subtitle: L10n.string("tvos_settings_file_size_badges_subtitle", fallback: "Show the stream file size when the add-on provides it"),
-                isOn: $showFileSizeBadges,
-                accentColor: accentColor
-            )
+        SettingsToggleRow(
+            title: L10n.string("tvos_settings_file_size_badges", fallback: "File Size Badges"),
+            subtitle: L10n.string("tvos_settings_file_size_badges_subtitle", fallback: "Show the stream file size when the add-on provides it"),
+            isOn: $showFileSizeBadges,
+            accentColor: accentColor
+        )
 
-            SettingsOptionRow(
-                title: L10n.string("tvos_settings_badge_placement", fallback: "Badge Placement"),
-                subtitle: L10n.string("tvos_settings_badge_placement_subtitle", fallback: "Place imported badges and file sizes above or below the stream details"),
-                selection: placementBinding,
-                options: ["Top", "Bottom"],
-                accentColor: accentColor
-            )
+        SettingsOptionRow(
+            title: L10n.string("tvos_settings_badge_placement", fallback: "Badge Placement"),
+            subtitle: L10n.string("tvos_settings_badge_placement_subtitle", fallback: "Place imported badges and file sizes above or below the stream details"),
+            selection: placementBinding,
+            options: ["Top", "Bottom"],
+            accentColor: accentColor
+        )
 
-            SettingsToggleRow(
-                title: L10n.string("tvos_settings_addon_logo", fallback: "Add-on Logo"),
-                subtitle: L10n.string("tvos_settings_addon_logo_subtitle", fallback: "Show the source add-on logo beside each stream"),
-                isOn: $showAddonLogo,
-                accentColor: accentColor
-            )
+        SettingsToggleRow(
+            title: L10n.string("tvos_settings_addon_logo", fallback: "Add-on Logo"),
+            subtitle: L10n.string("tvos_settings_addon_logo_subtitle", fallback: "Show the source add-on logo beside each stream"),
+            isOn: $showAddonLogo,
+            accentColor: accentColor
+        )
 
-            SettingsActionRow(
-                title: L10n.string("tvos_settings_install_gold_badge_pack", fallback: "Install Gold Badge Pack"),
-                subtitle: L10n.string("tvos_settings_install_gold_badge_pack_subtitle", fallback: "Install the Android TV Gold pack without entering a URL"),
-                value: isImportingStreamBadges
-                    ? L10n.string("tvos_settings_installing", fallback: "Installing…")
-                    : L10n.string("action_install", fallback: "Install"),
-                accentColor: accentColor,
-                action: importGoldBadgePack
-            )
-            .opacity(isImportingStreamBadges ? 0.55 : 1)
-            .disabled(isImportingStreamBadges)
+        SettingsActionRow(
+            title: L10n.string("tvos_settings_install_gold_badge_pack", fallback: "Install Gold Badge Pack"),
+            subtitle: L10n.string("tvos_settings_install_gold_badge_pack_subtitle", fallback: "Install the Android TV Gold pack without entering a URL"),
+            value: isImportingStreamBadges
+                ? L10n.string("tvos_settings_installing", fallback: "Installing…")
+                : L10n.string("action_install", fallback: "Install"),
+            accentColor: accentColor,
+            action: importGoldBadgePack
+        )
+        .opacity(isImportingStreamBadges ? 0.55 : 1)
+        .disabled(isImportingStreamBadges)
 
-            SettingsNativeTextFieldRow(
-                title: L10n.string("tvos_settings_badge_pack_url", fallback: "Badge Pack URL"),
-                subtitle: streamBadgeImportError ?? L10n.string("tvos_settings_badge_pack_url_subtitle", fallback: "Paste an Android TV-compatible JSON URL; it imports when you press Done (up to 3)"),
-                placeholder: "https://…",
-                text: $streamBadgeURL,
-                fieldWidth: 520,
-                onCommit: importStreamBadgePack
-            )
-            .opacity(isImportingStreamBadges ? 0.55 : 1)
-            .disabled(isImportingStreamBadges)
+        SettingsNativeTextFieldRow(
+            title: L10n.string("tvos_settings_badge_pack_url", fallback: "Badge Pack URL"),
+            subtitle: streamBadgeImportError ?? L10n.string("tvos_settings_badge_pack_url_subtitle", fallback: "Paste an Android TV-compatible JSON URL; it imports when you press Done (up to 3)"),
+            placeholder: "https://…",
+            text: $streamBadgeURL,
+            fieldWidth: 520,
+            onCommit: importStreamBadgePack
+        )
+        .opacity(isImportingStreamBadges ? 0.55 : 1)
+        .disabled(isImportingStreamBadges)
 
-            if importedRules.imports.isEmpty {
-                SettingsInfoRow(
-                    title: L10n.string("tvos_settings_imported_packs", fallback: "Imported Packs"),
-                    value: L10n.string("action_none", fallback: "None")
+        if importedRules.imports.isEmpty {
+            SettingsInfoRow(
+                title: L10n.string("tvos_settings_imported_packs", fallback: "Imported Packs"),
+                value: L10n.string("action_none", fallback: "None")
+            )
+        } else {
+            ForEach(importedRules.imports) { imported in
+                StreamBadgePackSettingsRow(
+                    badgePack: imported,
+                    accentColor: accentColor,
+                    onEnabledChange: { isEnabled in
+                        StreamBadgeSettingsStore.setSourceEnabled(
+                            imported.sourceUrl,
+                            isEnabled: isEnabled
+                        )
+                    },
+                    onDelete: {
+                        StreamBadgeSettingsStore.removeSource(imported.sourceUrl)
+                    }
                 )
-            } else {
-                ForEach(importedRules.imports) { imported in
-                    StreamBadgePackSettingsRow(
-                        badgePack: imported,
-                        accentColor: accentColor,
-                        onEnabledChange: { isEnabled in
-                            StreamBadgeSettingsStore.setSourceEnabled(
-                                imported.sourceUrl,
-                                isEnabled: isEnabled
-                            )
-                        },
-                        onDelete: {
-                            StreamBadgeSettingsStore.removeSource(imported.sourceUrl)
-                        }
-                    )
-                }
             }
         }
     }
@@ -9037,6 +9560,303 @@ private struct PlaybackSettingsView: View {
             }
             isImportingStreamBadges = false
         }
+    }
+}
+
+@MainActor
+private struct PlayerButtonsSettingsSection: View {
+    let accentColor: Color
+    @Binding var playerShowPiP: Bool
+    @Binding var playerShowEpisodes: Bool
+    @Binding var playerShowSources: Bool
+    @Binding var playerShowSubtitles: Bool
+    @Binding var playerShowAudio: Bool
+
+    @State private var buttons: [TVPlayerButton] = TVPlayerButtonOrder.currentOrder()
+    @FocusState private var focusedButtonID: String?
+
+    var body: some View {
+        SettingsGroup(
+            title: L10n.string("tvos_settings_player_transport_controls", fallback: "Transport Controls"),
+            subtitle: L10n.string(
+                "tvos_settings_player_transport_controls_subtitle",
+                fallback: "Enable and order the PiP, Episodes, Sources, Subtitles, and Audio buttons."
+            )
+        ) {
+            SettingsActionRow(
+                title: L10n.string("action_reset", fallback: "Reset"),
+                subtitle: L10n.string(
+                    "tvos_settings_reset_player_buttons_subtitle",
+                    fallback: "Restore the default button order and visibility"
+                ),
+                value: L10n.string("action_reset", fallback: "Reset"),
+                accentColor: accentColor
+            ) {
+                reset()
+            }
+
+            ForEach(Array(buttons.enumerated()), id: \.element.id) { index, button in
+                HStack(spacing: 14) {
+                    Button {
+                        toggle(button)
+                    } label: {
+                        SettingsRowShell(isFocused: focusedButtonID == button.id, accentColor: accentColor) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(button.title)
+                                    .font(.system(size: 22, weight: .semibold))
+                                    .foregroundColor(isEnabled(button) ? .white : .white.opacity(0.46))
+                                    .lineLimit(1)
+
+                                Text(subtitle(for: button))
+                                    .font(.system(size: 16, weight: .medium))
+                                    .foregroundColor(.white.opacity(isEnabled(button) ? 0.56 : 0.36))
+                                    .lineLimit(1)
+                            }
+
+                            Spacer(minLength: 20)
+
+                            Text(isEnabled(button)
+                                 ? L10n.string("settings_fusion_badge_url_active", fallback: "Active")
+                                 : L10n.string("tvos_settings_disabled", fallback: "Disabled"))
+                                .font(.system(size: 18, weight: .bold))
+                                .foregroundColor(isEnabled(button) ? .white.opacity(0.7) : .white.opacity(0.42))
+                                .lineLimit(1)
+                        }
+                    }
+                    .buttonStyle(PosterCardButtonStyle())
+                    .focused($focusedButtonID, equals: button.id)
+                    .focusEffectDisabledIfAvailable()
+                    .entryLockable()
+
+                    AddonReorderButton(systemImage: "chevron.up", disabled: index == 0) {
+                        move(index, up: true)
+                    }
+                    AddonReorderButton(systemImage: "chevron.down", disabled: index == buttons.count - 1) {
+                        move(index, up: false)
+                    }
+                }
+                .id(button.id)
+            }
+
+        }
+        .onAppear(perform: reload)
+        .onReceive(NotificationCenter.default.publisher(for: TVPlayerButtonOrder.changedNotification).receive(on: RunLoop.main)) { _ in
+            reload()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ProfileSettings.settingsChangedNotification).receive(on: RunLoop.main)) { _ in
+            reload()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification).receive(on: RunLoop.main)) { _ in
+            reload()
+        }
+    }
+
+    private func reload() {
+        let currentOrder = TVPlayerButtonOrder.currentOrder()
+        guard buttons != currentOrder else { return }
+        buttons = currentOrder
+    }
+
+    private func move(_ index: Int, up: Bool) {
+        let target = up ? index - 1 : index + 1
+        guard buttons.indices.contains(index), buttons.indices.contains(target) else { return }
+        buttons.swapAt(index, target)
+        TVPlayerButtonOrder.saveOrder(buttons)
+    }
+
+    private func isEnabled(_ button: TVPlayerButton) -> Bool {
+        switch button {
+        case .pip: return playerShowPiP
+        case .episodes: return playerShowEpisodes
+        case .sources: return playerShowSources
+        case .subtitles: return playerShowSubtitles
+        case .audio: return playerShowAudio
+        }
+    }
+
+    private func toggle(_ button: TVPlayerButton) {
+        switch button {
+        case .pip: playerShowPiP.toggle()
+        case .episodes: playerShowEpisodes.toggle()
+        case .sources: playerShowSources.toggle()
+        case .subtitles: playerShowSubtitles.toggle()
+        case .audio: playerShowAudio.toggle()
+        }
+    }
+
+    private func subtitle(for button: TVPlayerButton) -> String {
+        switch button {
+        case .pip:
+            return L10n.string("tvos_settings_player_pip_subtitle", fallback: "Show the Picture in Picture button in player controls")
+        case .episodes:
+            return L10n.string("tvos_settings_player_episodes_subtitle", fallback: "Show the Episodes panel button when watching series")
+        case .sources:
+            return L10n.string("tvos_settings_player_sources_subtitle", fallback: "Show the alternate streams and sources button")
+        case .subtitles:
+            return L10n.string("tvos_settings_player_subtitles_subtitle", fallback: "Show the native subtitle selector button in player controls")
+        case .audio:
+            return L10n.string("tvos_settings_player_audio_subtitle", fallback: "Show the native audio and sound adjustments button in player controls")
+        }
+    }
+
+    private func reset() {
+        playerShowPiP = true
+        playerShowEpisodes = true
+        playerShowSources = true
+        playerShowSubtitles = true
+        playerShowAudio = true
+        TVPlayerButtonOrder.resetToDefaults()
+        reload()
+    }
+}
+
+@MainActor
+private struct InSightSectionsSettingsSection: View {
+    let accentColor: Color
+    @Binding var sceneFeatureEnabled: Bool
+
+    @State private var tabs: [SceneTab] = TVSceneTabOrder.currentOrder()
+    @State private var disabledTabs: Set<SceneTab> = TVSceneTabOrder.disabledTabs()
+    @FocusState private var focusedTabID: String?
+
+    var body: some View {
+        SettingsGroup(
+            title: L10n.string("tvos_settings_insight_sections", fallback: "InSight Sections"),
+            subtitle: L10n.string(
+                "tvos_settings_insight_sections_subtitle",
+                fallback: "Choose which InSight panel tabs appear and set their order"
+            )
+        ) {
+            SettingsToggleRow(
+                title: L10n.string("tvos_settings_enable_insight", fallback: "Enable InSight"),
+                subtitle: L10n.string(
+                    "tvos_settings_enable_insight_subtitle",
+                    fallback: "Allow opening the InSight panel during playback"
+                ),
+                isOn: $sceneFeatureEnabled,
+                accentColor: accentColor
+            )
+
+            SettingsActionRow(
+                title: L10n.string("action_reset", fallback: "Reset"),
+                subtitle: L10n.string(
+                    "tvos_settings_reset_insight_sections_subtitle",
+                    fallback: "Restore the default section order, enable every section, and enable InSight"
+                ),
+                value: L10n.string("action_reset", fallback: "Reset"),
+                accentColor: accentColor
+            ) {
+                reset()
+            }
+
+            ForEach(Array(tabs.enumerated()), id: \.element.id) { index, tab in
+                HStack(spacing: 14) {
+                    Button {
+                        toggle(tab)
+                    } label: {
+                        SettingsRowShell(isFocused: focusedTabID == tab.id, accentColor: accentColor) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(title(for: tab))
+                                    .font(.system(size: 22, weight: .semibold))
+                                    .foregroundColor(isEnabled(tab) ? .white : .white.opacity(0.46))
+                                    .lineLimit(1)
+
+                                Text(subtitle(for: tab))
+                                    .font(.system(size: 16, weight: .medium))
+                                    .foregroundColor(.white.opacity(isEnabled(tab) ? 0.56 : 0.36))
+                                    .lineLimit(1)
+                            }
+
+                            Spacer(minLength: 20)
+
+                            Text(isEnabled(tab)
+                                 ? L10n.string("settings_fusion_badge_url_active", fallback: "Active")
+                                 : L10n.string("tvos_settings_disabled", fallback: "Disabled"))
+                                .font(.system(size: 18, weight: .bold))
+                                .foregroundColor(isEnabled(tab) ? .white.opacity(0.7) : .white.opacity(0.42))
+                                .lineLimit(1)
+                        }
+                    }
+                    .buttonStyle(PosterCardButtonStyle())
+                    .focused($focusedTabID, equals: tab.id)
+                    .focusEffectDisabledIfAvailable()
+                    .entryLockable()
+
+                    AddonReorderButton(systemImage: "chevron.up", disabled: index == 0) {
+                        move(index, up: true)
+                    }
+                    AddonReorderButton(systemImage: "chevron.down", disabled: index == tabs.count - 1) {
+                        move(index, up: false)
+                    }
+                }
+                .id(tab.id)
+            }
+        }
+        .onAppear(perform: reload)
+        .onReceive(NotificationCenter.default.publisher(for: TVSceneTabOrder.changedNotification).receive(on: RunLoop.main)) { _ in
+            reload()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ProfileSettings.settingsChangedNotification).receive(on: RunLoop.main)) { _ in
+            reload()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification).receive(on: RunLoop.main)) { _ in
+            reload()
+        }
+    }
+
+    private func reload() {
+        let currentOrder = TVSceneTabOrder.currentOrder()
+        if tabs != currentOrder {
+            tabs = currentOrder
+        }
+        let currentDisabledTabs = TVSceneTabOrder.disabledTabs()
+        if disabledTabs != currentDisabledTabs {
+            disabledTabs = currentDisabledTabs
+        }
+    }
+
+    private func isEnabled(_ tab: SceneTab) -> Bool {
+        !disabledTabs.contains(tab)
+    }
+
+    private func toggle(_ tab: SceneTab) {
+        TVSceneTabOrder.setTabEnabled(tab, isEnabled: !isEnabled(tab))
+        reload()
+    }
+
+    private func move(_ index: Int, up: Bool) {
+        let target = up ? index - 1 : index + 1
+        guard tabs.indices.contains(index), tabs.indices.contains(target) else { return }
+        tabs.swapAt(index, target)
+        TVSceneTabOrder.saveOrder(tabs)
+    }
+
+    private func subtitle(for tab: SceneTab) -> String {
+        switch tab {
+        case .chapters:
+            return L10n.string("tvos_settings_insight_chapters_subtitle", fallback: "The file's chapters, with stills")
+        case .scene:
+            return L10n.string("tvos_settings_insight_scene_subtitle", fallback: "Cast and song recognition")
+        case .info:
+            return L10n.string("tvos_settings_insight_info_subtitle", fallback: "Playback engine and stream details")
+        case .upNext:
+            return L10n.string("tvos_settings_insight_up_next_subtitle", fallback: "Details for the next episode")
+        case .watchParty:
+            return L10n.string("tvos_settings_insight_watch_party_subtitle", fallback: "Watch Party session controls")
+        }
+    }
+
+    private func title(for tab: SceneTab) -> String {
+        if tab == .scene {
+            return L10n.string("tvos_settings_player_scene", fallback: "Scene (InSight)")
+        }
+        return tab.localizedTitle
+    }
+
+    private func reset() {
+        sceneFeatureEnabled = true
+        TVSceneTabOrder.resetToDefaults()
+        reload()
     }
 }
 
@@ -9183,9 +10003,9 @@ struct SubtitleStyleEditor: View {
 
                 SettingsStepperRow(
                     title: L10n.string("tvos_settings_vertical_position", fallback: "Vertical Position"),
-                    subtitle: L10n.string("tvos_settings_raise_captions_up_off_the_bottom_edge", fallback: "Raise captions up off the bottom edge"),
+                    subtitle: L10n.string("subtitle_vertical_position_adjustment_desc", fallback: "Increase to move captions away from the screen edge; decrease to move them closer"),
                     value: $bottomOffset,
-                    range: 0...160,
+                    range: SubtitleStyleDefaults.bottomOffsetRange,
                     step: 4,
                     suffix: "",
                     accentColor: accentColor
@@ -9324,7 +10144,7 @@ private struct SubtitlePreviewCard: View {
     }
 
     private var previewVerticalPadding: CGFloat {
-        22 + CGFloat(min(max(style.bottomOffset, 0), 160)) * 0.7
+        22 + CGFloat(style.subMarginY - 22) * 0.7
     }
 
     private var previewHorizontalPadding: CGFloat {
@@ -9441,6 +10261,7 @@ private struct SubtitleColorRow: View {
     let subtitle: String
     @Binding var selection: String
     let accentColor: Color
+    var colors: [String] = SubtitlePalette.colors
 
     var body: some View {
         HStack(spacing: 20) {
@@ -9448,7 +10269,7 @@ private struct SubtitleColorRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             HStack(spacing: 12) {
-                ForEach(SubtitlePalette.colors, id: \.self) { hex in
+                ForEach(colors, id: \.self) { hex in
                     SubtitleColorSwatchButton(
                         hex: hex,
                         isSelected: selection.caseInsensitiveCompare(hex) == .orderedSame,
@@ -9798,6 +10619,22 @@ private struct AdvancedSettingsView: View {
                     action: { showingPlaybackHistory = true }
                 )
                 #endif
+
+                // Whether the app can hand its rows to the Top Shelf extension: a sideloaded
+                // build only can when its signing kept the App Group.
+                SettingsActionRow(
+                    title: L10n.string("tvos_settings_topshelf_status", fallback: "Top Shelf"),
+                    subtitle: L10n.format(
+                        "tvos_settings_topshelf_status_detail",
+                        fallback: "Data shared with the home screen row (App Group %@)",
+                        topShelfAppGroupID
+                    ),
+                    value: TopShelfFeedStore.isAvailable
+                        ? L10n.string("tvos_settings_topshelf_available", fallback: "OK")
+                        : L10n.string("tvos_settings_topshelf_unavailable", fallback: "Unavailable"),
+                    accentColor: accentColor,
+                    action: {}
+                )
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_playback_debug_overlay", fallback: "Playback Debug Overlay"),
@@ -11200,6 +12037,7 @@ private struct JellyfinServerEditSheet: View {
     @State private var username: String
     @State private var password: String
     @State private var apiKey: String
+    @State private var syncAutomatically: Bool
     @State private var isSaving = false
     @State private var errorMessage: String?
     @State private var saveTask: Task<Void, Never>?
@@ -11215,6 +12053,7 @@ private struct JellyfinServerEditSheet: View {
         let storedToken = server.map { JellyfinCredentialStore.token(forServerID: $0.id) } ?? ""
         _password = State(initialValue: server?.authKind == .login ? storedToken : "")
         _apiKey = State(initialValue: server?.authKind == .apiKey ? storedToken : "")
+        _syncAutomatically = State(initialValue: server?.syncAutomatically ?? true)
     }
 
     var body: some View {
@@ -11287,6 +12126,18 @@ private struct JellyfinServerEditSheet: View {
                                 .font(.system(size: 15, weight: .regular))
                                 .foregroundColor(.red.opacity(0.85))
                         }
+                    }
+
+                    SettingsGroup(
+                        title: L10n.string("jellyfin_sync_group_title", fallback: "Library Sync"),
+                        subtitle: L10n.string("jellyfin_sync_group_subtitle", fallback: "Automatically refresh library contents in the background")
+                    ) {
+                        SettingsToggleRow(
+                            title: L10n.string("jellyfin_sync_automatically", fallback: "Sync Automatically"),
+                            subtitle: L10n.string("jellyfin_sync_automatically_subtitle", fallback: "Refresh library content on launch and when returning to the app"),
+                            isOn: $syncAutomatically,
+                            accentColor: accentColor
+                        )
                     }
 
                     HStack {
@@ -11377,7 +12228,8 @@ private struct JellyfinServerEditSheet: View {
                     userId: userId,
                     selectedLibraryIDs: server?.selectedLibraryIDs ?? [],
                     lastSyncDate: server?.lastSyncDate,
-                    lastSyncTitleCount: server?.lastSyncTitleCount
+                    lastSyncTitleCount: server?.lastSyncTitleCount,
+                    syncAutomatically: syncAutomatically
                 )
                 JellyfinCredentialStore.save(token, forServerID: id)
                 JellyfinServerStore.shared.upsert(config)
@@ -11408,11 +12260,13 @@ private struct JellyfinLibrarySelectionSheet: View {
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @ObservedObject private var sessionManager = JellyfinSessionManager.shared
     @State private var selectedLibraryIDs: Set<String>
+    @State private var syncAutomatically: Bool
 
     init(server: JellyfinServerConfig, accentColor: Color) {
         self.server = server
         self.accentColor = accentColor
         _selectedLibraryIDs = State(initialValue: Set(server.selectedLibraryIDs))
+        _syncAutomatically = State(initialValue: server.syncAutomatically)
     }
 
     var body: some View {
@@ -11424,6 +12278,18 @@ private struct JellyfinLibrarySelectionSheet: View {
                     Text(L10n.format("jellyfin_libraries_on_server", fallback: "Libraries on %@", server.displayName))
                         .font(.system(size: 36, weight: .bold))
                         .foregroundColor(.white)
+
+                    SettingsGroup(
+                        title: L10n.string("jellyfin_sync_options", fallback: "Sync Options"),
+                        subtitle: L10n.string("jellyfin_sync_options_subtitle", fallback: "Automatic background updates for this server")
+                    ) {
+                        SettingsToggleRow(
+                            title: L10n.string("jellyfin_sync_automatically", fallback: "Sync Automatically"),
+                            subtitle: L10n.string("jellyfin_sync_automatically_subtitle", fallback: "Refresh library content on launch and when returning to the app"),
+                            isOn: syncAutomaticallyBinding,
+                            accentColor: accentColor
+                        )
+                    }
 
                     if let libraries = availableLibraries {
                         SettingsGroup(
@@ -11482,9 +12348,23 @@ private struct JellyfinLibrarySelectionSheet: View {
         )
     }
 
+    private var syncAutomaticallyBinding: Binding<Bool> {
+        Binding(
+            get: { syncAutomatically },
+            set: { newValue in
+                syncAutomatically = newValue
+                if var current = JellyfinServerStore.shared.server(id: server.id) {
+                    current.syncAutomatically = newValue
+                    JellyfinServerStore.shared.upsert(current)
+                }
+            }
+        )
+    }
+
     private func startSync() {
         var updated = server
         updated.selectedLibraryIDs = Array(selectedLibraryIDs)
+        updated.syncAutomatically = syncAutomatically
         JellyfinServerStore.shared.upsert(updated)
         sessionManager.sync(updated)
     }
@@ -15704,13 +16584,13 @@ private struct SettingsDetailHeader: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 Text(title)
-                    .font(.system(size: 40, weight: .bold))
+                    .font(.appFont(size: 40, weight: .bold))
                     .foregroundColor(.white)
                     .lineLimit(1)
                     .minimumScaleFactor(0.82)
 
                 Text(subtitle)
-                    .font(.system(size: 20, weight: .medium))
+                    .font(.appFont(size: 20, weight: .medium))
                     .foregroundColor(.white.opacity(0.62))
                     .lineLimit(2)
             }
@@ -15729,11 +16609,11 @@ private struct SettingsGroup<Content: View>: View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 5) {
                 Text(title)
-                    .font(.system(size: 28, weight: .bold))
+                    .font(.appFont(size: 28, weight: .bold))
                     .foregroundColor(.white)
 
                 Text(subtitle)
-                    .font(.system(size: 18, weight: .medium))
+                    .font(.appFont(size: 18, weight: .medium))
                     .foregroundColor(.white.opacity(0.56))
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -15817,7 +16697,7 @@ private struct SettingsOptionRow: View {
 
                 HStack(spacing: 10) {
                     Text(optionLabel(currentStored))
-                        .font(.system(size: 19, weight: .bold))
+                        .font(.appFont(size: 19, weight: .bold))
                         .foregroundColor(.white)
                         .lineLimit(1)
                         .minimumScaleFactor(0.76)
@@ -15869,7 +16749,7 @@ private struct SettingsChoiceRow: View {
 
                 HStack(spacing: 10) {
                     Text(displayLabel(for: currentStored))
-                        .font(.system(size: 19, weight: .bold))
+                        .font(.appFont(size: 19, weight: .bold))
                         .foregroundColor(.white)
                         .lineLimit(1)
                         .minimumScaleFactor(0.76)
@@ -16003,13 +16883,15 @@ private struct SettingsNativeTextFieldRow: View {
     @Binding var text: String
     var isSecure: Bool = false
     var fieldWidth: CGFloat = 300
+    var status: String? = nil
+    var statusColor: Color = .white.opacity(0.56)
     var onCommit: () -> Void = {}
 
     @FocusState private var isFocused: Bool
 
     var body: some View {
         SettingsRowShell(isFocused: isFocused, accentColor: .white) {
-            SettingsRowText(title: title, subtitle: subtitle)
+            SettingsRowText(title: title, subtitle: subtitle, status: status, statusColor: statusColor)
 
             Spacer(minLength: 24)
 
@@ -16364,21 +17246,29 @@ private struct SettingsRowShell<Content: View>: View {
 private struct SettingsRowText: View {
     let title: String
     let subtitle: String
+    /// A status after the subtitle in its own color (a key's check, say).
+    var status: String? = nil
+    var statusColor: Color = .white.opacity(0.56)
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title)
-                .font(.system(size: 22, weight: .semibold))
+                .font(.appFont(size: 22, weight: .semibold))
                 .foregroundColor(.white)
                 .lineLimit(1)
                 .minimumScaleFactor(0.82)
 
-            Text(subtitle)
-                .font(.system(size: 17, weight: .medium))
-                .foregroundColor(.white.opacity(0.56))
+            subtitleText
+                .font(.appFont(size: 17, weight: .medium))
                 .lineLimit(2)
                 .minimumScaleFactor(0.82)
         }
+    }
+
+    private var subtitleText: Text {
+        let base = Text(subtitle).foregroundColor(.white.opacity(0.56))
+        guard let status, !status.isEmpty else { return base }
+        return base + Text(" " + status).foregroundColor(statusColor)
     }
 }
 
@@ -16530,6 +17420,7 @@ private struct UsenetSettingsSection: View {
     @State private var profile = UsenetSettings.profile().rawValue
     @State private var prefersOwnServers = UsenetSettings.prefersOwnServers()
     @State private var speedLimit = String(UsenetSettings.speedLimitMbps())
+    @State private var syncToAccount = UsenetSettings.syncChoice() ?? false
 
     var body: some View {
         SettingsGroup(
@@ -16582,6 +17473,24 @@ private struct UsenetSettingsSection: View {
                 isOn: $prefersOwnServers,
                 accentColor: accentColor
             )
+
+            // Written only from the toggle: a profile that never chose leaves
+            // the account's copy alone (see UsenetSettingsSync).
+            SettingsToggleRow(
+                title: L10n.string("usenet_sync_title", fallback: "Save to Nuvio Account"),
+                subtitle: L10n.string(
+                    "usenet_sync_subtitle",
+                    fallback: "Keep these servers and their passwords in this profile of your Nuvio account, so a reinstall or another Apple TV gets them back. Passwords are stored like debrid keys. Turning it off removes them from the account."
+                ),
+                isOn: Binding(
+                    get: { syncToAccount },
+                    set: { value in
+                        syncToAccount = value
+                        UsenetSettings.setSyncChoice(value)
+                    }
+                ),
+                accentColor: accentColor
+            )
         }
         .onChange(of: profile) { _, value in
             UsenetSettings.setProfile(UsenetMemoryProfile(rawValue: value) ?? .balanced)
@@ -16594,6 +17503,11 @@ private struct UsenetSettingsSection: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .usenetServersChanged)) { _ in
             model.reload()
+            // An account pull may have brought servers and settings in.
+            syncToAccount = UsenetSettings.syncChoice() ?? false
+            profile = UsenetSettings.profile().rawValue
+            prefersOwnServers = UsenetSettings.prefersOwnServers()
+            speedLimit = String(UsenetSettings.speedLimitMbps())
         }
         .sheet(isPresented: $isAddingServer) {
             UsenetServerEditSheet(server: nil, accentColor: accentColor)

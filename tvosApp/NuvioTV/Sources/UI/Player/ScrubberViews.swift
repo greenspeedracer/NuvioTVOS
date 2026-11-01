@@ -3,12 +3,45 @@ import CoreGraphics
 
 // MARK: - Progress track
 
+/// A stretch of the timeline drawn in its own color (the opening, the ending).
+struct PlayerTrackSegment: Equatable {
+    var start: Double
+    var end: Double
+    var color: Color
+}
+
+extension PlaybackChapters.Kind {
+    /// The opening's and the ending's color (Settings → Player; yellow and blue by default):
+    /// on the timeline and as the chapter badges.
+    var color: Color {
+        Color(hex: PlaybackChapters.colorHex(for: self, in: ProfileSettings.current))
+    }
+
+    /// The text on a badge of `color`.
+    var labelColor: Color {
+        PlaybackChapters.prefersDarkText(on: PlaybackChapters.colorHex(for: self, in: ProfileSettings.current))
+            ? .black : .white
+    }
+}
+
 /// Shared transport bar used by the controls timeline, Seek HUD, and Infuse scrub HUD.
 ///
 /// `glassTrack` uses a single frosted capsule (material + soft white tint) so it
 /// matches the liquid-glass control chrome without `glassEffect`, which draws a
 /// second raised pill and reads as a double bar.
 struct PlayerProgressTrack: View {
+    /// How much taller the piece under the playhead is than the track's height.
+    static let currentPieceLift: CGFloat = 4
+    /// The gap between two pieces of the track.
+    static let pieceGap: CGFloat = 2
+    /// The mark of where playback is (`position`).
+    static let positionColor = Color(red: 1, green: 0.23, blue: 0.19)
+
+    /// The pieces away from the playhead: two thirds of the track's height (5 of 7, 8 of 12).
+    static func otherPieceHeight(for height: CGFloat) -> CGFloat {
+        max(3, (height * 2 / 3).rounded())
+    }
+
     var played: Double
     var buffered: Double
     var height: CGFloat = 10
@@ -16,6 +49,14 @@ struct PlayerProgressTrack: View {
     var emphasized: Bool = false
     /// When true, the track is a frosted glass capsule (one bar, not glassEffect).
     var glassTrack: Bool = false
+    /// Chapter starts as fractions of the track: optional markers.
+    var markers: [Double] = []
+    /// Colored stretches: the opening and the ending colors.
+    var segments: [PlayerTrackSegment] = []
+    /// The played part's white opacity.
+    var playedOpacity: Double = 0.4
+    /// Optional position indicator.
+    var position: Double? = nil
 
     @State private var animatedBuffered: Double = 0
 
@@ -25,15 +66,19 @@ struct PlayerProgressTrack: View {
             let p = CGFloat(min(max(played, 0), 1))
             let b = CGFloat(min(max(animatedBuffered, 0), 1))
             let h = emphasized ? height + 2 : height
+            let pieces = PlaybackChapters.timelinePieces(
+                markers: markers,
+                segments: segments.map { (start: $0.start, end: $0.end) }
+            )
 
             ZStack(alignment: .leading) {
-                // Single track layer (fills + clip = one bar, not glassEffect).
+                // Single track layer (fills + clip = one capsule, not glassEffect).
                 ZStack(alignment: .leading) {
                     if glassTrack {
                         Capsule()
                             .fill(.ultraThinMaterial)
                             .overlay(
-                                Capsule().fill(Color.white.opacity(emphasized ? 0.28 : 0.14))
+                                Capsule().fill(Color.white.opacity(emphasized ? 0.16 : 0.07))
                             )
                     } else {
                         Capsule()
@@ -46,11 +91,35 @@ struct PlayerProgressTrack: View {
                             .frame(width: w * b)
                     }
 
+                    // Opening & ending segments ahead of playback
+                    ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
+                        let start = CGFloat(min(max(segment.start, 0), 1))
+                        let end = CGFloat(min(max(segment.end, 0), 1))
+                        if end > start {
+                            Rectangle()
+                                .fill(segment.color.opacity(0.8))
+                                .frame(width: w * (end - start), height: h)
+                                .position(x: w * (start + end) / 2, y: h / 2)
+                        }
+                    }
+
                     if p > 0 {
-                        // Played progress bar (semi-opaque grey)
+                        // Played progress bar (semi-opaque white)
                         Rectangle()
-                            .fill(Color.white.opacity(0.65))
+                            .fill(Color.white.opacity(playedOpacity))
                             .frame(width: w * p)
+
+                        // Played portion of opening & ending segments in full vibrant color
+                        ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
+                            let start = CGFloat(min(max(segment.start, 0), 1))
+                            let end = min(CGFloat(min(max(segment.end, 0), 1)), p)
+                            if end > start {
+                                Rectangle()
+                                    .fill(segment.color)
+                                    .frame(width: w * (end - start), height: h)
+                                    .position(x: w * (start + end) / 2, y: h / 2)
+                            }
+                        }
 
                         // Leading edge tick: bright white cap flush with the track height
                         Rectangle()
@@ -61,6 +130,16 @@ struct PlayerProgressTrack: View {
                 }
                 .frame(height: h)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .mask(alignment: .leading) {
+                    trackShape(
+                        pieces: pieces,
+                        current: nil,
+                        width: w,
+                        height: h,
+                        full: h
+                    )
+                    .frame(width: w, height: h)
+                }
                 .clipShape(Capsule())
 
                 if showThumb {
@@ -80,6 +159,35 @@ struct PlayerProgressTrack: View {
         }
         .onChange(of: buffered) { _, newBuffered in
             updateAnimatedBuffered(to: newBuffered)
+        }
+    }
+
+    /// The track's outline: one bar, or the pieces side by side with a gap between them,
+    /// the one under the playhead `full` tall and the others `height`.
+    @ViewBuilder
+    private func trackShape(
+        pieces: [PlaybackChapters.TimelinePiece],
+        current: Int?,
+        width w: CGFloat,
+        height h: CGFloat,
+        full: CGFloat
+    ) -> some View {
+        if pieces.isEmpty {
+            Rectangle()
+        } else {
+            ZStack(alignment: .topLeading) {
+                ForEach(Array(pieces.enumerated()), id: \.offset) { index, piece in
+                    let lead = index > 0 ? Self.pieceGap / 2 : 0
+                    let trail = index < pieces.count - 1 ? Self.pieceGap / 2 : 0
+                    let x0 = w * CGFloat(piece.start) + lead
+                    let x1 = w * CGFloat(piece.end) - trail
+                    Rectangle()
+                        .frame(width: max(0, x1 - x0), height: index == current ? full : h)
+                        .position(x: (x0 + x1) / 2, y: full / 2)
+                }
+            }
+            .frame(width: w, height: full, alignment: .topLeading)
+            .animation(.easeOut(duration: 0.2), value: current)
         }
     }
 
@@ -233,6 +341,9 @@ struct SeekPreviewCard: View {
     let image: CGImage?
     var width: CGFloat = 480
     var naturalSize: CGSize = CGSize(width: 16, height: 9)
+    /// The still belongs to a passed position while the target's own is on its way: dimmed, so
+    /// it does not read as the preview of where the remote rests.
+    var isStale: Bool = false
 
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
 
@@ -252,6 +363,8 @@ struct SeekPreviewCard: View {
                     .aspectRatio(contentMode: .fill)
                     .frame(width: cardSize.width, height: cardSize.height)
                     .clipped()
+                    .blur(radius: isStale ? 8 : 0)
+                    .opacity(isStale ? 0.35 : 1)
             } else {
                 ZStack {
                     RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
@@ -343,10 +456,10 @@ struct InfuseScrubHUD: View {
 
                         // Ghost tick: live playback position while scrubbing.
                         Rectangle()
-                            .fill(Color.white.opacity(0.45))
-                            .frame(width: 3, height: 22)
+                            .fill(Color.white)
+                            .frame(width: 2, height: 22)
                             .offset(
-                                x: w * CGFloat(min(max(current / duration, 0), 1)) - 1.5,
+                                x: w * CGFloat(min(max(current / duration, 0), 1)) - 1,
                                 y: previewHeight + 50
                             )
 

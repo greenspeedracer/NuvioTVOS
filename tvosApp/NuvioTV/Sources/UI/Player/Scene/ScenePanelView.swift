@@ -19,15 +19,29 @@ struct ScenePanelView: View {
         ScenePanelWatchPartyFocusContext
     ) -> AnyView)?
     let watchPartyFocusTarget: String
+    /// The Chapters tab's row, given the card focus and how to leave it (like Watch Party).
+    let chaptersContent: ((
+        FocusState<String?>.Binding,
+        ScenePanelWatchPartyFocusContext
+    ) -> AnyView)?
+    /// The card the Chapters tab enters on: the playing chapter's.
+    let chaptersFocusTarget: String
 
     private enum FocusSection: Equatable { case tabs, content }
     
     @FocusState private var focusedTab: SceneTab?
     @FocusState private var focusedCardID: String?
+    @FocusState private var focusedEmptyClose: Bool
     @State private var activeFocusSection: FocusSection = .tabs
     @State private var contentFocusAnchors: [SceneTab: String] = [:]
     @State private var focusHandoffGeneration = 0
     @State private var pendingTabFocusTarget: SceneTab?
+    @State private var tabOrder: [SceneTab] = TVSceneTabOrder.currentOrder()
+    @State private var disabledTabs: Set<SceneTab> = TVSceneTabOrder.disabledTabs()
+    @State private var needsTabReconciliation = false
+    /// The card the panel is handing the focus to as it opens (the Chapters tab opens on the
+    /// playing chapter): until it has it, the tabs stand aside and only that card takes focus.
+    @State private var pendingCardFocusTarget: String?
     
     init(
         viewModel: SceneViewModel,
@@ -38,7 +52,12 @@ struct ScenePanelView: View {
             FocusState<String?>.Binding,
             ScenePanelWatchPartyFocusContext
         ) -> AnyView)? = nil,
-        watchPartyFocusTarget: String = "party.start"
+        watchPartyFocusTarget: String = "party.start",
+        chaptersContent: ((
+            FocusState<String?>.Binding,
+            ScenePanelWatchPartyFocusContext
+        ) -> AnyView)? = nil,
+        chaptersFocusTarget: String = "chapter-0"
     ) {
         self.viewModel = viewModel
         self.isAdvancing = isAdvancing
@@ -46,6 +65,8 @@ struct ScenePanelView: View {
         self.onPlayNextEpisode = onPlayNextEpisode
         self.watchPartyContent = watchPartyContent
         self.watchPartyFocusTarget = watchPartyFocusTarget
+        self.chaptersContent = chaptersContent
+        self.chaptersFocusTarget = chaptersFocusTarget
     }
     
     var body: some View {
@@ -54,53 +75,84 @@ struct ScenePanelView: View {
             
             // Bottom third panel
             VStack(alignment: .leading, spacing: 22) {
-                // Tab Header Bar
-                tabHeaderBar
-                    .padding(.top, 10)
-                    .focusSection()
-                
-                // Active Tab Content
-                Group {
-                    switch viewModel.selectedTab {
-                    case .scene:
-                        sceneTabContent
-                    case .info:
-                        infoTabContent
-                    case .upNext:
-                        upNextTabContent
-                    case .watchParty:
-                        watchPartyContent?(
-                            $focusedCardID,
-                            ScenePanelWatchPartyFocusContext(
-                                entryLocked: activeFocusSection != .content,
-                                entryFocusTarget: contentFocusAnchor(for: .watchParty) ?? watchPartyFocusTarget,
-                                entryFallbackTarget: watchPartyFocusTarget,
-                                onFocusChanged: rememberWatchPartyFocus,
-                                onMoveUpFromContent: focusSelectedTabFromContent,
-                                focusTab: requestTabFocus
-                            )
-                        ) ?? AnyView(EmptyView())
+                if let selectedTab = selectedVisibleTab {
+                    // Tab Header Bar
+                    tabHeaderBar
+                        .padding(.top, 10)
+                        .focusSection()
+
+                    // Active Tab Content
+                    Group {
+                        content(for: selectedTab)
                     }
+                    // Keep the bottom-anchored panel at a constant size across tab navigation.
+                    // The previous 272/300pt switch made InSight visibly jump vertically.
+                    .frame(height: 300, alignment: .top)
+                    .focusSection()
+                } else {
+                    noAvailableSectionsState
                 }
-                // Keep the bottom-anchored panel at a constant size across tab navigation.
-                // The previous 272/300pt switch made InSight visibly jump vertically.
-                .frame(height: 300, alignment: .top)
-                .focusSection()
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onExitCommand {
             onDismiss()
         }
         .onDisappear {
             focusHandoffGeneration &+= 1
             pendingTabFocusTarget = nil
+            pendingCardFocusTarget = nil
         }
         .onAppear {
-            activeFocusSection = .tabs
-            focusedTab = viewModel.selectedTab
+            reloadSettings()
+            if let firstTab = visibleTabs.first {
+                if firstTab == .chapters, chaptersContent != nil {
+                    // Chapters open straight on the playing chapter: one Down from playback.
+                    // Up goes to the tabs, and Up again closes the panel.
+                    openOnChapters()
+                } else {
+                    requestTabFocus(firstTab)
+                }
+            } else {
+                reconcileAvailableTabs()
+            }
+        }
+        .onChange(of: visibleTabs) { _, _ in
+            reconcileAvailableTabs()
+        }
+        .onChange(of: viewModel.availableTabs) { _, _ in
+            reconcileAvailableTabs()
+        }
+        .onChange(of: viewModel.isDetailVisible) { _, isVisible in
+            if isVisible {
+                if pendingTabFocusTarget != nil {
+                    needsTabReconciliation = true
+                }
+                invalidateFocusHandoff()
+            } else if needsTabReconciliation {
+                needsTabReconciliation = false
+                if !reloadSettings() {
+                    reconcileAvailableTabs()
+                }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: TVSceneTabOrder.changedNotification).receive(on: RunLoop.main)) { _ in
+            reloadSettings()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ProfileSettings.settingsChangedNotification).receive(on: RunLoop.main)) { _ in
+            reloadSettings()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification).receive(on: RunLoop.main)) { _ in
+            reloadSettings()
         }
         .onChange(of: focusedTab) { _, newTab in
+            guard !viewModel.isDetailVisible else { return }
+            if let card = pendingCardFocusTarget {
+                // A tab took the focus while the panel opens on a card: hand it back.
+                if newTab != nil { reassertPendingCardFocus(card) }
+                return
+            }
             if let pending = pendingTabFocusTarget {
                 guard let newTab else {
                     reassertPendingTabFocus(pending)
@@ -114,6 +166,10 @@ struct ScenePanelView: View {
                 return
             }
             guard let newTab else { return }
+            guard visibleTabs.contains(newTab) else {
+                reconcileAvailableTabs()
+                return
+            }
             invalidateFocusHandoff()
             activeFocusSection = .tabs
             if viewModel.selectedTab != newTab {
@@ -123,6 +179,13 @@ struct ScenePanelView: View {
             }
         }
         .onChange(of: viewModel.selectedTab) { _, newTab in
+            guard !viewModel.isDetailVisible else { return }
+            // Opening on a chapter card selects the Chapters tab without focusing it.
+            guard pendingCardFocusTarget == nil else { return }
+            guard visibleTabs.contains(newTab) else {
+                reconcileAvailableTabs()
+                return
+            }
             if let pending = pendingTabFocusTarget {
                 if pending != newTab { requestTabFocus(newTab) }
                 else { activeFocusSection = .tabs }
@@ -133,11 +196,16 @@ struct ScenePanelView: View {
             }
         }
         .onChange(of: focusedCardID) { _, newID in
+            guard !viewModel.isDetailVisible else { return }
             if let pending = pendingTabFocusTarget {
                 reassertPendingTabFocus(pending)
                 return
             }
             guard let newID else { return }
+            guard visibleTabs.contains(viewModel.selectedTab) else {
+                reconcileAvailableTabs()
+                return
+            }
             activeFocusSection = .content
             if isValidContentAnchor(newID, for: viewModel.selectedTab) {
                 contentFocusAnchors[viewModel.selectedTab] = newID
@@ -155,7 +223,6 @@ struct ScenePanelView: View {
         .onChange(of: watchPartyFocusTarget) { _, _ in
             reconcileActiveContentFocus()
         }
-        .defaultFocus($focusedTab, viewModel.selectedTab)
     }
     
     // MARK: - Tab Header Bar
@@ -163,7 +230,7 @@ struct ScenePanelView: View {
     private var tabHeaderBar: some View {
         HStack(spacing: 20) {
             ForEach(visibleTabs) { tab in
-                let isSelected = viewModel.selectedTab == tab
+                let isSelected = selectedVisibleTab == tab
                 let isTabFocused = focusedTab == tab
                 
                 Button(action: {
@@ -192,7 +259,8 @@ struct ScenePanelView: View {
                 .focused($focusedTab, equals: tab)
                 .focusEffectDisabledIfAvailable()
                 .disabled((pendingTabFocusTarget != nil && pendingTabFocusTarget != tab)
-                    || (activeFocusSection == .content && viewModel.selectedTab != tab))
+                    || pendingCardFocusTarget != nil
+                    || (activeFocusSection == .content && selectedVisibleTab != tab))
                 .scaleEffect(isTabFocused ? 1.05 : 1.0)
                 .animation(.easeOut(duration: 0.14), value: isTabFocused)
                 .onExitCommand(perform: onDismiss)
@@ -210,11 +278,92 @@ struct ScenePanelView: View {
         }
         .padding(.horizontal, 60)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .defaultFocus($focusedTab, selectedVisibleTab ?? .scene)
     }
 
     private var visibleTabs: [SceneTab] {
-        guard watchPartyContent != nil else { return viewModel.availableTabs }
-        return viewModel.availableTabs + [.watchParty]
+        var runtimeTabs = viewModel.availableTabs.filter { $0 != .watchParty }
+        if watchPartyContent != nil {
+            runtimeTabs.append(.watchParty)
+        }
+        let runtimeTabSet = Set(runtimeTabs)
+        return tabOrder.filter { runtimeTabSet.contains($0) && !disabledTabs.contains($0) }
+    }
+
+    private var selectedVisibleTab: SceneTab? {
+        let tabs = visibleTabs
+        return tabs.contains(viewModel.selectedTab) ? viewModel.selectedTab : tabs.first
+    }
+
+    private var noAvailableSectionsState: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text(L10n.string("tvos_settings_no_insight_sections_available", fallback: "No InSight sections are available for this playback"))
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundColor(.white.opacity(0.84))
+
+            Button(action: onDismiss) {
+                Text(L10n.string("action_close", fallback: "Close InSight"))
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundColor(focusedEmptyClose ? .black : .white)
+                    .padding(.horizontal, 28)
+                    .frame(height: 56)
+                    .modifier(TvDetailsGlassBackground(filled: focusedEmptyClose, shape: Capsule()))
+            }
+            .buttonStyle(PosterCardButtonStyle())
+            .focused($focusedEmptyClose)
+            .focusEffectDisabledIfAvailable()
+            .onExitCommand(perform: onDismiss)
+        }
+        .frame(maxWidth: .infinity, minHeight: 300, alignment: .leading)
+        .padding(.horizontal, 60)
+        .focusSection()
+    }
+
+    @ViewBuilder
+    private func content(for tab: SceneTab) -> some View {
+        switch tab {
+        case .chapters:
+            if let chaptersContent {
+                chaptersContent(
+                    $focusedCardID,
+                    ScenePanelWatchPartyFocusContext(
+                        entryLocked: viewModel.isDetailVisible
+                            || activeFocusSection != .content
+                            || pendingCardFocusTarget != nil,
+                        entryFocusTarget: pendingCardFocusTarget
+                            ?? contentFocusAnchor(for: .chapters) ?? chaptersFocusTarget,
+                        entryFallbackTarget: chaptersFocusTarget,
+                        onFocusChanged: rememberChapterFocus,
+                        onMoveUpFromContent: focusSelectedTabFromContent,
+                        focusTab: requestTabFocus
+                    )
+                )
+            } else {
+                EmptyView()
+            }
+        case .scene:
+            sceneTabContent
+        case .info:
+            infoTabContent
+        case .upNext:
+            upNextTabContent
+        case .watchParty:
+            if let watchPartyContent {
+                watchPartyContent(
+                    $focusedCardID,
+                    ScenePanelWatchPartyFocusContext(
+                        entryLocked: viewModel.isDetailVisible || activeFocusSection != .content,
+                        entryFocusTarget: contentFocusAnchor(for: .watchParty) ?? watchPartyFocusTarget,
+                        entryFallbackTarget: watchPartyFocusTarget,
+                        onFocusChanged: rememberWatchPartyFocus,
+                        onMoveUpFromContent: focusSelectedTabFromContent,
+                        focusTab: requestTabFocus
+                    )
+                )
+            } else {
+                EmptyView()
+            }
+        }
     }
     
     // MARK: - Scene Tab Content
@@ -503,7 +652,6 @@ struct ScenePanelView: View {
                     .padding(.vertical, 16)
                     .frame(height: 256)
                     .modifier(TvDetailsGlassBackground(filled: isNextFocused, shape: RoundedRectangle(cornerRadius: 32, style: .continuous)))
-                    .shadow(color: Color.black.opacity(isNextFocused ? 0.22 : 0.25), radius: isNextFocused ? 10 : 6, y: isNextFocused ? 5 : 3)
                 }
                 .buttonStyle(PosterCardButtonStyle())
                 .focused($focusedCardID, equals: "upNext")
@@ -532,11 +680,61 @@ struct ScenePanelView: View {
     }
     
     // MARK: - Focus Management
+
+    @discardableResult
+    private func reloadSettings() -> Bool {
+        let currentOrder = TVSceneTabOrder.currentOrder()
+        let currentDisabledTabs = TVSceneTabOrder.disabledTabs()
+        let settingsChanged = tabOrder != currentOrder || disabledTabs != currentDisabledTabs
+        guard settingsChanged else { return false }
+        if viewModel.isDetailVisible {
+            needsTabReconciliation = true
+            return false
+        }
+        tabOrder = currentOrder
+        disabledTabs = currentDisabledTabs
+        reconcileAvailableTabs()
+        return true
+    }
+
+    private func reconcileAvailableTabs() {
+        guard !viewModel.isDetailVisible else {
+            needsTabReconciliation = true
+            return
+        }
+        let tabs = visibleTabs
+        guard let firstTab = tabs.first else {
+            invalidateFocusHandoff()
+            activeFocusSection = .tabs
+            focusedTab = nil
+            focusedCardID = nil
+            focusedEmptyClose = true
+            return
+        }
+
+        focusedEmptyClose = false
+        let target = tabs.contains(viewModel.selectedTab) ? viewModel.selectedTab : firstTab
+        guard viewModel.selectedTab == target else {
+            requestTabFocus(target)
+            return
+        }
+
+        if activeFocusSection == .content {
+            reconcileActiveContentFocus()
+        } else if focusedTab != target {
+            activeFocusSection = .tabs
+            focusedTab = target
+        }
+    }
     
     private func focusFirstCard() {
+        guard !viewModel.isDetailVisible else { return }
         invalidateFocusHandoff()
         let generation = focusHandoffGeneration
-        let tab = viewModel.selectedTab
+        guard let tab = selectedVisibleTab else {
+            reconcileAvailableTabs()
+            return
+        }
         guard let target = contentFocusAnchor(for: tab) else {
             requestTabFocus(tab)
             return
@@ -545,6 +743,7 @@ struct ScenePanelView: View {
         focusedCardID = target
         DispatchQueue.main.async {
             guard focusHandoffGeneration == generation,
+                  !viewModel.isDetailVisible,
                   viewModel.selectedTab == tab,
                   activeFocusSection == .content else { return }
             guard let currentTarget = contentFocusAnchor(for: tab) else {
@@ -558,10 +757,22 @@ struct ScenePanelView: View {
     }
 
     private func focusSelectedTabFromContent() {
-        requestTabFocus(viewModel.selectedTab)
+        guard let tab = selectedVisibleTab else {
+            reconcileAvailableTabs()
+            return
+        }
+        requestTabFocus(tab)
     }
 
     private func requestTabFocus(_ tab: SceneTab) {
+        guard !viewModel.isDetailVisible else {
+            needsTabReconciliation = true
+            return
+        }
+        guard visibleTabs.contains(tab) else {
+            reconcileAvailableTabs()
+            return
+        }
         invalidateFocusHandoff()
         let generation = focusHandoffGeneration
         pendingTabFocusTarget = tab
@@ -575,30 +786,91 @@ struct ScenePanelView: View {
         focusedTab = tab
         DispatchQueue.main.async {
             guard focusHandoffGeneration == generation,
+                  !viewModel.isDetailVisible,
                   viewModel.selectedTab == tab,
                   pendingTabFocusTarget == tab else { return }
             if focusedTab != tab { focusedTab = tab }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
             guard focusHandoffGeneration == generation,
+                  !viewModel.isDetailVisible,
                   pendingTabFocusTarget == tab else { return }
             pendingTabFocusTarget = nil
         }
     }
 
     private func reassertPendingTabFocus(_ tab: SceneTab) {
+        guard !viewModel.isDetailVisible else {
+            needsTabReconciliation = true
+            return
+        }
+        guard visibleTabs.contains(tab) else {
+            reconcileAvailableTabs()
+            return
+        }
         let generation = focusHandoffGeneration
         DispatchQueue.main.async {
             guard focusHandoffGeneration == generation,
+                  !viewModel.isDetailVisible,
                   pendingTabFocusTarget == tab,
                   viewModel.selectedTab == tab else { return }
             if focusedTab != tab { focusedTab = tab }
         }
     }
 
+    /// Opens on the playing chapter's card instead of the Chapters tab (see `requestCardFocus`).
+    private func openOnChapters() {
+        if viewModel.selectedTab != .chapters {
+            viewModel.selectTab(.chapters)
+        }
+        guard let card = contentFocusAnchor(for: .chapters) else {
+            requestTabFocus(.chapters)
+            return
+        }
+        requestCardFocus(card)
+    }
+
+    /// Hands the focus to a card of the selected tab instead of its tab, like `requestTabFocus`:
+    /// while the handoff settles, the tabs are disabled and the card is the only one that can focus.
+    private func requestCardFocus(_ card: String) {
+        guard !viewModel.isDetailVisible else { return }
+        invalidateFocusHandoff()
+        let generation = focusHandoffGeneration
+        let tab = viewModel.selectedTab
+        pendingCardFocusTarget = card
+        activeFocusSection = .content
+        focusedCardID = card
+        DispatchQueue.main.async {
+            guard focusHandoffGeneration == generation,
+                  !viewModel.isDetailVisible,
+                  viewModel.selectedTab == tab,
+                  pendingCardFocusTarget == card else { return }
+            if focusedCardID != card { focusedCardID = card }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            guard focusHandoffGeneration == generation,
+                  pendingCardFocusTarget == card else { return }
+            pendingCardFocusTarget = nil
+            // The card never took the focus: the tab takes it, as for the other tabs.
+            if focusedCardID == nil, focusedTab == nil { focusSelectedTabFromContent() }
+        }
+    }
+
+    private func reassertPendingCardFocus(_ card: String) {
+        let generation = focusHandoffGeneration
+        DispatchQueue.main.async {
+            guard focusHandoffGeneration == generation,
+                  !viewModel.isDetailVisible,
+                  pendingCardFocusTarget == card else { return }
+            activeFocusSection = .content
+            if focusedCardID != card { focusedCardID = card }
+        }
+    }
+
     private func invalidateFocusHandoff() {
         focusHandoffGeneration &+= 1
         pendingTabFocusTarget = nil
+        pendingCardFocusTarget = nil
     }
 
     private func isContentEntryLocked(_ id: String) -> Bool {
@@ -609,6 +881,8 @@ struct ScenePanelView: View {
     private func contentFocusAnchor(for tab: SceneTab) -> String? {
         let anchors: [String]
         switch tab {
+        case .chapters:
+            anchors = [contentFocusAnchors[.chapters] ?? chaptersFocusTarget]
         case .scene:
             let actors = viewModel.snapshot.actors.map { "actor-\($0.id)" }
             let song = viewModel.snapshot.song.map { "song-\($0.id)" }
@@ -628,6 +902,8 @@ struct ScenePanelView: View {
 
     private func isValidContentAnchor(_ id: String, for tab: SceneTab) -> Bool {
         switch tab {
+        case .chapters:
+            return id.hasPrefix("chapter-")
         case .scene:
             return contentFocusAnchorCandidates(for: tab).contains(id)
         case .info:
@@ -646,7 +922,20 @@ struct ScenePanelView: View {
         return actors + (song.map { [$0] } ?? [])
     }
 
+    /// The chapter cards report their focus, like Watch Party's controls.
+    private func rememberChapterFocus(_ id: String?) {
+        guard !viewModel.isDetailVisible else { return }
+        if let pending = pendingTabFocusTarget {
+            reassertPendingTabFocus(pending)
+            return
+        }
+        guard let id, isValidContentAnchor(id, for: .chapters) else { return }
+        contentFocusAnchors[.chapters] = id
+        activeFocusSection = .content
+    }
+
     private func rememberWatchPartyFocus(_ id: String?) {
+        guard !viewModel.isDetailVisible else { return }
         if let pending = pendingTabFocusTarget {
             reassertPendingTabFocus(pending)
             return
@@ -657,11 +946,19 @@ struct ScenePanelView: View {
     }
 
     private func reconcileActiveContentFocus() {
-        guard activeFocusSection == .content else { return }
-        if let focusedCardID, isValidContentAnchor(focusedCardID, for: viewModel.selectedTab) {
+        guard !viewModel.isDetailVisible else {
+            needsTabReconciliation = true
             return
         }
-        guard let target = contentFocusAnchor(for: viewModel.selectedTab) else {
+        guard activeFocusSection == .content else { return }
+        guard let tab = selectedVisibleTab else {
+            reconcileAvailableTabs()
+            return
+        }
+        if let focusedCardID, isValidContentAnchor(focusedCardID, for: tab) {
+            return
+        }
+        guard let target = contentFocusAnchor(for: tab) else {
             focusSelectedTabFromContent()
             return
         }

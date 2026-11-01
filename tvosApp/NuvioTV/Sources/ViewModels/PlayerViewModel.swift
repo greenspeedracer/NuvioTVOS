@@ -8,6 +8,27 @@ protocol ScrubThumbnailProviding: AnyObject {
     var supportsScrubThumbnails: Bool { get }
     func cachedScrubThumbnail(atSeconds seconds: Double, duration: Double) async -> CGImage?
     func scrubThumbnail(atSeconds seconds: Double, maxWidth: Int, precise: Bool) async -> CGImage?
+    /// The closest still already held within `maxDistance`, shown when the target has none yet.
+    func nearestScrubThumbnail(atSeconds seconds: Double, maxDistance: Double) async -> CGImage?
+    /// True when `prefetchScrubThumbnails` runs in the background without retiring the
+    /// foreground request (the seek preview lane); false keeps the speculative requests.
+    var prefetchesScrubThumbnailsInBackground: Bool { get }
+    func prefetchScrubThumbnails(around seconds: Double, direction: Double, duration: Double)
+    /// Seconds until previews may read the source, when only a just-started pause holds them back.
+    func pendingScrubThumbnailDelay() -> TimeInterval?
+    /// A chapter's still for the Chapters panel, without retiring a seek preview request.
+    func chapterThumbnail(atSeconds seconds: Double, duration: Double) async -> CGImage?
+}
+
+extension ScrubThumbnailProviding {
+    func nearestScrubThumbnail(atSeconds seconds: Double, maxDistance: Double) async -> CGImage? { nil }
+    var prefetchesScrubThumbnailsInBackground: Bool { false }
+    func prefetchScrubThumbnails(around seconds: Double, direction: Double, duration: Double) {}
+    func pendingScrubThumbnailDelay() -> TimeInterval? { nil }
+    func chapterThumbnail(atSeconds seconds: Double, duration: Double) async -> CGImage? {
+        if let cached = await cachedScrubThumbnail(atSeconds: seconds, duration: duration) { return cached }
+        return await scrubThumbnail(atSeconds: seconds, maxWidth: 320, precise: false)
+    }
 }
 
 struct LiveStreamFailoverPolicy {
@@ -206,6 +227,21 @@ class PlayerViewModel: ObservableObject {
     let clock = PlaybackClock()
     @Published var subtitles: [SubtitleTrack] = []
     @Published var audioTracks: [AudioTrack] = []
+    /// Container chapters of the playing file (empty when it has none).
+    @Published var chapters: [PlaybackChapter] = [] {
+        didSet {
+            if !PlaybackChapters.isSameList(chapters, oldValue) { resetChapterThumbnails() }
+        }
+    }
+    /// Stills for the Chapters panel: loaded for every chapter after the panel's first open.
+    let chapterThumbnails = ChapterThumbnailStore()
+    private var chapterThumbnailTask: Task<Void, Never>?
+    private var chapterThumbnailToken: UInt64 = 0
+    private var chapterThumbnailFocusIndex: Int?
+    /// The stills started loading on their own for this chapter list (see
+    /// `autoStartChapterThumbnailsIfReady`), and since when playback could let them.
+    private var chapterThumbnailsAutoStarted = false
+    private var chapterThumbnailsEligibleSince: Date?
     @Published var discTitles: [PlaybackDiscTitleInfo] = []
     @Published var selectedDiscTitleId: Int? = nil
     @Published var playbackSpeed: PlaybackSpeed = .normal
@@ -229,6 +265,9 @@ class PlayerViewModel: ObservableObject {
     /// Cache-backed Aether still for the current scrub target. Nil means the
     /// time-only HUD remains visible while a still is unavailable.
     @Published private(set) var scrubThumbnail: CGImage?
+    /// The card shows a still from somewhere else than where the remote rests (a position it
+    /// passed on the way), while the target's own still is on its way: the card dims it.
+    @Published private(set) var scrubThumbnailIsStale = false
     /// Accumulated D-pad skip preview (seconds). Zero when idle.
     @Published var pendingSeekDelta: Double = 0
     /// True while holding down D-pad Left/Right for continuous fast-seeking with live preview.
@@ -518,7 +557,28 @@ class PlayerViewModel: ObservableObject {
     private var traktProgressTask: Task<Void, Never>?
     private static let traktProgressReportInterval: TimeInterval = 30
     private(set) var controlsAutoHideSuspended = false
-    private var skipIntervals: [SkipInterval] = []
+    private var skipIntervals: [SkipInterval] = [] {
+        didSet { publishSkipSegments() }
+    }
+    /// Skip Intro / Skip Ending from chapter names ("Opening", "ED"…): exact for
+    /// the file, so they take the place of IntroDB's opening or ending.
+    private var chapterSkipIntervals: [SkipInterval] = [] {
+        didSet { publishSkipSegments() }
+    }
+    /// IntroDB's segments on the file's chapters (named ones first, the others
+    /// aligned to the chapter they line up with). The IntroDB season template
+    /// keeps learning from `skipIntervals` alone.
+    private var effectiveSkipIntervals: [SkipInterval] {
+        PlaybackChapters.merged(introDB: skipIntervals, chapters: chapterSkipIntervals, chapterList: chapters)
+    }
+    /// The same segments for the views: the opening and the ending colored on
+    /// the timeline, their badges in the chapter list.
+    @Published private(set) var skipSegments: [SkipInterval] = []
+
+    private func publishSkipSegments() {
+        let latest = effectiveSkipIntervals
+        if latest != skipSegments { skipSegments = latest }
+    }
     private var autoHiddenSkipIntervalId: String?
     /// Segments the user skipped during this playback item. Keep these hidden
     /// even while the asynchronous seek is still reporting the old position.
@@ -562,6 +622,9 @@ class PlayerViewModel: ObservableObject {
     /// Coarse D-pad jump while scrubbing (seconds). Pan zooms, presses hop.
     private var scrubJumpSeconds: Double { max(Double(seekStepSeconds) * 4, 60) }
     private var scrubValue: Double?
+    /// The swipe seek that stops on chapter and opening / ending edges (Settings → Player);
+    /// nil when snapping is off or there is nothing to stop on.
+    private var scrubSnap: PlaybackChapters.SnappingSeek?
     private var lastScrubPublish = Date.distantPast
     private var scrubTimeoutTask: Task<Void, Never>?
     private let suppliedScrubThumbnailProvider: (any ScrubThumbnailProviding)?
@@ -580,8 +643,24 @@ class PlayerViewModel: ObservableObject {
     private var pendingScrubThumbnailSeconds: Double?
     private var scrubThumbnailGeneration: UInt64 = 0
     private var scrubThumbnailInteractionToken: UInt64 = 0
-    private var scrubThumbnailTargetSeconds: Double?
+    private var scrubThumbnailTargetSeconds: Double? {
+        didSet { updateStaleScrubThumbnail() }
+    }
+    /// A still this far from the target belongs to another moment (more than a preview cell).
+    private static let staleScrubThumbnailDistance = 3.0
+    private var staleScrubThumbnailCheck: Task<Void, Never>?
+    /// How far from the target a held still may stand in while the target has none.
+    static let nearestScrubThumbnailDistance: Double = 30
     private var lastScrubTargetSeconds: Double?
+    /// When the requested target last moved. A superseded frame is shown as feedback only
+    /// while the remote keeps moving.
+    private var lastScrubTargetChange = Date.distantPast
+    /// Requests closer than this ask for the same still: the end of a touch gesture repeats the
+    /// last published target.
+    private static let sameScrubTargetTolerance = 0.05
+    /// Targets change every 33 ms while swiping and every 100 ms while holding: a longer gap
+    /// means the remote rests.
+    private static let scrubMovingWindow: TimeInterval = 0.25
     private var speculativePrefetchTask: Task<Void, Never>?
     private var scrubLastDx: CGFloat = 0
     private var scrubEngagedThisStroke = false
@@ -867,6 +946,8 @@ class PlayerViewModel: ObservableObject {
             self.addedExternalSubtitleURLs = Set(self.sessionCoordinator.lastRequest?.externalSubtitles.map(\.url) ?? [])
             self.didAddExternalSubtitles = true
             self.audioTracks = []
+            self.chapters = []
+            self.chapterSkipIntervals = []
             self.subtitles = []
             self.discTitles = []
             self.selectedDiscTitleId = nil
@@ -1234,6 +1315,7 @@ class PlayerViewModel: ObservableObject {
             season: activeEpisodeNumbers?.season,
             episode: activeEpisodeNumbers?.episode,
             duration: expectedDurationSeconds,
+            fileIdentity: (cacheFileIdentity ?? activeCacheFileIdentity)?.cacheKey ?? filename,
             fallbackURL: url.absoluteString
         )
         let isAnime = activeMeta?.isAnime == true
@@ -1286,6 +1368,7 @@ class PlayerViewModel: ObservableObject {
         let sNum = activeEpisodeNumbers?.season
         let eNum = activeEpisodeNumbers?.episode
         let expDur = expectedDurationSeconds
+        SeekPreviewDiagnostics.shared.updateSeekr("")
         trickplayResolveTask = Task { [weak self, activeGen = self.sessionCoordinator.loadGeneration] in
             let provider = await TrickplayResolver.shared.resolve(
                 contentId: contentId,
@@ -1294,11 +1377,27 @@ class PlayerViewModel: ObservableObject {
                 duration: expDur,
                 directTrickplayURL: directTPURL
             )
-            guard let self, let provider, !Task.isCancelled else { return }
-            await MainActor.run {
-                guard self.sessionCoordinator.loadGeneration == activeGen else { return }
-                self.sessionCoordinator.setExternalTrickplayProvider(provider)
+            guard let self, !Task.isCancelled else { return }
+            if let provider {
+                await MainActor.run {
+                    guard self.sessionCoordinator.loadGeneration == activeGen else { return }
+                    self.sessionCoordinator.setExternalTrickplayProvider(provider)
+                }
+                return
             }
+            // Seekr, with the profile's key; titles it doesn't have keep the player's previews.
+            guard await SeekrTrickplay.isEnabled(), self.isSeekPreviewEnabled, !self.isLiveStream else { return }
+            SeekPreviewDiagnostics.shared.updateSeekr("waiting for the file's length…")
+            guard let duration = await self.playingFileDuration(generation: activeGen) else { return }
+            let seekr = await SeekrTrickplay.shared.provider(
+                contentId: contentId,
+                season: sNum,
+                episode: eNum,
+                durationSeconds: duration
+            )
+            guard let seekr, !Task.isCancelled,
+                  self.sessionCoordinator.loadGeneration == activeGen else { return }
+            self.sessionCoordinator.setExternalTrickplayProvider(seekr)
         }
         // The coordinator owns initial seek and subtitle registration on both
         // backends; later progressive subtitle results still flow through the
@@ -1577,6 +1676,7 @@ class PlayerViewModel: ObservableObject {
             self.audioAmplificationDb = 0
         }
         self.skipIntervals = []
+        self.chapterSkipIntervals = []
         self.didSeedIntroDBSeasonTemplate = false
         self.didRefreshIntroDBForKnownDuration = false
         self.activeSkipInterval = nil
@@ -2070,7 +2170,7 @@ class PlayerViewModel: ObservableObject {
               time.current / time.duration >= 0.5 else {
             return false
         }
-        if let ending = skipIntervals.first(where: \.isEnding) {
+        if let ending = effectiveSkipIntervals.first(where: \.isEnding) {
             return time.current >= max(ending.startTime - Self.skipSegmentStartLead, 0)
         }
         return time.remaining <= Self.nextCardLeadSeconds
@@ -2270,7 +2370,8 @@ class PlayerViewModel: ObservableObject {
             )
             didSeedIntroDBSeasonTemplate = true
         }
-        guard !skipIntervals.isEmpty,
+        let segments = effectiveSkipIntervals
+        guard !segments.isEmpty,
               time.current > 0,
               status != .ended,
               !isStandalonePlaybackSession,
@@ -2287,7 +2388,7 @@ class PlayerViewModel: ObservableObject {
         }
 
         let current = time.current
-        for segment in skipIntervals {
+        for segment in segments {
             if current < max(segment.startTime - 0.35, 0) {
                 dismissedSkipIntervalIds.remove(segment.id)
                 autoSkippedIntervalIds.remove(segment.id)
@@ -2297,7 +2398,7 @@ class PlayerViewModel: ObservableObject {
             }
         }
 
-        let interval = skipIntervals.first { segment in
+        let interval = segments.first { segment in
             !segment.isPostCredits &&
             current >= max(segment.startTime - 0.35, 0) && current < segment.endTime - 0.25
         }
@@ -2310,7 +2411,7 @@ class PlayerViewModel: ObservableObject {
             return
         }
 
-        let postCredits = interval.followingPostCreditsScene(intervals: skipIntervals, duration: time.duration)
+        let postCredits = interval.followingPostCreditsScene(intervals: effectiveSkipIntervals, duration: time.duration)
         let targetsPostCredits = (postCredits != nil)
         if activeSkipTargetsPostCredits != targetsPostCredits {
             activeSkipTargetsPostCredits = targetsPostCredits
@@ -3789,8 +3890,8 @@ class PlayerViewModel: ObservableObject {
         if !isStandalonePlaybackSession && !isLiveStream && watchPartyPlayerBridge == nil {
             let postPlayEnabled = ProfileSettings.current.object(forKey: SettingsKey.postPlayRecommendationsEnabled) as? Bool ?? true
             let hasBlockingOverlay = showSettingsPanel || showScenePanel || isSceneDetailVisible || sidePanel != nil || isScrubbing || showPauseOverlay
-            let endingInterval = skipIntervals.first(where: \.isEnding)
-            let postCredits = endingInterval?.followingPostCreditsScene(intervals: skipIntervals, duration: time.duration)
+            let endingInterval = effectiveSkipIntervals.first(where: \.isEnding)
+            let postCredits = endingInterval?.followingPostCreditsScene(intervals: effectiveSkipIntervals, duration: time.duration)
             let endingStartTime: Double? = (postCredits == nil) ? endingInterval?.startTime : nil
             postPlayController.updateTimeline(
                 position: time.current,
@@ -3831,6 +3932,13 @@ class PlayerViewModel: ObservableObject {
                        languageName: $0.languageName, detail: $0.detail)
         }
         if audioTracks != latestAudioTracks { audioTracks = latestAudioTracks }
+
+        let latestChapters = c.chapters
+        if !PlaybackChapters.isSameList(chapters, latestChapters) {
+            chapters = latestChapters
+            chapterSkipIntervals = PlaybackChapters.skipIntervals(from: latestChapters)
+        }
+        autoStartChapterThumbnailsIfReady()
 
         var subs = c.subtitleTracks.map { track in
             let externalSubtitle = availableExternalSubtitles.first {
@@ -4485,6 +4593,162 @@ class PlayerViewModel: ObservableObject {
         }
     }
 
+    /// The chapter at the playhead, for the chapter list and the timeline.
+    var currentChapterIndex: Int? {
+        PlaybackChapters.index(at: time.current, in: chapters)
+    }
+
+    func seekToChapter(_ chapter: PlaybackChapter) {
+        seek(to: chapter.startSeconds)
+    }
+
+    /// Whether the Chapters panel shows stills: seek previews are on and the player can make
+    /// them for this stream.
+    var canShowChapterThumbnails: Bool {
+        guard isSeekPreviewEnabled, let provider = scrubThumbnailProvider else { return false }
+        return provider.supportsScrubThumbnails
+    }
+
+    /// Loads every chapter's still, on its own a while into playback or when the Chapters tab
+    /// first opens, a few seconds into each chapter: the chapter under the focus first (the
+    /// playing one until the panel reports focus), then outward. While the panel is open nothing holds it back; closed, it carries on
+    /// only while paused or with a healthy buffer, so playback keeps its bandwidth. Scrubbing
+    /// pauses it, a chapter that fails is tried again a little later, and it runs until every
+    /// chapter has its still.
+    func startChapterThumbnails() {
+        guard chapterThumbnailTask == nil, canShowChapterThumbnails,
+              let provider = scrubThumbnailProvider, !chapters.isEmpty else { return }
+        let chapters = self.chapters
+        let store = chapterThumbnails
+        chapterThumbnailToken &+= 1
+        let token = chapterThumbnailToken
+        publishChapterThumbnailStatus("loading")
+        chapterThumbnailTask = Task { @MainActor [weak self, weak provider] in
+            defer {
+                if let self, self.chapterThumbnailToken == token { self.chapterThumbnailTask = nil }
+            }
+            var retryAfter: [Int: Date] = [:]
+            var consecutiveMisses = 0
+            while true {
+                guard !Task.isCancelled, let self, let provider,
+                      PlaybackChapters.isSameList(self.chapters, chapters),
+                      self.scrubThumbnailProvider === provider, self.canShowChapterThumbnails else { return }
+                guard !self.isChaptersTabHidden else {
+                    // Chapters switched off in Settings meanwhile: stop, and start again on
+                    // their own if they are switched back on.
+                    self.chapterThumbnailsAutoStarted = false
+                    self.chapterThumbnailsEligibleSince = nil
+                    self.publishChapterThumbnailStatus("off")
+                    return
+                }
+                let missing = chapters.indices.filter { store.images[chapters[$0].id] == nil }
+                guard !missing.isEmpty else {
+                    self.publishChapterThumbnailStatus("done")
+                    return
+                }
+                let now = Date()
+                let ready = missing.filter { (retryAfter[$0] ?? .distantPast) <= now }
+                let waitReason: String?
+                if self.isScrubbing || self.isHoldingSeek || self.pendingSeekDelta != 0 {
+                    // A seek preview owns the still decoder while the user scrubs.
+                    waitReason = "waiting (scrubbing)"
+                } else if !self.isChaptersTabOpen, !self.chapterThumbnailsMayLoadInBackground {
+                    waitReason = "waiting (playback buffer)"
+                } else if ready.isEmpty {
+                    waitReason = "waiting (retry)"
+                } else {
+                    waitReason = nil
+                }
+                if let waitReason {
+                    self.publishChapterThumbnailStatus(waitReason)
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    continue
+                }
+                let anchor = self.chapterThumbnailFocusIndex ?? self.currentChapterIndex ?? 0
+                guard let index = PlaybackChapters.nextThumbnailIndex(missing: ready, anchor: anchor) else { continue }
+                self.publishChapterThumbnailStatus("loading")
+                let chapter = chapters[index]
+                let image = await provider.chapterThumbnail(
+                    atSeconds: PlaybackChapters.thumbnailTime(for: chapter),
+                    duration: self.playbackDuration)
+                guard !Task.isCancelled, PlaybackChapters.isSameList(self.chapters, chapters) else { return }
+                if let image {
+                    store.set(image, for: chapter.id)
+                    retryAfter[index] = nil
+                    consecutiveMisses = 0
+                } else {
+                    // Back off further while nothing comes at all (no network for a while).
+                    consecutiveMisses += 1
+                    retryAfter[index] = Date().addingTimeInterval(consecutiveMisses >= 6 ? 30 : 5)
+                }
+                // Leave room for playback between stills.
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+    }
+
+    /// Chapter stills load without the panel, so it opens with them: once playback has run
+    /// 10 s, and then only while paused or with a healthy buffer (the loader's own rule), not
+    /// while scrubbing. Not when seek previews are off or the Chapters tab is hidden.
+    private func autoStartChapterThumbnailsIfReady() {
+        guard !chapterThumbnailsAutoStarted, chapterThumbnailTask == nil, !chapters.isEmpty else { return }
+        guard status == .playing || status == .paused else {
+            chapterThumbnailsEligibleSince = nil
+            return
+        }
+        let now = Date()
+        guard let since = chapterThumbnailsEligibleSince else {
+            chapterThumbnailsEligibleSince = now
+            return
+        }
+        guard now.timeIntervalSince(since) >= Self.chapterThumbnailsAutoStartDelay,
+              canShowChapterThumbnails,
+              !self.isChaptersTabHidden,
+              !isScrubbing, !isHoldingSeek, pendingSeekDelta == 0,
+              chapterThumbnailsMayLoadInBackground else { return }
+        chapterThumbnailsAutoStarted = true
+        startChapterThumbnails()
+    }
+
+    static let chapterThumbnailsAutoStartDelay: TimeInterval = 10
+
+    /// Chapters switched off (their section in InSight Sections, or InSight itself): no stills load.
+    private var isChaptersTabHidden: Bool {
+        !isSceneEnabled || TVSceneTabOrder.disabledTabs().contains(.chapters)
+    }
+
+    /// The panel's focused chapter, which loads next.
+    func focusChapterThumbnail(id: Int?) {
+        chapterThumbnailFocusIndex = id.flatMap { id in chapters.firstIndex { $0.id == id } }
+    }
+
+    /// With the panel closed, stills load only while they cannot cost playback its bandwidth.
+    private var chapterThumbnailsMayLoadInBackground: Bool {
+        if status == .paused { return true }
+        return clock.buffered - clock.position >= SeekPreviewNetworkPolicy.minimumForwardBufferSeconds
+    }
+
+    private func publishChapterThumbnailStatus(_ state: String) {
+        let total = chapters.count
+        guard total > 0 else {
+            SeekPreviewDiagnostics.shared.updateChapters("")
+            return
+        }
+        let loaded = chapters.filter { chapterThumbnails.images[$0.id] != nil }.count
+        SeekPreviewDiagnostics.shared.updateChapters("\(loaded)/\(total) stills · \(state)")
+    }
+
+    private func resetChapterThumbnails() {
+        chapterThumbnailToken &+= 1
+        chapterThumbnailTask?.cancel()
+        chapterThumbnailTask = nil
+        chapterThumbnailFocusIndex = nil
+        chapterThumbnailsAutoStarted = false
+        chapterThumbnailsEligibleSince = nil
+        chapterThumbnails.reset()
+        SeekPreviewDiagnostics.shared.updateChapters("")
+    }
+
     func seek(to seconds: Double) {
         guard !isLiveStream, seconds.isFinite else { return }
         recordWatchPartyTransportIntent()
@@ -4588,7 +4852,7 @@ class PlayerViewModel: ObservableObject {
             activeSkipInterval = nil
         }
         activeSkipTargetsPostCredits = false
-        let postCredits = interval.followingPostCreditsScene(intervals: skipIntervals, duration: time.duration)
+        let postCredits = interval.followingPostCreditsScene(intervals: effectiveSkipIntervals, duration: time.duration)
         if interval.isEnding && postCredits == nil {
             postPlayController.showImmediately()
         }
@@ -4603,7 +4867,7 @@ class PlayerViewModel: ObservableObject {
             autoSkippedIntervalIds.removeAll()
         }
         // Reset auto-hidden or dismissed skip intervals only when rewinding before their start
-        for segment in skipIntervals {
+        for segment in effectiveSkipIntervals {
             if target < max(segment.startTime - 0.35, 0) {
                 dismissedSkipIntervalIds.remove(segment.id)
                 autoSkippedIntervalIds.remove(segment.id)
@@ -4766,6 +5030,20 @@ class PlayerViewModel: ObservableObject {
         status == .playing || status == .paused || time.duration > 0 || clock.duration > 0
     }
 
+    /// The playing file's length once it plays (Seekr picks its sprites by it), or nil when
+    /// this load is replaced or it doesn't play within two minutes.
+    private func playingFileDuration(generation: UInt64) async -> Double? {
+        for _ in 0..<240 {
+            guard !Task.isCancelled, sessionCoordinator.loadGeneration == generation else { return nil }
+            let duration = playbackDuration
+            if status == .playing || status == .paused, duration.isFinite, duration > 0 {
+                return duration
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        return nil
+    }
+
     private var playbackPosition: Double {
         clock.duration > 0 ? clock.position : time.current
     }
@@ -4894,12 +5172,19 @@ class PlayerViewModel: ObservableObject {
 
     private func scheduleSpeculativePrefetch(from seconds: Double, direction: Double, duration: Double) {
         speculativePrefetchTask?.cancel()
-        guard isSeekPreviewEnabled, activeEngineKind == .aether, duration > 0 else { return }
+        guard isSeekPreviewEnabled, duration > 0,
+              let provider = scrubThumbnailProvider, provider.supportsScrubThumbnails else { return }
+        if provider.prefetchesScrubThumbnailsInBackground {
+            // The preview lane queues neighbours behind the foreground decode instead of
+            // issuing requests that would retire it.
+            provider.prefetchScrubThumbnails(around: seconds, direction: direction, duration: duration)
+            return
+        }
+        guard activeEngineKind == .aether else { return }
         let step = 15.0 * (direction >= 0 ? 1.0 : -1.0)
         let targets = [seconds + step, seconds + step * 2]
             .filter { $0 >= 0 && $0 <= duration }
         guard !targets.isEmpty else { return }
-        guard let provider = scrubThumbnailProvider, provider.supportsScrubThumbnails else { return }
         speculativePrefetchTask = Task(priority: .utility) { [weak provider] in
             for target in targets {
                 guard !Task.isCancelled else { break }
@@ -4924,6 +5209,19 @@ class PlayerViewModel: ObservableObject {
             scrubThumbnail = nil
             scrubThumbnailTargetSeconds = nil
             return
+        }
+        let isSameTarget = lastScrubTargetSeconds.map {
+            abs($0 - seconds) < Self.sameScrubTargetTolerance
+        } ?? false
+        // The repeat at the end of a gesture asks again for the still the card already shows;
+        // another decode could only swap it for a different one.
+        if isSameTarget, scrubThumbnailTask == nil, scrubThumbnail != nil,
+           let shown = scrubThumbnailTargetSeconds, abs(shown - seconds) < Self.sameScrubTargetTolerance {
+            return
+        }
+        if !isSameTarget {
+            lastScrubTargetChange = Date()
+            scheduleStaleScrubThumbnailCheck()
         }
         // Keep the last still visible while the next frame is decoded. Remote
         // input routinely advances faster than a network decoder can finish.
@@ -4960,12 +5258,14 @@ class PlayerViewModel: ObservableObject {
             }
             var lastAttemptTarget: Double?
             var failedAttempts = 0
+            var usedDeferredRetry = false
             var lastDecodeTime = Date.distantPast
             while !Task.isCancelled {
                 guard let target = self.pendingScrubThumbnailSeconds else { break }
                 self.pendingScrubThumbnailSeconds = nil
                 if lastAttemptTarget != target {
                     failedAttempts = 0
+                    usedDeferredRetry = false
                     lastAttemptTarget = target
                 }
                 let cached = await selectedProvider.cachedScrubThumbnail(
@@ -4985,10 +5285,11 @@ class PlayerViewModel: ObservableObject {
                 if let cached {
                     self.scrubThumbnail = cached
                     self.scrubThumbnailTargetSeconds = target
+                    SeekPreviewDiagnostics.shared.noteShown(cached, target: target, path: "cache")
                 }
 
                 // If newer remote input arrived while querying cache, prioritize moving to it
-                if self.pendingScrubThumbnailSeconds != nil {
+                if self.hasNewScrubTarget(besides: target) {
                     continue
                 }
 
@@ -4996,10 +5297,10 @@ class PlayerViewModel: ObservableObject {
                 if image == nil {
                     // Throttle fast in-flight decodes while moving (~180ms)
                     let elapsed = Date().timeIntervalSince(lastDecodeTime)
-                    if elapsed < 0.18 {
+                    if elapsed < 0.18, !self.isScrubRemoteResting {
                         try? await Task.sleep(nanoseconds: UInt64((0.18 - elapsed) * 1_000_000_000))
                         guard !Task.isCancelled else { return }
-                        if self.pendingScrubThumbnailSeconds != nil {
+                        if self.hasNewScrubTarget(besides: target) {
                             continue
                         }
                     }
@@ -5020,21 +5321,33 @@ class PlayerViewModel: ObservableObject {
                       self.scrubThumbnailProvider === selectedProvider,
                       selectedProvider.supportsScrubThumbnails else { return }
 
-                // Completed fast frames provide progressive feedback
-                if let image {
-                    self.scrubThumbnail = image
-                    self.scrubThumbnailTargetSeconds = target
-                } else if abs(target - (self.scrubThumbnailTargetSeconds ?? target)) > 15 {
+                if image == nil, abs(target - (self.scrubThumbnailTargetSeconds ?? target)) > 15 {
                     self.scrubThumbnail = nil
                     self.scrubThumbnailTargetSeconds = nil
                 }
 
-                if self.pendingScrubThumbnailSeconds != nil { continue }
+                // A fast frame can be the keyframe seconds before the target, often another shot.
+                // It is feedback only while the remote keeps moving: a settled target waits for
+                // its exact still, so the card never shows a nearby picture and then swaps it.
+                if self.hasNewScrubTarget(besides: target) {
+                    self.showMovingScrubThumbnail(image, for: target)
+                    continue
+                }
 
-                // Give new input a chance to arrive before paying for exact decode.
-                try? await Task.sleep(nanoseconds: 160_000_000)
-                guard !Task.isCancelled else { return }
-                if self.pendingScrubThumbnailSeconds != nil { continue }
+                // Give new input a chance to arrive before paying for exact decode; a resting
+                // remote sends none.
+                if !self.isScrubRemoteResting {
+                    try? await Task.sleep(nanoseconds: 160_000_000)
+                    guard !Task.isCancelled else { return }
+                }
+                if self.hasNewScrubTarget(besides: target) {
+                    if self.isCurrentScrubThumbnailWork(
+                        generation: generation, interactionToken: interactionToken,
+                        provider: selectedProvider, backend: selectedBackend) {
+                        self.showMovingScrubThumbnail(image, for: target)
+                    }
+                    continue
+                }
                 let refined = await selectedProvider.scrubThumbnail(
                     atSeconds: target, maxWidth: 480, precise: true
                 )
@@ -5047,11 +5360,32 @@ class PlayerViewModel: ObservableObject {
                       self.isSeekPreviewEnabled,
                       self.scrubThumbnailProvider === selectedProvider,
                       selectedProvider.supportsScrubThumbnails else { return }
-                if self.pendingScrubThumbnailSeconds != nil { continue }
-                if let refined {
-                    self.scrubThumbnail = refined
+                if self.hasNewScrubTarget(besides: target) {
+                    self.showMovingScrubThumbnail(refined ?? image, for: target)
+                    continue
+                }
+                if let still = refined ?? image {
+                    // The exact still; the fast frame only when no exact one came.
+                    self.scrubThumbnail = still
                     self.scrubThumbnailTargetSeconds = target
-                } else if image == nil, failedAttempts < 2 {
+                    SeekPreviewDiagnostics.shared.noteShown(still, target: target, path: refined != nil ? "exact" : "fast")
+                } else if !usedDeferredRetry,
+                          let delay = selectedProvider.pendingScrubThumbnailDelay(), delay > 0, delay < 6 {
+                    // A pause has not yet released the playback connection (option off): try the
+                    // settled target once more when it has, without another remote press. The
+                    // previous still stays meanwhile rather than a nearby one that would be swapped.
+                    usedDeferredRetry = true
+                    let deadline = Date().addingTimeInterval(delay + 0.2)
+                    // Sliced, so a new target moves on at once instead of after the wait.
+                    while Date() < deadline, !self.hasNewScrubTarget(besides: target) {
+                        try? await Task.sleep(nanoseconds: 100_000_000)
+                        guard !Task.isCancelled else { return }
+                    }
+                    if self.pendingScrubThumbnailSeconds == nil,
+                       (self.isScrubbing || self.isHoldingSeek || self.pendingSeekDelta != 0 || self.isTimelineFocused) {
+                        self.pendingScrubThumbnailSeconds = target
+                    }
+                } else if failedAttempts < 2 {
                     // A transient cache miss/yield must recover even after the
                     // user stops moving, without requiring another remote press.
                     failedAttempts += 1
@@ -5061,9 +5395,102 @@ class PlayerViewModel: ObservableObject {
                        (self.isScrubbing || self.isHoldingSeek || self.pendingSeekDelta != 0 || self.isTimelineFocused) {
                         self.pendingScrubThumbnailSeconds = target
                     }
+                } else {
+                    // Nothing for the target will come (outside the buffer, no network for
+                    // previews): the closest held still keeps the card showing a picture.
+                    await self.showNearestScrubThumbnail(
+                        for: target, provider: selectedProvider, backend: selectedBackend,
+                        generation: generation, interactionToken: interactionToken)
                 }
             }
         }
+    }
+
+    /// A frame finished for a target the remote has already moved past: feedback while it keeps
+    /// moving. Once it rests, the next still the card shows is the final target's own.
+    private func showMovingScrubThumbnail(_ image: CGImage?, for target: Double) {
+        guard let image,
+              Date().timeIntervalSince(lastScrubTargetChange) < Self.scrubMovingWindow else { return }
+        scrubThumbnail = image
+        scrubThumbnailTargetSeconds = target
+        SeekPreviewDiagnostics.shared.noteShown(image, target: target, path: "moving")
+    }
+
+    /// The remote has not moved the target for a moment: it rests.
+    private var isScrubRemoteResting: Bool {
+        Date().timeIntervalSince(lastScrubTargetChange) >= Self.scrubMovingWindow
+    }
+
+    /// Once the remote rests, a still from a passed position stops looking like the preview.
+    private func scheduleStaleScrubThumbnailCheck() {
+        staleScrubThumbnailCheck?.cancel()
+        staleScrubThumbnailCheck = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.scrubMovingWindow * 1_000_000_000) + 10_000_000)
+            guard !Task.isCancelled else { return }
+            self?.updateStaleScrubThumbnail()
+        }
+    }
+
+    private func updateStaleScrubThumbnail() {
+        var stale = false
+        if scrubThumbnail != nil, isScrubRemoteResting,
+           let shown = scrubThumbnailTargetSeconds, let target = lastScrubTargetSeconds {
+            stale = abs(shown - target) > Self.staleScrubThumbnailDistance
+        }
+        if stale != scrubThumbnailIsStale { scrubThumbnailIsStale = stale }
+    }
+
+    /// Whether the remote asked for another target than `target`. A repeat of `target` itself
+    /// (the end of a touch gesture) is dropped: it is no movement.
+    private func hasNewScrubTarget(besides target: Double) -> Bool {
+        guard let pending = pendingScrubThumbnailSeconds else { return false }
+        if abs(pending - target) < Self.sameScrubTargetTolerance {
+            pendingScrubThumbnailSeconds = nil
+            return false
+        }
+        return true
+    }
+
+    private func isCurrentScrubThumbnailWork(
+        generation: UInt64,
+        interactionToken: UInt64,
+        provider: any ScrubThumbnailProviding,
+        backend: PlayerEngineKind
+    ) -> Bool {
+        scrubThumbnailGeneration == generation
+            && scrubThumbnailTaskInteractionToken == interactionToken
+            && (isScrubbing || isHoldingSeek || pendingSeekDelta != 0 || isTimelineFocused)
+            && activeEngineKind == backend
+            && sessionCoordinator.activeBackend == backend
+            && isSeekPreviewEnabled
+            && scrubThumbnailProvider === provider
+            && provider.supportsScrubThumbnails
+    }
+
+    /// Only when the target gets no still of its own: shown after its requests came back empty,
+    /// never before, so the card does not swap a nearby picture for the right one.
+    private func showNearestScrubThumbnail(
+        for target: Double,
+        provider: any ScrubThumbnailProviding,
+        backend: PlayerEngineKind,
+        generation: UInt64,
+        interactionToken: UInt64
+    ) async {
+        guard self.pendingScrubThumbnailSeconds == nil,
+              let nearest = await provider.nearestScrubThumbnail(
+                atSeconds: target, maxDistance: Self.nearestScrubThumbnailDistance),
+              !Task.isCancelled,
+              self.pendingScrubThumbnailSeconds == nil,
+              self.scrubThumbnailGeneration == generation,
+              self.scrubThumbnailTaskInteractionToken == interactionToken,
+              (self.isScrubbing || self.isHoldingSeek || self.pendingSeekDelta != 0 || self.isTimelineFocused),
+              self.activeEngineKind == backend,
+              self.sessionCoordinator.activeBackend == backend,
+              self.isSeekPreviewEnabled,
+              self.scrubThumbnailProvider === provider else { return }
+        self.scrubThumbnail = nearest
+        self.scrubThumbnailTargetSeconds = target
+        SeekPreviewDiagnostics.shared.noteShown(nearest, target: target, path: "nearest")
     }
 
     private func restartScrubTimeout() {
@@ -5079,6 +5506,7 @@ class PlayerViewModel: ObservableObject {
         scrubTimeoutTask?.cancel()
         resetScrubThumbnailState()
         scrubValue = nil
+        scrubSnap = nil
         isScrubbing = false
         resetWheel()
         clock.scrubTarget = nil
@@ -5105,6 +5533,7 @@ class PlayerViewModel: ObservableObject {
         scrubThumbnailTargetSeconds = nil
         let position = playbackPosition
         scrubValue = position
+        scrubSnap = makeScrubSnap(from: position)
         clock.scrubTarget = position
         isScrubbing = true
         resetWheel()
@@ -5161,8 +5590,32 @@ class PlayerViewModel: ObservableObject {
         let duration = playbackDuration
         let proposed = target + seconds
         let clamped = max(0, min(proposed, duration > 0 ? duration - 1 : proposed))
+        scrubSnap?.reset(to: clamped)
         publishScrub(clamped)
         restartScrubTimeout()
+    }
+
+    /// The swipe seek's edges: its starting position, chapter starts, and opening/ending edges
+    /// while they show on the timeline. Nil when the duration is too short.
+    private func makeScrubSnap(from position: Double) -> PlaybackChapters.SnappingSeek? {
+        let settings = ProfileSettings.current
+        guard PlaybackChapters.snapsWhileSeeking(in: settings) else { return nil }
+        let duration = playbackDuration
+        guard duration > 2, position.isFinite else { return nil }
+        var edges = PlaybackChapters.snapEdges(
+            chapters: chapters,
+            segments: PlaybackChapters.showsSegmentsOnTimeline(in: settings) ? skipSegments : [],
+            duration: duration
+        )
+        edges.append(min(max(position, 0), duration - 1))
+        edges = Array(Set(edges)).sorted()
+        guard !edges.isEmpty else { return nil }
+        return PlaybackChapters.SnappingSeek(
+            from: position,
+            edges: edges,
+            radius: PlaybackChapters.snapRadius(duration: duration),
+            push: PlaybackChapters.snapPush(duration: duration)
+        )
     }
 
     // MARK: Trackpad input
@@ -5240,9 +5693,16 @@ class PlayerViewModel: ObservableObject {
         let duration = playbackDuration
         let delta = scrubDeltaSeconds(for: inc, duration: duration)
         guard abs(delta) > 0.0001 else { return }
-        let proposed = target + delta
-        let clamped = max(0, min(proposed, duration > 0 ? duration - 1 : proposed))
-        publishScrub(clamped)
+        if var snap = scrubSnap, duration > 0 {
+            // The target stops on an edge close to the swipe until the swipe carries on past it.
+            let next = snap.move(by: delta, upTo: duration - 1)
+            scrubSnap = snap
+            publishScrub(next)
+        } else {
+            let proposed = target + delta
+            let clamped = max(0, min(proposed, duration > 0 ? duration - 1 : proposed))
+            publishScrub(clamped)
+        }
         restartScrubTimeout()
     }
 
@@ -5287,6 +5747,8 @@ class PlayerViewModel: ObservableObject {
         let duration = playbackDuration
         let proposed = target + seconds
         let clamped = max(0, min(proposed, duration > 0 ? duration - 1 : proposed))
+        // Fine-tuning goes to the exact second: no snapping, and the next swipe starts here.
+        scrubSnap?.reset(to: clamped)
         publishScrub(clamped)
         restartScrubTimeout()
     }
@@ -7232,15 +7694,22 @@ class PlayerViewModel: ObservableObject {
         return gap
     }
 
+    /// Whether the Chapters tab is on screen (its stills then load whatever the buffer).
+    var isChaptersTabOpen: Bool {
+        showScenePanel && sceneViewModel.selectedTab == .chapters
+    }
+
     func openScene() {
         guard isSceneEnabled else { return }
         cancelMoveSeekTracking()
         if isScrubbing {
             cancelScrub()
         }
-        showScenePanel = true
-        setControlsAutoHideSuspended(true)
-        hideControls()
+        withAnimation(.easeInOut(duration: 0.2)) {
+            showScenePanel = true
+            hideControls()
+            setControlsAutoHideSuspended(true)
+        }
         
         let context = buildSceneContext()
         sceneAudioTapBroker.updateEngine(aetherController?.engine)
@@ -7255,14 +7724,17 @@ class PlayerViewModel: ObservableObject {
             overview: activeMeta?.description,
             runtime: activeMeta?.runtime,
             nextEpisode: nextEpisode,
-            playbackInfo: playbackInfo
+            playbackInfo: playbackInfo,
+            hasChapters: !chapters.isEmpty
         )
         sceneViewModel.open()
     }
     
     func closeScene() {
-        showScenePanel = false
-        setControlsAutoHideSuspended(false)
+        withAnimation(.easeInOut(duration: 0.2)) {
+            showScenePanel = false
+            setControlsAutoHideSuspended(false)
+        }
         sceneViewModel.close()
     }
     
@@ -7711,7 +8183,7 @@ class PlayerViewModel: ObservableObject {
               playbackTime.current / playbackTime.duration >= 0.5 else {
             return false
         }
-        if let ending = skipIntervals.first(where: \.isEnding),
+        if let ending = effectiveSkipIntervals.first(where: \.isEnding),
            playbackTime.current >= max(ending.startTime - Self.skipSegmentStartLead, 0) {
             print("[ContinueWatching][Player] shouldMarkAsWatched=true due to ending skip interval at \(ending.startTime)s")
             return true

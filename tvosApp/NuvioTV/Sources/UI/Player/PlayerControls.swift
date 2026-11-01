@@ -10,6 +10,19 @@ enum PlayerControlFocus: Hashable {
     case audio
     case settings
     case timeline
+    case firstTransportButton
+}
+
+private extension TVPlayerButton {
+    var focusKey: PlayerControlFocus {
+        switch self {
+        case .pip: return .pip
+        case .episodes: return .episodes
+        case .sources: return .sources
+        case .subtitles: return .subtitles
+        case .audio: return .audio
+        }
+    }
 }
 
 struct PlayerControls: View {
@@ -22,6 +35,7 @@ struct PlayerControls: View {
     var onFocusNextEpisode: () -> Void = {}
 
     @FocusState private var focusedControl: PlayerControlFocus?
+    @State private var playerButtonOrder = TVPlayerButtonOrder.currentOrder()
 
     @AppStorage(SettingsKey.playerShowPiP) private var playerShowPiP = true
     @AppStorage(SettingsKey.playerShowEpisodes) private var playerShowEpisodes = true
@@ -32,17 +46,24 @@ struct PlayerControls: View {
     var body: some View {
         GlassControlsContainer {
             VStack {
-                topBar
-                Spacer()
+                Spacer(minLength: 0)
                 bottomControls
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .onExitCommand(perform: handleExit)
         }
         .onExitCommand(perform: handleExit)
         .onChange(of: requestedFocus) { _, target in
             guard let target, viewModel.showControls, !viewModel.controlsAutoHideSuspended else { return }
             DispatchQueue.main.async {
-                let resolvedTarget: PlayerControlFocus = target == .timeline && !didReportPlaybackStarted ? .settings : target
+                let resolvedTarget: PlayerControlFocus
+                if target == .firstTransportButton {
+                    resolvedTarget = transportFocusOrder.first ?? .settings
+                } else if target == .timeline && !didReportPlaybackStarted {
+                    resolvedTarget = .settings
+                } else {
+                    resolvedTarget = target
+                }
                 if resolvedTarget == .timeline {
                     focusedControl = .timeline
                 } else {
@@ -56,7 +77,17 @@ struct PlayerControls: View {
                 DispatchQueue.main.async { focusedControl = .settings }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: TVPlayerButtonOrder.changedNotification).receive(on: RunLoop.main)) { _ in
+            reloadPlayerButtonOrder()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ProfileSettings.settingsChangedNotification).receive(on: RunLoop.main)) { _ in
+            reloadPlayerButtonOrder()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification).receive(on: RunLoop.main)) { _ in
+            reloadPlayerButtonOrder()
+        }
         .onAppear {
+            reloadPlayerButtonOrder()
             if (viewModel.showControls || viewModel.isScrubbing),
                !viewModel.showPauseOverlay,
                !viewModel.postPlayState.isVisible,
@@ -281,14 +312,30 @@ struct PlayerControls: View {
 
     /// Left-to-right order of currently visible transport buttons.
     private var transportFocusOrder: [PlayerControlFocus] {
-        var order: [PlayerControlFocus] = []
-        if didReportPlaybackStarted && viewModel.isPictureInPictureSupported && playerShowPiP { order.append(.pip) }
-        if viewModel.canShowEpisodesPanel && playerShowEpisodes { order.append(.episodes) }
-        if viewModel.canShowSourcesPanel && playerShowSources { order.append(.sources) }
-        if didReportPlaybackStarted && canShowSubtitlePicker && playerShowSubtitles { order.append(.subtitles) }
-        if didReportPlaybackStarted && canShowAudioPicker && playerShowAudio { order.append(.audio) }
-        order.append(.settings)
-        return order
+        availableTransportButtons.map(\.focusKey) + [.settings]
+    }
+
+    private var availableTransportButtons: [TVPlayerButton] {
+        playerButtonOrder.filter { button in
+            switch button {
+            case .pip:
+                return didReportPlaybackStarted && viewModel.isPictureInPictureSupported && playerShowPiP
+            case .episodes:
+                return viewModel.canShowEpisodesPanel && playerShowEpisodes
+            case .sources:
+                return viewModel.canShowSourcesPanel && playerShowSources
+            case .subtitles:
+                return didReportPlaybackStarted && canShowSubtitlePicker && playerShowSubtitles
+            case .audio:
+                return didReportPlaybackStarted && canShowAudioPicker && playerShowAudio
+            }
+        }
+    }
+
+    private func reloadPlayerButtonOrder() {
+        let order = TVPlayerButtonOrder.currentOrder()
+        guard playerButtonOrder != order else { return }
+        playerButtonOrder = order
     }
 
     private var canShowSubtitlePicker: Bool {
@@ -364,6 +411,8 @@ struct PlayerControls: View {
                 }
             } else if viewModel.showNextEpisodeCard {
                 onFocusNextEpisode()
+            } else if viewModel.showSkipSegmentCard {
+                onFocusSkipSegment()
             } else {
                 moveFocus(to: origin)
             }
@@ -403,150 +452,55 @@ struct PlayerControls: View {
         }
     }
 
-    // MARK: - Top bar
+    // MARK: - Playback title
 
-    private var isSeekingOrScrubbing: Bool {
-        viewModel.isScrubbing || viewModel.isHoldingSeek || viewModel.pendingSeekDelta != 0
+    private var playbackTitle: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let subtitle = playbackSubtitle {
+                Text(subtitle)
+                    .font(.system(size: 21, weight: .medium))
+                    .foregroundColor(.white.opacity(0.76))
+                    .lineLimit(1)
+            }
+
+            Text(viewModel.title)
+                .font(.system(size: 38, weight: .bold))
+                .foregroundColor(.white)
+                .lineLimit(1)
+        }
     }
 
-    private var topBar: some View {
-        Group {
-            if !isSeekingOrScrubbing {
-                VStack(spacing: 12) {
-                    HStack(alignment: .top, spacing: 24) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(viewModel.title)
-                                .font(.system(size: 38, weight: .bold))
-                                .foregroundColor(.white)
-                                .lineLimit(1)
-
-                            if !viewModel.subtitle.isEmpty {
-                                Text(viewModel.subtitle)
-                                    .font(.system(size: 21, weight: .medium))
-                                    .foregroundColor(.white.opacity(0.68))
-                                    .lineLimit(1)
-                            }
-                        }
-
-                        Spacer()
-                    }
-                }
-                .padding(.horizontal, 60)
-                .padding(.top, 34)
-                .shadow(color: .black.opacity(0.82), radius: 18, x: 0, y: 6)
-                .transition(.opacity)
-            }
-        }
-        .animation(.playerControls, value: isSeekingOrScrubbing)
+    private var playbackSubtitle: String? {
+        let subtitle = viewModel.subtitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !subtitle.isEmpty, subtitle != PlaybackMarkers.trailerSubtitle else { return nil }
+        return subtitle
+            .replacingOccurrences(of: " · E", with: ", E")
+            .replacingOccurrences(of: " · ", with: " • ")
     }
 
     // MARK: - Bottom controls
 
     private var bottomControls: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            if !isSeekingOrScrubbing {
-                transportRow
+        VStack(alignment: .leading, spacing: 24) {
+            if !viewModel.isScrubbing {
+                HStack(alignment: .bottom, spacing: 24) {
+                    playbackTitle
+                    Spacer(minLength: 24)
+                    transportRow
+                }
                     .transition(.opacity)
             }
             timelineBar
         }
         .padding(.horizontal, 60)
         .padding(.bottom, 54)
-        .animation(.playerControls, value: isSeekingOrScrubbing)
+        .animation(.playerControls, value: viewModel.isScrubbing)
     }
 
     private var transportRow: some View {
         HStack(spacing: 18) {
-            Spacer()
-
-            if didReportPlaybackStarted && viewModel.isPictureInPictureSupported && playerShowPiP {
-                glassIconButton(
-                    size: 70,
-                    iconSize: 28,
-                    focusKey: .pip,
-                    isFocused: focusedControl == .pip
-                ) {
-                    viewModel.togglePictureInPicture()
-                } icon: {
-                    Image(systemName: "pip.enter")
-                }
-                .id("pip_button")
-            }
-
-            if viewModel.canShowEpisodesPanel && playerShowEpisodes {
-                glassIconButton(
-                    size: 70,
-                    iconSize: 28,
-                    focusKey: .episodes,
-                    isFocused: focusedControl == .episodes
-                ) {
-                    viewModel.openSidePanel(.episodes)
-                } icon: {
-                    Image(systemName: "list.bullet")
-                }
-                .id("episodes_button")
-            }
-
-            if viewModel.canShowSourcesPanel && playerShowSources {
-                glassIconButton(
-                    size: 70,
-                    iconSize: 28,
-                    focusKey: .sources,
-                    isFocused: focusedControl == .sources
-                ) {
-                    viewModel.openSidePanel(.sources)
-                } icon: {
-                    Image(systemName: "square.stack.3d.up")
-                }
-                .id("sources_button")
-            }
-
-            if didReportPlaybackStarted && canShowSubtitlePicker && playerShowSubtitles {
-                PlayerSubtitleMenuButton(
-                    noneOption: subtitleNoneOption,
-                    languageGroups: subtitleLanguageGroups,
-                    isFocused: focusedControl == .subtitles,
-                    onSelect: { selectSubtitlePickerOption($0) }
-                )
-                .equatable()
-                .focused($focusedControl, equals: .subtitles)
-                .disabled(!isTransportButtonFocusable(.subtitles))
-                .onExitCommand(perform: handleExit)
-                .onMoveCommand { direction in
-                    handleMove(direction, from: .subtitles)
-                }
-            }
-
-            if didReportPlaybackStarted && canShowAudioPicker && playerShowAudio {
-                PlayerAudioMenuButton(
-                    orderedTracks: orderedAudioTracks,
-                    supportsAudioProcessing: viewModel.supportsAudioProcessing,
-                    enhanceDialogueMode: viewModel.supportsAudioProcessing ? viewModel.enhanceDialogueMode : .off,
-                    isReduceLoudSoundsActive: viewModel.supportsAudioProcessing && viewModel.isReduceLoudSoundsActive,
-                    isFocused: focusedControl == .audio,
-                    onSelectTrack: { track in
-                        viewModel.selectAudio(track)
-                        viewModel.setControlsAutoHideSuspended(false)
-                        viewModel.scheduleControlsHide(after: 10.0)
-                    },
-                    onSetEnhanceDialogueMode: { mode in
-                        viewModel.setEnhanceDialogueMode(mode)
-                        viewModel.setControlsAutoHideSuspended(false)
-                        viewModel.scheduleControlsHide(after: 10.0)
-                    },
-                    onToggleReduceLoudSounds: {
-                        viewModel.toggleReduceLoudSounds()
-                        viewModel.setControlsAutoHideSuspended(false)
-                        viewModel.scheduleControlsHide(after: 10.0)
-                    }
-                )
-                .equatable()
-                .focused($focusedControl, equals: .audio)
-                .disabled(!isTransportButtonFocusable(.audio))
-                .onExitCommand(perform: handleExit)
-                .onMoveCommand { direction in
-                    handleMove(direction, from: .audio)
-                }
+            ForEach(availableTransportButtons) { button in
+                transportButton(button)
             }
 
             glassIconButton(
@@ -561,7 +515,97 @@ struct PlayerControls: View {
             }
             .id("settings_button")
         }
-        .shadow(color: .black.opacity(0.74), radius: 20, x: 0, y: 8)
+    }
+
+    @ViewBuilder
+    private func transportButton(_ button: TVPlayerButton) -> some View {
+        switch button {
+        case .pip:
+            glassIconButton(
+                size: 70,
+                iconSize: 28,
+                focusKey: .pip,
+                isFocused: focusedControl == .pip
+            ) {
+                viewModel.togglePictureInPicture()
+            } icon: {
+                Image(systemName: "pip.enter")
+            }
+            .id("pip_button")
+
+        case .episodes:
+            glassIconButton(
+                size: 70,
+                iconSize: 28,
+                focusKey: .episodes,
+                isFocused: focusedControl == .episodes
+            ) {
+                viewModel.openSidePanel(.episodes)
+            } icon: {
+                Image(systemName: "list.bullet")
+            }
+            .id("episodes_button")
+
+        case .sources:
+            glassIconButton(
+                size: 70,
+                iconSize: 28,
+                focusKey: .sources,
+                isFocused: focusedControl == .sources
+            ) {
+                viewModel.openSidePanel(.sources)
+            } icon: {
+                Image(systemName: "square.stack.3d.up")
+            }
+            .id("sources_button")
+
+        case .subtitles:
+            PlayerSubtitleMenuButton(
+                noneOption: subtitleNoneOption,
+                languageGroups: subtitleLanguageGroups,
+                isFocused: focusedControl == .subtitles,
+                onSelect: { selectSubtitlePickerOption($0) }
+            )
+            .equatable()
+            .focused($focusedControl, equals: .subtitles)
+            .disabled(!isTransportButtonFocusable(.subtitles))
+            .onExitCommand(perform: handleExit)
+            .onMoveCommand { direction in
+                handleMove(direction, from: .subtitles)
+            }
+
+        case .audio:
+            PlayerAudioMenuButton(
+                orderedTracks: orderedAudioTracks,
+                supportsAudioProcessing: viewModel.supportsAudioProcessing,
+                enhanceDialogueMode: viewModel.supportsAudioProcessing ? viewModel.enhanceDialogueMode : .off,
+                isReduceLoudSoundsActive: viewModel.supportsAudioProcessing && viewModel.isReduceLoudSoundsActive,
+                isFocused: focusedControl == .audio,
+                onSelectTrack: { track in
+                    viewModel.selectAudio(track)
+                    viewModel.setControlsAutoHideSuspended(false)
+                    viewModel.scheduleControlsHide(after: 10.0)
+                },
+                onSetEnhanceDialogueMode: { mode in
+                    viewModel.setEnhanceDialogueMode(mode)
+                    viewModel.setControlsAutoHideSuspended(false)
+                    viewModel.scheduleControlsHide(after: 10.0)
+                },
+                onToggleReduceLoudSounds: {
+                    viewModel.toggleReduceLoudSounds()
+                    viewModel.setControlsAutoHideSuspended(false)
+                    viewModel.scheduleControlsHide(after: 10.0)
+                }
+            )
+            .equatable()
+            .focused($focusedControl, equals: .audio)
+            .disabled(!isTransportButtonFocusable(.audio))
+            .onExitCommand(perform: handleExit)
+            .onMoveCommand { direction in
+                handleMove(direction, from: .audio)
+            }
+
+        }
     }
 
     private func glassIconButton<Icon: View>(
@@ -589,7 +633,6 @@ struct PlayerControls: View {
                 .foregroundColor(isFocused ? .black : .white)
                 .frame(width: size, height: size)
                 .modifier(PlayerGlassCircleButtonBackground(filled: isFocused))
-                .shadow(color: .black.opacity(0.82), radius: 14, x: 0, y: 7)
                 .frame(width: size, height: size)
                 .clipShape(Circle())
                 .contentShape(Circle())
@@ -697,14 +740,12 @@ struct PlayerControls: View {
             Circle()
                 .fill(Color.red)
                 .frame(width: 12, height: 12)
-                .shadow(color: .red.opacity(0.65), radius: 7)
             Text(L10n.string("player_live", fallback: "LIVE"))
                 .font(.system(size: 22, weight: .bold))
                 .foregroundColor(.white.opacity(0.9))
             Spacer()
         }
         .frame(height: 44)
-        .shadow(color: .black.opacity(0.82), radius: 16, x: 0, y: 7)
     }
 
     private var finiteTimelineBar: some View {
@@ -715,7 +756,9 @@ struct PlayerControls: View {
             isHoldingSeek: viewModel.isHoldingSeek,
             pendingSeekDelta: viewModel.pendingSeekDelta,
             speedMultiplier: viewModel.seekSpeedMultiplier,
-            seekStepSeconds: viewModel.seekStepSeconds
+            seekStepSeconds: viewModel.seekStepSeconds,
+            chapters: viewModel.chapters,
+            skipSegments: viewModel.skipSegments
         )
         .overlay(alignment: .top) {
             // Keep the geometry mounted even while a still is unavailable so
@@ -727,6 +770,7 @@ struct PlayerControls: View {
                 isHoldingSeek: viewModel.isHoldingSeek,
                 pendingSeekDelta: viewModel.pendingSeekDelta,
                 image: ((viewModel.isHoldingSeek || viewModel.isScrubbing) && viewModel.isSeekPreviewEnabled) ? viewModel.scrubThumbnail : nil,
+                isStale: viewModel.scrubThumbnailIsStale,
                 naturalSize: viewModel.videoNaturalSize,
                 speedMultiplier: viewModel.seekSpeedMultiplier,
                 wheelEngaged: viewModel.wheelEngaged
@@ -758,7 +802,6 @@ struct PlayerControls: View {
             // even if spatial focus already hopped to a transport button.
             handleMove(direction, from: .timeline)
         }
-        .shadow(color: .black.opacity(0.82), radius: 16, x: 0, y: 7)
         .animation(.easeOut(duration: 0.14), value: focusedControl)
         .animation(.easeOut(duration: 0.12), value: viewModel.pendingSeekDelta)
         .animation(.easeOut(duration: 0.16), value: viewModel.isScrubbing)
@@ -857,7 +900,6 @@ private struct PlayerSubtitleMenuButton: View, Equatable {
                 .foregroundColor(isFocused ? .black : .white)
                 .frame(width: 70, height: 70)
                 .modifier(PlayerGlassCircleButtonBackground(filled: isFocused))
-                .shadow(color: .black.opacity(0.82), radius: 14, x: 0, y: 7)
                 .frame(width: 70, height: 70)
                 .clipShape(Circle())
                 .contentShape(Circle())
@@ -956,7 +998,6 @@ private struct PlayerAudioMenuButton: View, Equatable {
                 .foregroundColor(isFocused ? .black : .white)
                 .frame(width: 70, height: 70)
                 .modifier(PlayerGlassCircleButtonBackground(filled: isFocused))
-                .shadow(color: .black.opacity(0.82), radius: 14, x: 0, y: 7)
                 .frame(width: 70, height: 70)
                 .clipShape(Circle())
                 .contentShape(Circle())
@@ -1041,6 +1082,7 @@ private struct SeekPreviewTimelineCard: View {
     var isHoldingSeek: Bool = false
     let pendingSeekDelta: Double
     let image: CGImage?
+    var isStale: Bool = false
     var naturalSize: CGSize = CGSize(width: 16, height: 9)
     var speedMultiplier: Int? = nil
     var wheelEngaged: Bool = false
@@ -1067,7 +1109,7 @@ private struct SeekPreviewTimelineCard: View {
             let cardX = min(max(targetX, cardHalfW + 16), geo.size.width - cardHalfW - 16)
 
             if isScrubbing || isHoldingSeek {
-                SeekPreviewCard(image: image, width: width, naturalSize: naturalSize)
+                SeekPreviewCard(image: image, width: width, naturalSize: naturalSize, isStale: isStale)
                     .position(x: cardX, y: 270 - cardSize.height / 2)
             }
         }
@@ -1085,9 +1127,19 @@ private struct PlayerTimelineBar: View {
     let pendingSeekDelta: Double
     var speedMultiplier: Int? = nil
     var seekStepSeconds: Int = PlayerSeekSettings.defaultStep
+    /// Chapters of the file: marks on the track and the chapter's name by the time.
+    var chapters: [PlaybackChapter] = []
+    /// Opening and ending (IntroDB or chapters), colored on the track.
+    var skipSegments: [SkipInterval] = []
 
     private var duration: Double {
         max(clock.duration, 0.001)
+    }
+
+    /// The name of the chapter at `seconds`, if the file has chapters.
+    private func chapterName(at seconds: Double) -> String? {
+        guard let index = PlaybackChapters.index(at: seconds, in: chapters) else { return nil }
+        return PlaybackChapters.displayName(chapters[index], index: index)
     }
 
     private var skipIconName: String {
@@ -1120,12 +1172,19 @@ private struct PlayerTimelineBar: View {
             GeometryReader { geo in
                 let w = geo.size.width
                 let targetX = min(max(w * progress, 0), w)
-                let trackHeight: CGFloat = (isTimelineFocused || isSeekingOrScrubbing) ? 10 : 7
+                let trackHeight: CGFloat = 10
                 let h: CGFloat = (isTimelineFocused || isSeekingOrScrubbing) ? trackHeight + 2 : trackHeight
                 let needleHeight: CGFloat = 22
                 let originalProgress = CGFloat(min(max(clock.position / duration, 0), 1))
                 let originalX = min(max(w * originalProgress, 0), w)
                 let bottomOfTrack = geo.size.height / 2 + h / 2
+                let markers = PlaybackChapters.markers(chapters, duration: clock.duration)
+                // The opening and the ending, colored unless that is off in Settings → Player.
+                let segments = PlaybackChapters.showsSegmentsOnTimeline(in: ProfileSettings.current)
+                    ? PlaybackChapters.timelineSegments(skipSegments, duration: clock.duration).map {
+                        PlayerTrackSegment(start: $0.start, end: $0.end, color: $0.kind.color)
+                    }
+                    : []
 
                 ZStack(alignment: .leading) {
                     PlayerProgressTrack(
@@ -1134,15 +1193,17 @@ private struct PlayerTimelineBar: View {
                         height: trackHeight,
                         showThumb: false,
                         emphasized: isTimelineFocused || isSeekingOrScrubbing,
-                        glassTrack: true
+                        glassTrack: true,
+                        markers: markers,
+                        segments: segments
                     )
 
                     if isScrubbing || isHoldingSeek {
                         // Ghost tick: original paused playback position flush within track
                         if abs(targetX - originalX) > 3 {
                             Rectangle()
-                                .fill(Color.white.opacity(0.4))
-                                .frame(width: 1.5, height: h)
+                                .fill(Color.white)
+                                .frame(width: 2, height: h)
                                 .position(x: originalX, y: geo.size.height / 2)
                         }
 
@@ -1150,22 +1211,41 @@ private struct PlayerTimelineBar: View {
                         Rectangle()
                             .fill(Color.white)
                             .frame(width: 2, height: needleHeight)
-                            .shadow(color: .black.opacity(0.45), radius: 1.5)
                             .position(x: targetX, y: bottomOfTrack - needleHeight / 2)
                     }
                 }
             }
-            .frame(height: (isTimelineFocused || isSeekingOrScrubbing) ? 16 : 11)
+            .frame(height: 16)
 
             // Timestamps: when seeking or scrubbing, center the time and direction/speed directly beneath the needle
             if isSeekingOrScrubbing {
                 GeometryReader { geo in
                     let w = geo.size.width
-                    let targetX = min(max(w * progress, 60), w - 60)
+                    let targetChapter = chapterName(at: targetPosition)
+                    let timeText = PlayerTime.formatted(time: targetPosition)
+                    let chapterText = targetChapter.map { "· " + $0 }
+                    let timeWidth = CGFloat(timeText.count) * 13
+                    let chapterWidth = chapterText.map { min(CGFloat($0.count) * 12, 320) } ?? 0
+                    let seekAccessoryWidth: CGFloat = (isHoldingSeek || speedMultiplier != nil)
+                        ? 34 + (speedMultiplier.map { CGFloat(String($0).count) * 14 + 8 } ?? 0)
+                        : (pendingSeekDelta != 0 ? 28 : 0)
+                    let labelWidth = timeWidth
+                        + (chapterWidth > 0 ? chapterWidth + 8 : 0)
+                        + seekAccessoryWidth
+                    let edgeInset = labelWidth / 2 + 8
+                    let targetX = min(max(w * progress, edgeInset), max(edgeInset, w - edgeInset))
                     HStack(spacing: 8) {
-                        Text(PlayerTime.formatted(time: targetPosition))
-                            .font(.system(size: 26, weight: .bold).monospacedDigit())
+                        Text(timeText)
+                            .font(.system(size: 22, weight: .bold).monospacedDigit())
                             .foregroundColor(.white)
+                        if let chapterText {
+                            Text(chapterText)
+                                .font(.system(size: 22, weight: .semibold))
+                                .foregroundColor(.white.opacity(0.85))
+                                .lineLimit(1)
+                                .frame(maxWidth: 320)
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
 
                         if isHoldingSeek || speedMultiplier != nil {
                             let isForward = pendingSeekDelta >= 0
@@ -1186,17 +1266,38 @@ private struct PlayerTimelineBar: View {
                                 .foregroundColor(.white)
                         }
                     }
-                    .shadow(color: .black.opacity(0.85), radius: 6, x: 0, y: 2)
                     .position(x: targetX, y: 14)
                 }
                 .frame(height: 28)
             } else {
-                HStack(spacing: 10) {
-                    Text(PlayerTime.formatted(time: targetPosition))
-                    Spacer()
-                    Text("-" + PlayerTime.formatted(time: max(0, duration - targetPosition)))
+                GeometryReader { geo in
+                    // The chapter's name rides with the elapsed time (shortened to stay on the bar).
+                    let chapter = chapterName(at: targetPosition).map { name in
+                        name.count > 32 ? String(name.prefix(31)) + "…" : name
+                    }
+                    let elapsed = PlayerTime.formatted(time: targetPosition) + (chapter.map { " · " + $0 } ?? "")
+                    let remaining = "-" + PlayerTime.formatted(time: max(0, duration - targetPosition))
+                    let elapsedHalfWidth = CGFloat(elapsed.count) * 6.5
+                    let remainingWidth = CGFloat(remaining.count) * 13
+                    let elapsedX = min(
+                        max(geo.size.width * progress, elapsedHalfWidth),
+                        max(elapsedHalfWidth, geo.size.width - elapsedHalfWidth - remainingWidth - 12)
+                    )
+
+                    ZStack {
+                        HStack {
+                            Spacer(minLength: 0)
+                            Text(remaining)
+                                .fixedSize()
+                        }
+                        Text(elapsed)
+                            .fixedSize()
+                            .position(x: elapsedX, y: 14)
+                    }
+                    .frame(width: geo.size.width, height: 28)
                 }
-                .font(.system(size: 22, weight: .bold))
+                .frame(height: 28)
+                .font(.system(size: 22, weight: .bold).monospacedDigit())
                 .foregroundColor(.white.opacity(isTimelineFocused ? 0.82 : 0.54))
             }
         }
@@ -1480,6 +1581,25 @@ struct PlayerGlassCircleButtonBackground: ViewModifier {
     }
 }
 
+struct PlayerBottomFade: View {
+    var body: some View {
+        LinearGradient(
+            stops: [
+                .init(color: .black.opacity(0.48), location: 0),
+                .init(color: .black.opacity(0.36), location: 0.36),
+                .init(color: .clear, location: 0.5),
+                .init(color: .clear, location: 1)
+            ],
+            startPoint: .bottom,
+            endPoint: .top
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
 // MARK: - Player settings panel
 //
 // Full-screen overlay opened from the controls' ellipsis button. Three pages:
@@ -1694,6 +1814,7 @@ struct PlayerSettingsPanel: View {
         case aiTranslation
         case font
         case sizeMinus, sizePlus
+        case heightMinus, heightPlus
         case bold
         case position
         case color(String)
@@ -2220,6 +2341,23 @@ struct PlayerSettingsPanel: View {
                         plusKey: .sizePlus,
                         onMinus: { updateStyle { $0.textSize = max($0.textSize - 5, 5) } },
                         onPlus: { updateStyle { $0.textSize = min($0.textSize + 5, 220) } }
+                    )
+
+                    stepperRow(
+                        title: L10n.string("tvos_settings_vertical_position", fallback: "Vertical Position"),
+                        value: "\(style.bottomOffset)",
+                        minusKey: .heightMinus,
+                        plusKey: .heightPlus,
+                        onMinus: {
+                            updateStyle {
+                                $0.bottomOffset = max($0.bottomOffset - 4, SubtitleStyleDefaults.bottomOffsetRange.lowerBound)
+                            }
+                        },
+                        onPlus: {
+                            updateStyle {
+                                $0.bottomOffset = min($0.bottomOffset + 4, SubtitleStyleDefaults.bottomOffsetRange.upperBound)
+                            }
+                        }
                     )
 
                     cycleRow(

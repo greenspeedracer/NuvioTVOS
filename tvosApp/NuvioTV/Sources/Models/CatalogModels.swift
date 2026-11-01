@@ -5,6 +5,7 @@
 //  Swift data models for catalog browsing
 //
 
+import AVFoundation
 import Foundation
 
 // MARK: - Catalog Models
@@ -1553,16 +1554,25 @@ struct WatchedEpisodeSummary: Equatable {
         videos: [NuvioVideo]?,
         watchedEpisodeKeys: Set<String>
     ) -> WatchedEpisodeSummary? {
-        let episodes = CatalogWatchedPolicy.airedRegularEpisodes(videos)
-        guard !episodes.isEmpty else { return nil }
-        let watchedCount = episodes.reduce(into: 0) { count, video in
+        make(
+            airedEpisodes: CatalogWatchedPolicy.airedRegularEpisodes(videos),
+            watchedEpisodeKeys: watchedEpisodeKeys
+        )
+    }
+
+    static func make(
+        airedEpisodes: [NuvioVideo],
+        watchedEpisodeKeys: Set<String>
+    ) -> WatchedEpisodeSummary? {
+        guard !airedEpisodes.isEmpty else { return nil }
+        let watchedCount = airedEpisodes.reduce(into: 0) { count, video in
             if watchedEpisodeKeys.contains("\(video.season):\(video.episode)") {
                 count += 1
             }
         }
         return WatchedEpisodeSummary(
             watchedCount: watchedCount,
-            totalCount: episodes.count
+            totalCount: airedEpisodes.count
         )
     }
 }
@@ -1661,7 +1671,7 @@ enum ContentReleasePolicy {
 }
 
 /// Video stream information
-struct NuvioSubtitle: Identifiable, Codable, Equatable {
+struct NuvioSubtitle: Identifiable, Codable, Equatable, Sendable {
     var id: String { url }
     let url: String
     let language: String
@@ -1671,7 +1681,7 @@ struct NuvioSubtitle: Identifiable, Codable, Equatable {
     var source: String? = nil
 }
 
-struct NuvioStream: Identifiable, Codable, Equatable {
+struct NuvioStream: Identifiable, Codable, Equatable, Sendable {
     /// Stable identity for lists and focus. Prefer URL / torrent key; never mint a
     /// fresh UUID on each access (that forces full SwiftUI list rebuilds).
     var id: String {
@@ -1979,7 +1989,7 @@ struct NuvioStream: Identifiable, Codable, Equatable {
 /// One add-on's stream results in the progressive picker, matching Android's
 /// `AddonStreamGroup`: created as loading before requests start, then updated
 /// independently as that add-on completes, fails, or times out.
-struct AddonStreamGroup: Identifiable {
+struct AddonStreamGroup: Identifiable, Sendable {
     var id: String { addonId }
     /// Stable identity (manifest URL / manifest id) — never the display name.
     let addonId: String
@@ -2069,7 +2079,7 @@ struct TrailerPlaybackSource {
 
     init(
         videoUrl: String,
-        audioUrl: String?,
+        audioUrl: String? = nil,
         requestHeaders: [String: String] = [:],
         qualityLabel: String? = nil,
         diagnostics: String? = nil
@@ -2079,6 +2089,87 @@ struct TrailerPlaybackSource {
         self.requestHeaders = requestHeaders
         self.qualityLabel = qualityLabel
         self.diagnostics = diagnostics
+    }
+
+    /// Creates an AVPlayerItem for the trailer stream. When separate video and
+    /// audio URLs are present (e.g. YouTube adaptive 1080p/720p streams), it
+    /// composes both tracks into an AVMutableComposition with synchronized
+    /// playback in AVPlayer.
+    func makePlayerItem(preferredForwardBufferDuration: TimeInterval? = nil) async -> AVPlayerItem? {
+        guard let url = URL(string: videoUrl) else { return nil }
+        let videoAsset: AVURLAsset
+        if let userAgent = requestHeaders["User-Agent"], !userAgent.isEmpty {
+            videoAsset = AVURLAsset(url: url, options: [AVURLAssetHTTPUserAgentKey: userAgent])
+        } else {
+            videoAsset = AVURLAsset(url: url)
+        }
+
+        let item: AVPlayerItem
+        if let audioUrlString = audioUrl,
+           let audioURL = URL(string: audioUrlString) {
+            let audioAsset: AVURLAsset
+            if let userAgent = requestHeaders["User-Agent"], !userAgent.isEmpty {
+                audioAsset = AVURLAsset(url: audioURL, options: [AVURLAssetHTTPUserAgentKey: userAgent])
+            } else {
+                audioAsset = AVURLAsset(url: audioURL)
+            }
+
+            do {
+                let videoTracks = try await videoAsset.loadTracks(withMediaType: .video)
+                let audioTracks = try await audioAsset.loadTracks(withMediaType: .audio)
+                guard !Task.isCancelled else { return nil }
+
+                if let videoTrack = videoTracks.first,
+                   let audioTrack = audioTracks.first {
+                    let videoDuration = try await videoAsset.load(.duration)
+                    let audioDuration = try await audioAsset.load(.duration)
+                    guard !Task.isCancelled else { return nil }
+
+                    if videoDuration.isNumeric, audioDuration.isNumeric,
+                       CMTimeCompare(videoDuration, .zero) > 0,
+                       CMTimeCompare(audioDuration, .zero) > 0 {
+                        let composition = AVMutableComposition()
+                        if let compVideo = composition.addMutableTrack(
+                            withMediaType: .video,
+                            preferredTrackID: kCMPersistentTrackID_Invalid
+                        ), let compAudio = composition.addMutableTrack(
+                            withMediaType: .audio,
+                            preferredTrackID: kCMPersistentTrackID_Invalid
+                        ) {
+                            try compVideo.insertTimeRange(
+                                CMTimeRange(start: .zero, duration: videoDuration),
+                                of: videoTrack,
+                                at: .zero
+                            )
+                            try compAudio.insertTimeRange(
+                                CMTimeRange(start: .zero, duration: CMTimeMinimum(videoDuration, audioDuration)),
+                                of: audioTrack,
+                                at: .zero
+                            )
+                            item = AVPlayerItem(asset: composition)
+                        } else {
+                            item = AVPlayerItem(asset: videoAsset)
+                        }
+                    } else {
+                        item = AVPlayerItem(asset: videoAsset)
+                    }
+                } else {
+                    item = AVPlayerItem(asset: videoAsset)
+                }
+            } catch {
+                guard !Task.isCancelled else { return nil }
+                item = AVPlayerItem(asset: videoAsset)
+            }
+        } else {
+            item = AVPlayerItem(asset: videoAsset)
+        }
+
+        if let preferredForwardBufferDuration {
+            item.preferredForwardBufferDuration = preferredForwardBufferDuration
+        }
+        item.preferredPeakBitRate = 0
+        item.preferredMaximumResolution = .zero
+        return item
     }
 }
 
@@ -3565,21 +3656,25 @@ enum ContinueWatchingStore {
         guard TopShelfFeedStore.isAvailable else { return }
         topShelfSnapshotLock.lock()
         defer { topShelfSnapshotLock.unlock() }
-        let allItems = items()
-        let inProgress = allItems.filter { !$0.isUpNextEntry }.prefix(10)
+        // Each entry keeps its place on Home's row, so the shelf can show both
+        // sections as one row in that order.
+        let allItems = Array(items().enumerated())
+        let inProgress = allItems.filter { !$0.element.isUpNextEntry }.prefix(10)
         // Unaired suggestions can't be played yet, so they stay off the shelf.
         let upNext = allItems
-            .filter { $0.isUpNextEntry && ($0.hasAired || $0.isAiringToday) }
+            .filter { $0.element.isUpNextEntry && ($0.element.hasAired || $0.element.isAiringToday) }
             .prefix(10)
         // Register these snapshots before any detached work can reorder them.
         // Mapping at most twenty cards is cheap; disk/network/artwork stay async.
-        TopShelfFeedStore.write(inProgress.map(topShelfEntry(for:)), section: .continueWatching,
+        TopShelfFeedStore.write(inProgress.map { topShelfEntry(for: $0.element, homeOrder: $0.offset) },
+                                section: .continueWatching,
                                 title: L10n.string("home_continue_watching", fallback: "Continue Watching"))
-        TopShelfFeedStore.write(upNext.map(topShelfEntry(for:)), section: .upNext,
+        TopShelfFeedStore.write(upNext.map { topShelfEntry(for: $0.element, homeOrder: $0.offset) },
+                                section: .upNext,
                                 title: L10n.string("cw_badge_next_up", fallback: "Up Next").capitalized)
     }
 
-    private static func topShelfEntry(for item: ContinueWatchingItem) -> TopShelfEntry {
+    private static func topShelfEntry(for item: ContinueWatchingItem, homeOrder: Int) -> TopShelfEntry {
         let fraction = item.duration > 0 ? min(max(item.position / item.duration, 0), 1) : nil
         var subtitleParts: [String] = []
         if let season = item.season, let episode = item.episode {
@@ -3593,13 +3688,12 @@ enum ContinueWatchingStore {
             subtitleParts.append("\(remaining) left")
         }
         return TopShelfEntry(
-            contentId: item.meta.id,
-            contentType: item.meta.type,
-            title: item.meta.name,
+            meta: item.meta,
             subtitle: subtitleParts.isEmpty ? nil : subtitleParts.joined(separator: "  ·  "),
-            imageURL: item.meta.posterUrl,
-            backdropURL: item.meta.backdropUrl,
-            progress: item.isUpNextEntry ? nil : fraction
+            progress: item.isUpNextEntry ? nil : fraction,
+            action: .resume,
+            screen: .continueWatching,
+            homeOrder: homeOrder
         )
     }
 
@@ -4339,16 +4433,7 @@ enum LibraryStore {
             .sorted { $0.addedAt > $1.addedAt }
             .prefix(15)
             .map { item in
-                TopShelfEntry(
-                    contentId: item.meta.id,
-                    contentType: item.meta.type,
-                    title: item.meta.name,
-                    subtitle: nil,
-                    imageURL: item.meta.posterUrl,
-                    backdropURL: item.meta.backdropUrl,
-                    progress: nil,
-                    action: .details
-                )
+                TopShelfEntry(meta: item.meta, subtitle: nil, progress: nil, action: .details, screen: .library)
             }
         TopShelfFeedStore.write(Array(entries), section: .library,
                                 title: L10n.string("nav_library", fallback: "Library"))

@@ -486,11 +486,14 @@ enum PlaybackThumbnailSourceFallback {
         maxInputBytes: 64 * 1024 * 1024, maxPackets: 2_048,
         maxPacketBytes: 8 * 1024 * 1024, timeBudget: 2)
 
+    /// `allowsOrigin: false` stops after the local cache stage: a remote source the preview lane
+    /// serves never opens a second, unpaced extractor on the origin here.
     @MainActor
     static func boundedSnapshot(
         sourceContext: PlaybackThumbnailSourceContext,
         atSeconds seconds: Double,
         maxWidth: Int,
+        allowsOrigin: Bool = true,
         cancellation: PlaybackThumbnailRequestCancellation,
         isCurrent: @MainActor () -> Bool,
         requiredDolbyVisionReshaping: Bool = false,
@@ -528,7 +531,7 @@ enum PlaybackThumbnailSourceFallback {
             return nil
         }
 
-        guard isCurrent(), !cancellation.isCancelled, yieldWhile?() != true,
+        guard allowsOrigin, isCurrent(), !cancellation.isCancelled, yieldWhile?() != true,
               let stage = cancellation.beginStage() else { return nil }
         let extractor = FrameExtractor(
             url: originURL,
@@ -615,6 +618,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 
     // MARK: - Trickplay & Seek Previews
     private let hybridThumbnailIndex = HybridSeekThumbnailIndex()
+    private let seekPreviewLaneHost = SeekPreviewLaneHost()
     private var externalTrickplayProvider: (any TrickplayProviding)?
     private var loadGeneration: UInt64 = 0
     private let firstFrameReadiness = MPVFirstFrameReadiness()
@@ -667,10 +671,13 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         let image = await hybridThumbnailIndex.lookup(
             seconds: seconds,
             duration: duration,
-            generation: generation
+            generation: generation,
+            exactOnly: true
         )
         guard isCurrentScrubThumbnailRequest(
             requestID, generation: generation, providerGeneration: providerGeneration) else { return nil }
+        // No lane cell here: its keyframe can sit seconds before the target, and an exact still
+        // from the cache may follow. generateScrubThumbnail reaches the lane, from memory at once.
         return image
     }
 
@@ -753,7 +760,8 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         let cached = await hybridThumbnailIndex.lookup(
             seconds: seconds,
             duration: duration,
-            generation: generation
+            generation: generation,
+            exactOnly: true
         )
         guard isCurrentScrubThumbnailRequest(requestID, generation: generation,
                                              providerGeneration: providerGeneration,
@@ -761,10 +769,13 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         if let cached { return cached }
         guard let sourceContext,
               sourceContext.generation == generation else { return nil }
+        // Remote sources read the origin only through the preview lane (paced, one connection).
+        let usesPreviewLane = SeekPreviewLaneHost.mayServe(sourceContext)
         let still = await PlaybackThumbnailSourceFallback.boundedSnapshot(
             sourceContext: sourceContext,
             atSeconds: seconds,
             maxWidth: maxWidth,
+            allowsOrigin: !usesPreviewLane,
             cancellation: cancellation,
             isCurrent: {
                 self.isCurrentScrubThumbnailRequest(
@@ -774,9 +785,94 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         guard isCurrentScrubThumbnailRequest(requestID, generation: generation,
                                              providerGeneration: providerGeneration,
                                              cancellation: cancellation) else { return nil }
-        return await storePreviewIfCurrent(
+        if let stored = await storePreviewIfCurrent(
             still, requestedSeconds: seconds, generation: generation,
-            requestID: requestID, providerGeneration: providerGeneration, cancellation: cancellation)
+            requestID: requestID, providerGeneration: providerGeneration, cancellation: cancellation) {
+            return stored
+        }
+        guard usesPreviewLane,
+              isCurrentScrubThumbnailRequest(requestID, generation: generation,
+                                             providerGeneration: providerGeneration,
+                                             cancellation: cancellation),
+              let lane = await previewLane(for: sourceContext),
+              isCurrentScrubThumbnailRequest(requestID, generation: generation,
+                                             providerGeneration: providerGeneration,
+                                             cancellation: cancellation) else { return nil }
+        let image = await lane.image(at: seconds, duration: duration)
+        guard isCurrentScrubThumbnailRequest(requestID, generation: generation,
+                                             providerGeneration: providerGeneration,
+                                             cancellation: cancellation) else { return nil }
+        return image
+    }
+
+    // MARK: Seek preview lane
+
+    private func previewLane(for context: PlaybackThumbnailSourceContext) async -> SeekPreviewLane? {
+        let generation = loadGeneration
+        guard context.generation == generation else { return nil }
+        let index = hybridThumbnailIndex
+        return await seekPreviewLaneHost.lane(
+            for: context,
+            diskStreamKey: contentCanonicalKey ?? currentStreamKey,
+            isCurrent: { [weak self] in
+                guard let self else { return false }
+                return self.loadGeneration == generation && self.thumbnailSourceContext == context
+            },
+            admission: { [weak self] purpose in
+                self?.seekPreviewNetworkDecision(for: purpose) ?? .busy
+            },
+            localFrame: { seconds, maxDistance in
+                await index.nearest(seconds: seconds, maxDistance: maxDistance, generation: generation)
+            })
+    }
+
+    private func seekPreviewNetworkDecision(for purpose: SeekPreviewLane.Purpose) -> SeekPreviewNetworkPolicy.Decision {
+        guard mpv != nil else { return .busy }
+        let paused = getFlag("pause")
+        let seeking = getFlag("seeking") || getFlag("paused-for-cache")
+        if purpose == .chapter { return SeekPreviewNetworkPolicy.chapterThumbnails() }
+        return SeekPreviewNetworkPolicy.mpv(
+            beyondBuffer: SeekPreviewNetworkPolicy.beyondBufferEnabled,
+            isPaused: paused,
+            isPlaying: !paused && !seeking && isPlayerPlaying,
+            cacheSeconds: readDoubleProperty("demuxer-cache-duration"))
+    }
+
+    func nearestScrubThumbnail(atSeconds seconds: Double, maxDistance: Double) async -> CGImage? {
+        let generation = loadGeneration
+        let fromIndex = await hybridThumbnailIndex.nearest(
+            seconds: seconds, maxDistance: maxDistance, generation: generation)
+        guard loadGeneration == generation else { return nil }
+        return fromIndex ?? seekPreviewLaneHost.current?.nearestImage(to: seconds, maxDistance: maxDistance)
+    }
+
+    var prefetchesScrubThumbnailsInBackground: Bool {
+        SeekPreviewLaneHost.mayServe(thumbnailSourceContext)
+    }
+
+    /// A chapter's still for the Chapters panel: the external storyboard's (the add-on's
+    /// trickplay, the trickplay server or Seekr), else one held near it, else the preview
+    /// lane's keyframe; sources the lane does not serve keep the ordinary preview path.
+    func chapterThumbnail(atSeconds seconds: Double, duration: Double) async -> CGImage? {
+        let generation = loadGeneration
+        guard let context = thumbnailSourceContext else { return nil }
+        if let external = externalTrickplayProvider, let image = await external.thumbnail(at: seconds) {
+            return loadGeneration == generation ? image : nil
+        }
+        if let near = await hybridThumbnailIndex.nearest(seconds: seconds, maxDistance: 2.5, generation: generation) {
+            return near
+        }
+        guard loadGeneration == generation else { return nil }
+        guard SeekPreviewLaneHost.mayServe(context) else {
+            if let cached = await cachedScrubThumbnail(atSeconds: seconds, duration: duration) { return cached }
+            return await scrubThumbnail(atSeconds: seconds, maxWidth: 320, precise: false)
+        }
+        guard let lane = await previewLane(for: context), loadGeneration == generation else { return nil }
+        return await lane.image(at: seconds, duration: duration, purpose: .chapter)
+    }
+
+    func prefetchScrubThumbnails(around seconds: Double, direction: Double, duration: Double) {
+        seekPreviewLaneHost.current?.prefetch(around: seconds, direction: direction, duration: duration)
     }
 
     private func storePreviewIfCurrent(
@@ -787,6 +883,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         providerGeneration: UInt64,
         cancellation: PlaybackThumbnailRequestCancellation
     ) async -> CGImage? {
+        SeekPreviewOriginTags.shared.tag(still?.image, "snapshot", seconds: still?.actualSeconds)
         guard let still,
               let actualSeconds = still.actualSeconds,
               actualSeconds.isFinite,
@@ -846,6 +943,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         isKnownHLS: Bool = false
     ) {
         cancelScrubThumbnailWork()
+        seekPreviewLaneHost.reset()
         loadGeneration &+= 1
         externalProviderGeneration &+= 1
         externalTrickplayProvider = nil
@@ -958,6 +1056,8 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     private var desiredAudioSelection: DesiredTrackSelection?
     let subtitleTranslationState = MPVSubtitleTranslationState()
     private var isMPVSubtitleRendererHiddenForTranslation = false
+    private var playerControlsVisibleForSubtitles = false
+    private var subtitleStyleViewportHeight: CGFloat = 0
 
     // MARK: - Seek Watchdog Diagnostics
     private struct ActiveSeekWatchdog {
@@ -997,6 +1097,10 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     // Cached track lists
     var audioTracks: [PlaybackTrackInfo] = []
     var subtitleTracks: [PlaybackTrackInfo] = []
+    /// mpv's own chapter list (Matroska / MP4), read again when its length or
+    /// the duration changes.
+    private(set) var chapters: [PlaybackChapter] = []
+    private var chapterListKey = ""
 
     // State (polled from the view model every 250ms)
     var onFirstFrameReady: (() -> Void)?
@@ -1075,6 +1179,11 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         layoutMetalLayer()
+        if playerControlsVisibleForSubtitles,
+           mpv != nil,
+           abs(view.bounds.height - subtitleStyleViewportHeight) > 1 {
+            applySubtitleStyle()
+        }
         attemptStartPendingLoad()
     }
 
@@ -1464,6 +1573,8 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     }
 
     func loadFile(_ urlString: String) {
+        chapters = []
+        chapterListKey = ""
         resetStartupDisplayGateState(clearAnchor: true)
         firstFrameReadiness.reset()
         if didConfigureMPVRemoteCommands { teardownMPVRemoteCommands(); setupMPVRemoteCommandsIfNeeded() }
@@ -1648,6 +1759,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 
     func playPlayback() {
         cancelScrubThumbnailWork()
+        seekPreviewLaneHost.revokeNetwork()
         guard mpv != nil else { return }
         screensaverDebugLog("[ScreensaverDebug][MPVController] playPlayback() called: pos=\(positionMs)ms")
         wasPlayingBeforeBackground = MPVPlaybackLifecyclePolicy.updatingSavedPlayIntent(
@@ -2210,17 +2322,37 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
             setStringProperty("sub-pos", "0")
             setStringProperty("sub-align-y", "top")
         } else {
-            setStringProperty("sub-pos", "100")
+            let position: String
+            if playerControlsVisibleForSubtitles, view.bounds.height > 1 {
+                let liftPercent = min(
+                    100,
+                    Double(PlayerSubtitleLayoutMetrics.controlsVisibleLiftPoints / view.bounds.height * 100)
+                )
+                position = String(format: "%.2f", 100 - liftPercent)
+            } else {
+                position = "100"
+            }
+            setStringProperty("sub-pos", position)
             setStringProperty("sub-align-y", "bottom")
         }
+        subtitleStyleViewportHeight = view.bounds.height
+    }
+
+    func setPlayerControlsVisible(_ visible: Bool) {
+        guard playerControlsVisibleForSubtitles != visible else { return }
+        playerControlsVisibleForSubtitles = visible
+        applySubtitleStyle()
     }
 
     func destroyPlayer() {
+        chapters = []
+        chapterListKey = ""
         firstFrameReadiness.reset()
 #if NUVIO_MPV_MEMORY_WATCHDOG && os(tvOS)
         memoryWatchdog.stop(event: "destroy")
 #endif
         cancelScrubThumbnailWork()
+        seekPreviewLaneHost.reset()
         loadGeneration &+= 1
         externalProviderGeneration &+= 1
         externalTrickplayProvider = nil
@@ -2444,6 +2576,24 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     func updateState() {
         refreshPlaybackState()
         refreshTracks()
+        refreshChapters()
+    }
+
+    private func refreshChapters() {
+        guard mpv != nil else { return }
+        let count = max(0, getInt("chapter-list/count"))
+        let reported = getDouble("duration")
+        let duration = reported.isFinite ? max(0, reported) : 0
+        let key = "\(count):\(Int(duration))"
+        guard key != chapterListKey else { return }
+        chapterListKey = key
+        let items: [(id: Int, name: String, start: Double, duration: Double)] = (0..<count).map { index in
+            (id: index,
+             name: getString("chapter-list/\(index)/title") ?? "",
+             start: getDouble("chapter-list/\(index)/time"),
+             duration: 0.0)
+        }
+        chapters = PlaybackChapters.chapters(from: items, totalDuration: duration)
     }
 
     private func refreshTracks() {
