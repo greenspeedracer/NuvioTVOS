@@ -1,0 +1,16 @@
+{
+  "name": "greenspeedracer's NuvioTVOS",
+  "identifier": "com.greenspeedracer.nuvio-tvos",
+  "apps": [
+    {
+      "name": "NuvioTVOS",
+      "bundleIdentifier": "com.pyksel.nuviotvos",
+      "developerName": "greenspeedracer",
+      "subtitle": "Nuvio TV for tvOS",
+      "localizedDescription": "greenspeedracer fork from BobSupra",
+      "iconURL": "https://raw.githubusercontent.com/greenspeedracer/NuvioTVOS/main/nuviotvos-icon.png",
+      "tintColor": "007AFF",
+      "versions": []
+    }
+  ]
+}
