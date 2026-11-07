@@ -725,10 +725,24 @@ struct CalendarView: View {
         .padding(.bottom, 30)
         .defaultFocusIfAvailable($focus, didFocusToday ? nil : .day(today))
         .onAppear(perform: focusTodayOnFirstOpen)
-        // Back from the episode list returns to the selected day instead
-        // of jumping to the sidebar (which slides the whole grid over).
-        // Elsewhere nil keeps the system's own Back.
-        .onExitCommand(perform: isFocusInPanel ? { focus = .day(selectedDay) } : nil)
+        // Back from the event panel returns to the day of the focused
+        // event, which may differ from selectedDay after scrolling the list.
+        // Other areas leave the Menu button to the native sidebar.
+        .onExitCommand(perform: isFocusInPanel ? { returnFromDayPanel(in: shown) } : nil)
+    }
+
+    private func returnFromDayPanel(in result: CalendarResult) {
+        guard let targetDay = CalendarBackTarget.day(
+            for: focus,
+            selectedDay: selectedDay,
+            sections: result.days.filter { $0.date.isSameMonth(as: displayedMonth) }
+        ) else { return }
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            selectedDay = targetDay
+            focus = .day(targetDay)
+        }
     }
 
     /// The first time the calendar shows, start on today's cell.
@@ -947,6 +961,22 @@ enum CalendarFocus: Hashable {
     case nextMonth
     case day(CalendarDay)
     case entry(String)
+}
+
+/// A focused event can belong to a different date from the calendar cell
+/// selected before entering the right-hand list. Resolve Back against the
+/// actual event, instead of jumping to that stale calendar selection.
+enum CalendarBackTarget {
+    static func day(
+        for focus: CalendarFocus?,
+        selectedDay: CalendarDay,
+        sections: [CalendarDaySection]
+    ) -> CalendarDay? {
+        guard case .entry(let entryID) = focus else { return nil }
+        return sections.first(where: { section in
+            section.entries.contains(where: { $0.id == entryID })
+        })?.date ?? selectedDay
+    }
 }
 
 /// Keeps the watched state and the add-on check in step with what the
@@ -1236,7 +1266,6 @@ private struct CalendarDayPanel: View {
     var focus: FocusState<CalendarFocus?>.Binding
     let onOpen: (CalendarEntry) -> Void
 
-    @State private var scrolledSectionID: String?
 
     private var sections: [CalendarDaySection] {
         result.days.filter { $0.date.isSameMonth(as: month) }
@@ -1306,22 +1335,12 @@ private struct CalendarDayPanel: View {
                 .padding(.vertical, 20)
                 .padding(.horizontal, 12)
             }
-            .scrollPosition(id: $scrolledSectionID, anchor: .top)
-            .scrollClipDisabledIfAvailable()
-            .onAppear {
-                scrolledSectionID = anchorID
-                scroll(proxy)
-            }
-            .onChange(of: selectedDay) { _, _ in
-                scrolledSectionID = anchorID
-                scroll(proxy)
-            }
-            .onChange(of: month) { _, _ in
-                scrolledSectionID = anchorID
-                scroll(proxy)
-            }
-            .onChange(of: focus.wrappedValue) { _, _ in
-                scrolledSectionID = anchorID
+            // One scroll owner: ScrollViewReader. Native tvOS focus may move
+            // between event buttons independently; do not reset the panel's
+            // position on every focus change or bind a second scroll position.
+            // Clip the list so offscreen rows cannot draw over the calendar.
+            .onAppear { scroll(proxy) }
+            .onChange(of: anchorID) { _, _ in
                 scroll(proxy)
             }
         }

@@ -35,6 +35,7 @@ struct PlayerControls: View {
     var onFocusNextEpisode: () -> Void = {}
 
     @FocusState private var focusedControl: PlayerControlFocus?
+    @State private var isAuxiliaryCardFocusActive = false
     @State private var playerButtonOrder = TVPlayerButtonOrder.currentOrder()
 
     @AppStorage(SettingsKey.playerShowPiP) private var playerShowPiP = true
@@ -54,7 +55,9 @@ struct PlayerControls: View {
         }
         .onExitCommand(perform: handleExit)
         .onChange(of: requestedFocus) { _, target in
-            guard let target, viewModel.showControls, !viewModel.controlsAutoHideSuspended else { return }
+            guard let target,
+                  viewModel.showControls,
+                  !viewModel.controlsAutoHideSuspended || isAuxiliaryCardFocusActive else { return }
             DispatchQueue.main.async {
                 let resolvedTarget: PlayerControlFocus
                 if target == .firstTransportButton {
@@ -70,6 +73,14 @@ struct PlayerControls: View {
                     focusedControl = isTransportButtonFocusable(resolvedTarget) ? resolvedTarget : (transportFocusOrder.first ?? .settings)
                 }
                 requestedFocus = nil
+            }
+        }
+        .onChange(of: isSkipSegmentFocused || isNextEpisodeFocused, initial: true) { _, isCardFocused in
+            if isCardFocused {
+                isAuxiliaryCardFocusActive = true
+                viewModel.setControlsAutoHideSuspended(false)
+            } else if focusedControl != nil {
+                isAuxiliaryCardFocusActive = false
             }
         }
         .onChange(of: viewModel.showSettingsPanel) { _, isPresented in
@@ -225,6 +236,9 @@ struct PlayerControls: View {
             }
         }
         .onChange(of: focusedControl) { oldControl, newControl in
+            if newControl != nil {
+                isAuxiliaryCardFocusActive = false
+            }
             // Keep this in lockstep with focus so hold-to-seek gating is correct
             // even before the next render cycle.
             let onTimeline = (newControl == .timeline)
@@ -253,16 +267,26 @@ struct PlayerControls: View {
                 viewModel.setControlsAutoHideSuspended(false)
                 viewModel.scheduleControlsHide(after: 10.0)
             } else if viewModel.showControls,
+                      !isAuxiliaryCardFocusActive,
                       let old = oldControl, old == .subtitles || old == .audio {
                 // Focus transitioned from a native Menu button into the presented menu items.
                 // Losing focus because controls were hidden must not suspend
                 // auto-hide and block a later revealControls() call.
-                viewModel.setControlsAutoHideSuspended(true)
+                DispatchQueue.main.async {
+                    // Card focus bindings update asynchronously with the focus handoff.
+                    guard focusedControl == nil,
+                          viewModel.showControls,
+                          !isAuxiliaryCardFocusActive,
+                          !isSkipSegmentFocused,
+                          !isNextEpisodeFocused else { return }
+                    viewModel.setControlsAutoHideSuspended(true)
+                }
             }
         }
         .onDisappear {
             viewModel.setTimelineFocused(false)
             viewModel.setControlsAutoHideSuspended(false)
+            isAuxiliaryCardFocusActive = false
         }
     }
 
@@ -270,6 +294,14 @@ struct PlayerControls: View {
         PlaybackTimelineRecorder.record(.controlsExitReceived, engine: viewModel.activeEngineKind)
         if viewModel.isScrubbing {
             viewModel.cancelScrub()
+        } else if focusedControl == nil,
+                  viewModel.showControls,
+                  viewModel.controlsAutoHideSuspended,
+                  !isAuxiliaryCardFocusActive,
+                  !isSkipSegmentFocused,
+                  !isNextEpisodeFocused {
+            // Native Menu owns focus until Back dismisses it.
+            return
         } else {
             viewModel.hideControls()
         }
@@ -363,18 +395,9 @@ struct PlayerControls: View {
         subtitlePanelOptions(for: viewModel)
     }
 
-    /// Settings-style flash prevention: while the progress bar owns focus, only
-    /// the first transport button stays focusable in the transport row. tvOS spatial focus lands on the
-    /// geometric nearest *focusable* control — with a single candidate it goes
-    /// straight to it, so other buttons never receive a one-frame flash.
-    /// Once any transport button is focused, every visible button is focusable
-    /// again so left/right still walks the full row.
     private func isTransportButtonFocusable(_ key: PlayerControlFocus) -> Bool {
         guard controlsInteractable else { return false }
         guard key != .pip || didReportPlaybackStarted else { return false }
-        if focusedControl == .timeline {
-            return key == (transportFocusOrder.first ?? .settings)
-        }
         return true
     }
 
@@ -515,6 +538,7 @@ struct PlayerControls: View {
             }
             .id("settings_button")
         }
+        .focusSection()
     }
 
     @ViewBuilder
@@ -560,11 +584,84 @@ struct PlayerControls: View {
             .id("sources_button")
 
         case .subtitles:
+            let activeAddonSubtitle = viewModel.activeAddonSubtitle
+            let autoSyncState = activeAddonSubtitle.flatMap { viewModel.subtitleAutoSyncStates[$0.url] }
+            let isSubtitleAutoSyncUsingOriginal = activeAddonSubtitle.map {
+                viewModel.isSubtitleAutoSyncUsingOriginal($0.url)
+            } ?? false
+            let syncActionTitle: String = {
+                switch autoSyncState {
+                case .checking?:
+                    return L10n.string("player_autosync_running", fallback: "Checking…")
+                case .synced?:
+                    return L10n.string(
+                        isSubtitleAutoSyncUsingOriginal
+                            ? "player_subtitle_autosync_original"
+                            : "player_autosync_subtitle_synced",
+                        fallback: isSubtitleAutoSyncUsingOriginal ? "Original Timing" : "Subtitle Synced"
+                    )
+                case .kept(.inSync)?:
+                    return L10n.string("player_subtitle_autosync_in_sync_short", fallback: "In Sync")
+                default:
+                    return L10n.string("player_autosync_sync_subtitle", fallback: "Sync Subtitle")
+                }
+            }()
+            let audioSyncStatus = viewModel.audioSyncStatus.flatMap {
+                $0.subtitleURL == activeAddonSubtitle?.url ? $0 : nil
+            }
+            let audioSyncTimingStatus = viewModel.audioSyncTimingStatusForCurrentSubtitle
+            let isAudioSyncRunningForSelectedSubtitle = viewModel.isAudioSyncRunning
+                && audioSyncStatus?.isRunning == true
+            let isAudioSyncAppliedForSelectedSubtitle = audioSyncTimingStatus != nil
+            let isAudioSyncUsingOriginalTiming = audioSyncTimingStatus?.isOriginalTimingSelected ?? false
+            let canToggleAudioSyncTiming = audioSyncTimingStatus.map {
+                $0.originalDelayMs != $0.syncedDelayMs
+            } ?? false
             PlayerSubtitleMenuButton(
                 noneOption: subtitleNoneOption,
                 languageGroups: subtitleLanguageGroups,
                 isFocused: focusedControl == .subtitles,
-                onSelect: { selectSubtitlePickerOption($0) }
+                autoSyncState: autoSyncState,
+                syncActionTitle: syncActionTitle,
+                isSubtitleAutoSyncUsingOriginal: isSubtitleAutoSyncUsingOriginal,
+                hasActiveAddonSubtitle: activeAddonSubtitle != nil,
+                isAudioSyncRunningForSelectedSubtitle: isAudioSyncRunningForSelectedSubtitle,
+                isAudioSyncAppliedForSelectedSubtitle: isAudioSyncAppliedForSelectedSubtitle,
+                isAudioSyncUsingOriginalTiming: isAudioSyncUsingOriginalTiming,
+                canToggleAudioSyncTiming: canToggleAudioSyncTiming,
+                canToggleAudioSync: activeAddonSubtitle != nil
+                    && (isAudioSyncRunningForSelectedSubtitle || viewModel.activeEngineKind == .aether),
+                onSelect: { selectSubtitlePickerOption($0) },
+                onRunAutoSync: {
+                    guard let activeAddonSubtitle = viewModel.activeAddonSubtitle else { return }
+                    switch viewModel.subtitleAutoSyncStates[activeAddonSubtitle.url] {
+                    case .checking?, .synced?, .kept(.inSync)?:
+                        return
+                    default:
+                        viewModel.runSubtitleAutoSyncNow()
+                    }
+                },
+                onToggleSubtitleTiming: {
+                    guard let activeAddonSubtitle = viewModel.activeAddonSubtitle,
+                          case .synced? = viewModel.subtitleAutoSyncStates[activeAddonSubtitle.url] else {
+                        return
+                    }
+                    viewModel.toggleSubtitleAutoSyncTiming()
+                },
+                onToggleAudioSync: {
+                    if viewModel.isAudioSyncRunning,
+                       let activeAddonSubtitle,
+                       viewModel.audioSyncStatus?.subtitleURL != activeAddonSubtitle.url {
+                        viewModel.startAudioSync()
+                    } else {
+                        viewModel.toggleAudioSync()
+                    }
+                    viewModel.setControlsAutoHideSuspended(false)
+                    viewModel.scheduleControlsHide(after: 10.0)
+                },
+                onToggleAudioSyncTiming: {
+                    viewModel.toggleAudioSyncTiming()
+                }
             )
             .equatable()
             .focused($focusedControl, equals: .subtitles)
@@ -814,17 +911,136 @@ private struct PlayerSubtitleMenuButton: View, Equatable {
     let noneOption: SubtitlePanelOption?
     let languageGroups: [SubtitleLanguageGroup]
     let isFocused: Bool
+    let autoSyncState: SubtitleAutoSyncState?
+    let syncActionTitle: String
+    let isSubtitleAutoSyncUsingOriginal: Bool
+    let hasActiveAddonSubtitle: Bool
+    let isAudioSyncRunningForSelectedSubtitle: Bool
+    let isAudioSyncAppliedForSelectedSubtitle: Bool
+    let isAudioSyncUsingOriginalTiming: Bool
+    let canToggleAudioSyncTiming: Bool
+    let canToggleAudioSync: Bool
     let onSelect: (SubtitlePanelOption) -> Void
+    let onRunAutoSync: () -> Void
+    let onToggleSubtitleTiming: () -> Void
+    let onToggleAudioSync: () -> Void
+    let onToggleAudioSyncTiming: () -> Void
 
     static func == (lhs: PlayerSubtitleMenuButton, rhs: PlayerSubtitleMenuButton) -> Bool {
         lhs.isFocused == rhs.isFocused
             && lhs.noneOption == rhs.noneOption
             && lhs.languageGroups == rhs.languageGroups
+            && lhs.autoSyncState == rhs.autoSyncState
+            && lhs.syncActionTitle == rhs.syncActionTitle
+            && lhs.isSubtitleAutoSyncUsingOriginal == rhs.isSubtitleAutoSyncUsingOriginal
+            && lhs.hasActiveAddonSubtitle == rhs.hasActiveAddonSubtitle
+            && lhs.isAudioSyncRunningForSelectedSubtitle == rhs.isAudioSyncRunningForSelectedSubtitle
+            && lhs.isAudioSyncAppliedForSelectedSubtitle == rhs.isAudioSyncAppliedForSelectedSubtitle
+            && lhs.isAudioSyncUsingOriginalTiming == rhs.isAudioSyncUsingOriginalTiming
+            && lhs.canToggleAudioSyncTiming == rhs.canToggleAudioSyncTiming
+            && lhs.canToggleAudioSync == rhs.canToggleAudioSync
     }
 
     var body: some View {
         Menu {
             Section(L10n.string("playback_section_subtitles", fallback: "Subtitles")) {
+                switch autoSyncState {
+                case .synced?:
+                    Button {} label: {
+                        Label(
+                            syncActionTitle,
+                            systemImage: isSubtitleAutoSyncUsingOriginal ? "clock" : "checkmark.circle"
+                        )
+                    }
+                    .disabled(true)
+
+                    Button {
+                        onToggleSubtitleTiming()
+                    } label: {
+                        Label(
+                            L10n.string(
+                                isSubtitleAutoSyncUsingOriginal
+                                    ? "player_autosync_use_synced"
+                                    : "player_subtitle_autosync_original",
+                                fallback: isSubtitleAutoSyncUsingOriginal ? "Synced Timing" : "Original Timing"
+                            ),
+                            systemImage: isSubtitleAutoSyncUsingOriginal ? "checkmark.circle" : "arrow.uturn.backward"
+                        )
+                    }
+                    .menuActionDismissBehavior(.disabled)
+
+                case .kept(.inSync)?:
+                    Button {} label: {
+                        Label(syncActionTitle, systemImage: "checkmark.circle")
+                    }
+                    .disabled(true)
+
+                case .checking?, nil:
+                    Button {
+                        onRunAutoSync()
+                    } label: {
+                        Label(syncActionTitle, systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .menuActionDismissBehavior(.disabled)
+                    .disabled(!hasActiveAddonSubtitle)
+
+                default:
+                    Button {
+                        onRunAutoSync()
+                    } label: {
+                        Label(syncActionTitle, systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .menuActionDismissBehavior(.disabled)
+                    .disabled(!hasActiveAddonSubtitle)
+                }
+
+                if isAudioSyncAppliedForSelectedSubtitle {
+                    Button {} label: {
+                        Label(
+                            L10n.string(
+                                isAudioSyncUsingOriginalTiming
+                                    ? "player_subtitle_autosync_original"
+                                    : "player_autosync_audio_synced",
+                                fallback: isAudioSyncUsingOriginalTiming ? "Original Timing" : "Synced by Audio"
+                            ),
+                            systemImage: isAudioSyncUsingOriginalTiming ? "clock" : "checkmark.circle"
+                        )
+                    }
+                    .disabled(true)
+
+                    if canToggleAudioSyncTiming {
+                        Button {
+                            onToggleAudioSyncTiming()
+                        } label: {
+                            Label(
+                                L10n.string(
+                                    isAudioSyncUsingOriginalTiming
+                                        ? "player_autosync_use_synced"
+                                        : "player_subtitle_autosync_original",
+                                    fallback: isAudioSyncUsingOriginalTiming ? "Synced Timing" : "Original Timing"
+                                ),
+                                systemImage: isAudioSyncUsingOriginalTiming ? "checkmark.circle" : "arrow.uturn.backward"
+                            )
+                        }
+                        .menuActionDismissBehavior(.disabled)
+                    }
+                } else {
+                    Button {
+                        onToggleAudioSync()
+                    } label: {
+                        Label(
+                            L10n.string(
+                                isAudioSyncRunningForSelectedSubtitle ? "player_autosync_audio_stop" : "player_autosync_audio",
+                                fallback: isAudioSyncRunningForSelectedSubtitle ? "Stop Listening" : "Sync by Audio"
+                            ),
+                            systemImage: isAudioSyncRunningForSelectedSubtitle ? "stop.circle" : "waveform"
+                        )
+                    }
+                    .disabled(!canToggleAudioSync)
+                }
+
+                Divider()
+
                 if let none = noneOption {
                     Button {
                         onSelect(none)
@@ -894,6 +1110,7 @@ private struct PlayerSubtitleMenuButton: View, Equatable {
                     }
                 }
             }
+
         } label: {
             Image(systemName: "captions.bubble")
                 .font(.system(size: 28, weight: .semibold))
@@ -1654,7 +1871,7 @@ struct SubtitleLanguageGroup: Identifiable, Equatable {
 
 /// Maps raw track/addon language values ("en", "eng", "English") onto one
 /// display name so both kinds group into a single Languages entry.
-private enum SubtitleLanguageDisplay {
+enum SubtitleLanguageDisplay {
     static func name(for raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "Unknown" }
@@ -1778,9 +1995,11 @@ private func subtitlePanelOptions(for viewModel: PlayerViewModel) -> [SubtitlePa
     for subtitle in viewModel.availableExternalSubtitles {
         let language = SubtitleLanguageDisplay.name(for: subtitle.language)
         let loadedTrack = viewModel.subtitles.first { $0.externalFilename == subtitle.url }
-        let detail = subtitle.label.flatMap { label in
+        let label = subtitle.label.flatMap { label in
             label.caseInsensitiveCompare(language) == .orderedSame ? nil : label
         }
+        let notes = [label, viewModel.subtitleAutoSyncNote(for: subtitle.url)].compactMap { $0 }
+        let detail = notes.isEmpty ? nil : notes.joined(separator: " · ")
         options.append(SubtitlePanelOption(
             id: "ext-\(subtitle.url)",
             kind: .external(subtitle),
@@ -1806,11 +2025,12 @@ struct PlayerSettingsPanel: View {
         case audio = "Audio"
         case speed = "Speed"
         case picture = "Picture"
-        case logs = "Logs"
+        case gestures = "Gestures"
     }
 
     private enum StyleControl: Hashable {
         case delayMinus, delayPlus
+        case autoSync
         case aiTranslation
         case font
         case sizeMinus, sizePlus
@@ -1847,6 +2067,15 @@ struct PlayerSettingsPanel: View {
         case debugOverlay
         case aspect(String)
         case style(StyleControl)
+        case gesturesSwitch
+        case gestureReset
+        case gestureAction(String)
+        case gestureClear(String)
+        case gestureGallery
+        case gestureSensitivity(String)
+        case gestureNewCustom
+        case gestureCustomDelete(String)
+        case gestureExpert
     }
 
     /// Swatches shown in the Text Color row (white, gray, yellow, blue, red, green).
@@ -1854,22 +2083,24 @@ struct PlayerSettingsPanel: View {
     private static let backgroundPalette = ["#000000", "#303030", "#FFFFFF", "#1F3A5F", "#5A1F2B", "#214D35"]
 
     @State private var tab: Tab = .subtitles
+    /// Gestures tab: the bindings, the action being recorded, and what the last change did.
+    @State private var gestureBindings = PlayerGestureSettings.bindings()
+    @State private var recordingGestureAction: PlayerGestureAction?
+    @State private var gestureNote: String?
+    @State private var isShowingGestureGallery = false
+    @State private var isMakingCustomGesture = false
+    @State private var gestureSensitivity = PlayerGestureSettings.sensitivity()
     @State private var selectedLanguage: String?
     @State private var style = SubtitleStyle.current
     @FocusState private var focus: Focus?
 
     private var visibleTabs: [Tab] {
-        guard didReportPlaybackStarted else { return [.logs] }
         var tabs: [Tab] = []
         if !viewModel.discTitles.isEmpty {
             tabs.append(.titles)
         }
-        tabs.append(contentsOf: [.subtitles, .audio, .speed, .picture, .logs])
+        tabs.append(contentsOf: [.subtitles, .audio, .speed, .picture, .gestures])
         return tabs
-    }
-
-    private var activeTab: Tab {
-        didReportPlaybackStarted ? tab : .logs
     }
 
     var body: some View {
@@ -1884,28 +2115,70 @@ struct PlayerSettingsPanel: View {
             VStack(alignment: .leading, spacing: 38) {
                 tabBar
 
-                switch activeTab {
+                switch tab {
                 case .titles: titlesPage
                 case .subtitles: subtitlesPage
                 case .audio: audioPage
                 case .speed: speedPage
                 case .picture: picturePage
-                case .logs: PlaybackLogsPage()
+                case .gestures: gesturesPage
                 }
             }
             .padding(.horizontal, 90)
             .padding(.top, 64)
             .padding(.bottom, 44)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            // Recording or the overview: nothing behind can take the focus (a swipe moved it there).
+            .disabled(recordingGestureAction != nil || isShowingGestureGallery || isMakingCustomGesture)
+
+            if let action = recordingGestureAction {
+                PlayerGestureRecorderView(
+                    action: action,
+                    bindings: gestureBindings,
+                    tuning: gestureSensitivity.tuning,
+                    setPadObserver: { observer in
+                        viewModel.gesturePadObservers["recorder"] = observer
+                    },
+                    onSave: { gesture in finishRecording(gesture, for: action) },
+                    onCancel: { endRecording(action) },
+                    customShapes: viewModel.customGestureShapes
+                )
+            }
+
+            if isMakingCustomGesture {
+                PlayerCustomGestureMakerView(
+                    existing: viewModel.customGestureShapes,
+                    tuning: gestureSensitivity.tuning,
+                    setPadObserver: { observer in
+                        viewModel.gesturePadObservers["recorder"] = observer
+                    },
+                    onSave: { shape in
+                        viewModel.setCustomGestureShapes(viewModel.customGestureShapes + [shape])
+                        isMakingCustomGesture = false
+                        gestureNote = "\(shape.name) saved: pick an action on the right and draw it"
+                        DispatchQueue.main.async {
+                            focus = .gestureAction(PlayerGestureAction.allCases[0].rawValue)
+                        }
+                    },
+                    onCancel: {
+                        isMakingCustomGesture = false
+                        DispatchQueue.main.async { focus = .gestureNewCustom }
+                    }
+                )
+            }
+
+            if isShowingGestureGallery {
+                PlayerGestureGalleryView(bindings: viewModel.isGestureExpert ? gestureBindings : .defaults) {
+                    isShowingGestureGallery = false
+                    DispatchQueue.main.async { focus = .gestureGallery }
+                }
+            }
         }
         .onAppear {
             style = SubtitleStyle.current
             viewModel.setControlsAutoHideSuspended(true)
             DispatchQueue.main.async {
-                if !didReportPlaybackStarted {
-                    tab = .logs
-                    focus = .tab(.logs)
-                } else if let language = effectiveLanguage {
+                if let language = effectiveLanguage {
                     selectedLanguage = language
                     focus = .language(language)
                 } else {
@@ -1927,12 +2200,9 @@ struct PlayerSettingsPanel: View {
                 focus = .audioControl(.delayMinus)
             } else if newTab == .titles, let first = viewModel.discTitles.first {
                 focus = .discTitle(viewModel.selectedDiscTitleId ?? first.id)
-            }
-        }
-        .onChange(of: didReportPlaybackStarted) { _, isReady in
-            if !isReady {
-                tab = .logs
-                focus = .tab(.logs)
+            } else if newTab == .gestures {
+                gestureBindings = PlayerGestureSettings.bindings()
+                gestureSensitivity = PlayerGestureSettings.sensitivity()
             }
         }
         .focusSection()
@@ -1945,13 +2215,8 @@ struct PlayerSettingsPanel: View {
         HStack(spacing: 22) {
             ForEach(visibleTabs, id: \.self) { item in
                 let isFocused = focus == .tab(item)
-                let isSelected = activeTab == item
+                let isSelected = tab == item
                 Button {
-                    guard didReportPlaybackStarted else {
-                        tab = .logs
-                        focus = .tab(.logs)
-                        return
-                    }
                     tab = item
                     if item == .audio && orderedAudioTracks.isEmpty {
                         focus = .audioControl(.delayMinus)
@@ -2308,6 +2573,23 @@ struct PlayerSettingsPanel: View {
 
     // MARK: Subtitle style column
 
+    /// The Auto Sync row's value: the correction (press for the original timing and back), or
+    /// what kept the subtitle as it is (press to try again).
+    private func autoSyncValue(_ state: SubtitleAutoSyncState, usingOriginal: Bool) -> String {
+        switch state {
+        case .checking:
+            return L10n.string("player_subtitle_autosync_checking", fallback: "Checking…")
+        case .synced(let result):
+            return usingOriginal
+                ? L10n.string("player_subtitle_autosync_original", fallback: "Original timing")
+                : result.shortLabel
+        case .kept(.inSync):
+            return L10n.string("player_subtitle_autosync_in_sync_short", fallback: "In sync")
+        case .kept:
+            return L10n.string("player_subtitle_autosync_not_synced", fallback: "Not synced")
+        }
+    }
+
     private var styleColumn: some View {
         VStack(alignment: .leading, spacing: 18) {
             columnHeader(L10n.string("subtitle_style_title", fallback: "Subtitle Style"))
@@ -2321,6 +2603,21 @@ struct PlayerSettingsPanel: View {
                         onMinus: { viewModel.setSubtitleDelayMs(viewModel.subtitleDelayMs - 50) },
                         onPlus: { viewModel.setSubtitleDelayMs(viewModel.subtitleDelayMs + 50) }
                     )
+
+                    if let subtitle = viewModel.activeAddonSubtitle,
+                       let state = viewModel.subtitleAutoSyncStates[subtitle.url] {
+                        cycleRow(
+                            title: L10n.string("player_subtitle_autosync", fallback: "AutoSubSync"),
+                            value: autoSyncValue(state, usingOriginal: viewModel.isSubtitleAutoSyncUsingOriginal(subtitle.url)),
+                            focusKey: .autoSync
+                        ) {
+                            if case .synced = state {
+                                viewModel.toggleSubtitleAutoSyncTiming()
+                            } else {
+                                viewModel.runSubtitleAutoSyncNow()
+                            }
+                        }
+                    }
 
                     if viewModel.canManuallyToggleAISubtitleTranslation {
                         toggleRow(
@@ -2958,6 +3255,289 @@ struct PlayerSettingsPanel: View {
             .frame(width: 420, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // MARK: Gestures
+
+    private var gesturesPage: some View {
+        HStack(alignment: .top, spacing: 56) {
+            VStack(alignment: .leading, spacing: 18) {
+                columnHeader("Remote gestures")
+                ScrollView(showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        toggleRow(
+                            title: "Gestures during playback",
+                            isOn: viewModel.areGesturesEnabled,
+                            focusKey: .gesturesSwitch
+                        ) {
+                            viewModel.setGesturesEnabled(!viewModel.areGesturesEnabled)
+                        }
+
+                        toggleRow(
+                            title: "Expert mode",
+                            isOn: viewModel.isGestureExpert,
+                            focusKey: .gestureExpert
+                        ) {
+                            gestureNote = nil
+                            viewModel.setGestureExpert(!viewModel.isGestureExpert)
+                        }
+
+                        simpleRow(title: "Gesture overview", isSelected: false, focusKey: .gestureGallery) {
+                            isShowingGestureGallery = true
+                        }
+
+                        if viewModel.isGestureExpert {
+                            simpleRow(title: "New custom gesture", isSelected: false, focusKey: .gestureNewCustom) {
+                                gestureNote = nil
+                                isMakingCustomGesture = true
+                            }
+
+                            ForEach(viewModel.customGestureShapes) { shape in
+                                customShapeRow(shape)
+                            }
+
+                            simpleRow(title: "Reset to defaults", isSelected: false, focusKey: .gestureReset) {
+                                gestureBindings = .defaults
+                                PlayerGestureSettings.save(.defaults)
+                                gestureSensitivity = PlayerGestureSensitivity()
+                                viewModel.setGestureSensitivity(gestureSensitivity)
+                                gestureNote = "The ready-made gestures and the default sensitivity"
+                            }
+                        }
+
+                        Text(viewModel.isGestureExpert
+                             ? "With the controls hidden, a gesture with an action replaces what the player does with it (like click right = seek). With the controls shown or paused, a gesture with an action does it on top of what the controls do. With a double click or tap set, a single one waits to see whether a second one follows."
+                             : "Ready-made gestures that keep clear of what the player does itself. Turn on Expert mode to change them, draw your own and tune the sensitivity.")
+                            .font(.system(size: 20, weight: .medium))
+                            .foregroundColor(.white.opacity(0.5))
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.top, 8)
+
+                        if let gestureNote {
+                            Text(gestureNote)
+                                .font(.system(size: 20, weight: .semibold))
+                                .foregroundColor(Color(red: 1.0, green: 0.82, blue: 0.55))
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+
+                        if viewModel.isGestureExpert {
+                            Text("Sensitivity")
+                                .font(.system(size: 22, weight: .bold))
+                                .foregroundColor(.white.opacity(0.55))
+                                .padding(.top, 14)
+
+                            ForEach(PlayerGestureSensitivityKnob.allCases) { knob in
+                                gestureSensitivityRow(knob)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 6)
+                }
+                .focusSection()
+            }
+            .frame(width: 520, alignment: .leading)
+
+            VStack(alignment: .leading, spacing: 18) {
+                if viewModel.isGestureExpert {
+                    columnHeader("Actions · press to record a gesture")
+                    ScrollView(showsIndicators: false) {
+                        VStack(spacing: 12) {
+                            ForEach(PlayerGestureAction.allCases) { action in
+                                gestureActionRow(action)
+                            }
+                        }
+                        .padding(.vertical, 6)
+                    }
+                    .focusSection()
+                } else {
+                    columnHeader("Ready-made gestures")
+                    VStack(spacing: 12) {
+                        ForEach(PlayerGestureBindings.defaults.bindings, id: \.action) { binding in
+                            readyMadeGestureRow(binding)
+                        }
+                    }
+                    .padding(.vertical, 6)
+                    Text("The player's own clicks, taps and swipes stay as they are: click or tap a side = ±10 s, hold a side = rewind / fast forward, swipe up = controls, swipe down = InSight.")
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white.opacity(0.5))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(width: 900, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .focusSection()
+    }
+
+    /// A ready-made gesture (Expert mode off): what it does and how it goes; not to be changed.
+    private func readyMadeGestureRow(_ binding: PlayerGestureBinding) -> some View {
+        HStack(spacing: 16) {
+            AnimatedGesturePad(gesture: binding.gesture)
+                .frame(width: 44, height: 44 * RemotePadCanvas.aspect)
+            Text(binding.action.title)
+                .font(.system(size: 25, weight: .semibold))
+                .foregroundColor(.white)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            Text(binding.gesture.title)
+                .font(.system(size: 21, weight: .bold))
+                .foregroundColor(.white.opacity(0.75))
+                .lineLimit(1)
+        }
+        .padding(.leading, 18)
+        .padding(.trailing, 26)
+        .frame(height: 62)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color.white.opacity(0.07))
+        )
+    }
+
+    /// A shape of one's own: what it does, and a button that deletes it (and what it did).
+    private func customShapeRow(_ shape: CustomGestureShape) -> some View {
+        let key = Focus.gestureCustomDelete(shape.id)
+        let isFocused = focus == key
+        let meaning = PlayerGestureMeaning(of: .custom(shape.id), in: gestureBindings)
+        return Button {
+            var shapes = viewModel.customGestureShapes
+            shapes.removeAll { $0.id == shape.id }
+            viewModel.setCustomGestureShapes(shapes)
+            gestureBindings.unbind(gesture: .custom(shape.id))
+            PlayerGestureSettings.save(gestureBindings)
+            gestureNote = "\(shape.name) deleted"
+            DispatchQueue.main.async { focus = .gestureNewCustom }
+        } label: {
+            HStack(spacing: 12) {
+                if let drawing = shape.drawings.first {
+                    RemotePadCanvas(frame: GestureAnimation.still(drawing))
+                        .frame(width: 40, height: 40 * RemotePadCanvas.aspect)
+                }
+                Text(shape.name)
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundColor(isFocused ? .black : .white)
+                    .lineLimit(1)
+                Text(meaning.title)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundColor(isFocused ? .black.opacity(0.6) : .white.opacity(0.5))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                Spacer(minLength: 8)
+                Image(systemName: "trash")
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundColor(isFocused ? .black : .white.opacity(0.6))
+            }
+            .padding(.horizontal, 22)
+            .frame(height: 64)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(isFocused ? Color.white : Color.white.opacity(0.07))
+            )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($focus, equals: key)
+        .focusEffectDisabledIfAvailable()
+    }
+
+    /// A press moves to the next step; it applies at once (and the recorder shows the zones).
+    private func gestureSensitivityRow(_ knob: PlayerGestureSensitivityKnob) -> some View {
+        let key = Focus.gestureSensitivity(knob.rawValue)
+        let isFocused = focus == key
+        return Button {
+            gestureSensitivity.cycle(knob)
+            viewModel.setGestureSensitivity(gestureSensitivity)
+        } label: {
+            HStack(spacing: 12) {
+                Text(knob.title)
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundColor(isFocused ? .black : .white)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                Spacer(minLength: 8)
+                Text(knob.steps[gestureSensitivity.step(knob)])
+                    .font(.system(size: 20, weight: .bold))
+                    .foregroundColor(isFocused ? .black.opacity(0.75) : .white.opacity(0.7))
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 22)
+            .frame(height: 58)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(isFocused ? Color.white : Color.white.opacity(0.07))
+            )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($focus, equals: key)
+        .focusEffectDisabledIfAvailable()
+    }
+
+    private func gestureActionRow(_ action: PlayerGestureAction) -> some View {
+        let isFocused = focus == .gestureAction(action.rawValue)
+        let gesture = gestureBindings.gesture(for: action)
+        let isClearFocused = focus == .gestureClear(action.rawValue)
+        return HStack(spacing: 12) {
+            Button {
+                gestureNote = nil
+                recordingGestureAction = action
+            } label: {
+                HStack(spacing: 14) {
+                    Text(action.title)
+                        .font(.system(size: 25, weight: .semibold))
+                        .foregroundColor(isFocused ? .black : .white)
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    Text(gesture?.title ?? "—")
+                        .font(.system(size: 21, weight: .bold))
+                        .foregroundColor(isFocused ? .black.opacity(0.8) : .white.opacity(gesture == nil ? 0.35 : 0.75))
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 26)
+                .frame(height: 62)
+                .background(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(isFocused ? Color.white : Color.white.opacity(0.07))
+                )
+            }
+            .buttonStyle(PosterCardButtonStyle())
+            .focused($focus, equals: .gestureAction(action.rawValue))
+            .focusEffectDisabledIfAvailable()
+
+            Button {
+                gestureBindings.unbind(action)
+                PlayerGestureSettings.save(gestureBindings)
+                gestureNote = "\(action.title): no gesture"
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 20, weight: .bold))
+                    .foregroundColor(isClearFocused ? .black : .white.opacity(gesture == nil ? 0.25 : 0.8))
+                    .frame(width: 62, height: 62)
+                    .background(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .fill(isClearFocused ? Color.white : Color.white.opacity(0.07))
+                    )
+            }
+            .buttonStyle(PosterCardButtonStyle())
+            .focused($focus, equals: .gestureClear(action.rawValue))
+            .focusEffectDisabledIfAvailable()
+            .disabled(gesture == nil)
+        }
+    }
+
+    private func finishRecording(_ gesture: RemoteGesture, for action: PlayerGestureAction) {
+        let builtIn = PlayerBuiltInGesture.action(for: gesture)
+        let previous = gestureBindings.bind(gesture, to: action)
+        PlayerGestureSettings.save(gestureBindings)
+        var parts = ["\(gesture.title) → \(action.title)"]
+        if let previous { parts.append("\(previous.title) no longer has a gesture") }
+        if let builtIn { parts.append("replaces: \(builtIn.title)") }
+        gestureNote = parts.joined(separator: " · ")
+        endRecording(action)
+    }
+
+    private func endRecording(_ action: PlayerGestureAction) {
+        recordingGestureAction = nil
+        DispatchQueue.main.async {
+            focus = .gestureAction(action.rawValue)
+        }
     }
 
     private var picturePage: some View {

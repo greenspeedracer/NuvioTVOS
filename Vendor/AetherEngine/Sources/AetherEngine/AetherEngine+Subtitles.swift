@@ -24,6 +24,11 @@ extension SubtitleForwardPrefetcher {
 }
 
 extension AetherEngine {
+    /// AE#937: the readers open a second demuxer with its own pump, which a one-request origin does
+    /// not allow. A custom source's clone reads through the host's reader, not the origin budget.
+    nonisolated static func nativeSubtitleReadersAllowed(isCustomSource: Bool, originSerial: Bool) -> Bool {
+        isCustomSource || !originSerial
+    }
 
     // MARK: - Channel routing
 
@@ -69,7 +74,14 @@ extension AetherEngine {
     func selectSubtitleTrack(index: Int, startAt: Double) {
         // Phase D: every selection change disarms the OCR worker first; the embedded bitmap
         // branch below re-arms it (cursors persist, so a reselect resumes coverage).
-        cancelSubtitleOCRWorker()
+        // AE#955: except a re-pick of the track the worker already serves. Cancelling it there
+        // threw away the batch in flight and its cursor, and a host that re-asserts its pick next to
+        // `setNativeSubtitleRendering(true)` restarted recognition on every call.
+        let keepsOCRWorker = Self.subtitleOCRWorkerSurvivesPick(
+            armedOrdinal: subtitleOCRArmedOrdinal,
+            pickedOrdinal: Self.nativeSubtitleOrdinal(forActiveTrack: index, in: nativeSubtitleTrackTable),
+            pickIsEmbedded: index < Self.externalSubtitleTrackIDBase)
+        if !keepsOCRWorker { cancelSubtitleOCRWorker() }
         // #316: an external track the remote-HLS proxy declared as a rendition is rendered by AVPlayer
         // itself, so it must NOT also start a sidecar decode; the overlay would draw the same cues a
         // second time, and only the rendition survives PiP / AirPlay / an external display.
@@ -129,7 +141,7 @@ extension AetherEngine {
         // only while the host is showing that rendition (PiP / AirPlay / external display). Armed
         // BEFORE the prefetcher start so the raised lead is picked up. Otherwise the native-selection
         // path arms it on demand (`syncSubtitleOCRWithNativeSelection`).
-        if nativeSubtitleRenderingRequested,
+        if nativeSubtitleRenderingRequested, !keepsOCRWorker,
            let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: index, in: nativeSubtitleTrackTable),
            nativeSubtitleTrackTable[ordinal].needsOCR {
             startSubtitleOCRWorker(ordinal: ordinal, streamIndex: Int32(index))
@@ -142,6 +154,15 @@ extension AetherEngine {
             + "(backfill requested)",
             category: .engine
         )
+    }
+
+    /// AE#955: whether a subtitle pick leaves the OCR worker running. Only a pick of the embedded
+    /// track it is already armed for; anything else disarms it and lets the pick re-arm.
+    nonisolated static func subtitleOCRWorkerSurvivesPick(
+        armedOrdinal: Int?, pickedOrdinal: Int?, pickIsEmbedded: Bool
+    ) -> Bool {
+        guard pickIsEmbedded, let armedOrdinal else { return false }
+        return armedOrdinal == pickedOrdinal
     }
 
     /// Apply `LoadOptions.initialSubtitleTrackID`, else `LoadOptions.preferredSubtitleLanguages`, at the end of a
@@ -189,16 +210,14 @@ extension AetherEngine {
     func selectSecondarySubtitleTrack(index: Int, startAt: Double) {
         hostExplicitSubtitleAction = true
         if let external = externalSubtitleRegistry[index] {
-            cancelSidecarTask(channel: .secondary)
-            clearSubtitleDrainTarget(channel: .secondary, reason: .secondarySidecarSelected)   // #112 rework
-            activeSecondaryEmbeddedSubtitleStreamIndex = -1
-            activeSecondaryExternalSubtitleTrackID = index
+            cancelSidecarTask(channel: .secondary, preservingActiveBitmap: true)
+            pendingSecondaryExternalSubtitleTrackID = index
             startSecondarySidecarDecode(url: external.url, httpHeaders: external.httpHeaders,
-                                        sourceStreamIndex: external.sourceStreamIndex)
+                                        sourceStreamIndex: external.sourceStreamIndex,
+                                        externalTrackID: index)
             return
         }
         guard index < Self.externalSubtitleTrackIDBase else { return }
-        activeSecondaryExternalSubtitleTrackID = nil
         guard loadedURL != nil else { return }
         cancelSidecarTask(channel: .secondary)
         loadedSecondarySidecarURL = nil
@@ -209,13 +228,13 @@ extension AetherEngine {
         secondarySubtitleCues = []
         secondarySidecarASSHeader = nil
         pgsStaleArrivalGates[.secondary]?.reset()   // #100
-        activeSecondaryEmbeddedSubtitleStreamIndex = Int32(index)
         subtitleDrainTargets[.secondary] = Int32(index)
         subtitleDrainDecoders[.secondary] = nil
         subtitleDrainCursors[.secondary] = nil
         startSubtitleDrainer()
         startSubtitleForwardPrefetcher(startAt: startAt)   // #151
         isLoadingSecondarySubtitles = false
+        setSecondarySubtitleIdentity(embedded: Int32(index))
     }
 
 
@@ -263,10 +282,11 @@ extension AetherEngine {
 
     /// #921: drain a bitmap sidecar's packets on `channel`, the way a selected embedded track is
     /// drained. A nil cursor makes the first tick a `.resetAndDecode` around the playhead.
-    func installSidecarBitmapSource(_ source: SidecarBitmapSource, channel: SubtitleChannel) {
+    func installSidecarBitmapSource(_ source: SidecarBitmapSource, channel: SubtitleChannel,
+                                    preparedDecoder: EmbeddedSubtitleDecoder? = nil) {
         sidecarBitmapSources[channel] = source
         subtitleDrainTargets[channel] = SidecarBitmapSource.streamKey
-        subtitleDrainDecoders[channel] = nil
+        subtitleDrainDecoders[channel] = preparedDecoder
         subtitleDrainCursors[channel] = nil
         subtitleResolutionLastFrontier[channel] = nil
         subtitleResolutionCoverageStated.remove(channel)
@@ -400,7 +420,10 @@ extension AetherEngine {
         // loop, and it is exactly the stretch a landing claim rests on: the ground between a set
         // decoded behind the playhead and the playhead itself. Its lookahead beyond the playhead
         // comes from the packets it harvests, which the store notes as it takes them.
-        sessionStore?.noteHarvestReach(.pump, through: playhead)
+        // #941: not while a seek is in flight. `sourceTime` still reports the frame the seek is
+        // leaving, while the producer may already be re-anchored behind it, so the claim would
+        // stretch the fresh run across the very ground its restart skipped and blind the hole hold.
+        if !isSeeking { sessionStore?.noteHarvestReach(.pump, through: playhead) }
         // #271: wall time since the previous tick, so a tick that itself ran long cannot be read as
         // a seek by the next one. See SubtitleOverlayDrainer.drainPlan.
         let tickUptime = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
@@ -506,14 +529,20 @@ extension AetherEngine {
             var gapHoldSequence: UInt64 = 0
             var gapHoldTicksLeft = 0
             let held = subtitleDrainCursors[channel]
-            // The playhead catching up to the hold ends it whatever the budget says: from there on
-            // the island is what the viewer is about to need, and waiting would dark the overlay
-            // for content that IS stored. That, not the tick budget, is the real bound.
-            if let heldAt = held?.harvestGapAt, heldAt >= playhead,
+            // #941: the ledger sees the holes order cannot, a forward re-anchor's above all.
+            let isRead = store.harvestReadCheck()
+            // The playhead closing on the island ends the hold whatever the budget says: from there
+            // on the island is what the viewer is about to need, and waiting would dark the overlay
+            // for content that IS stored. That, not the tick budget, is the real bound. #941: the
+            // island, not the hold position, which a refill at about 1x passes while the hole is
+            // still ahead of the playhead.
+            let releaseAt = playhead + Self.subtitleDrainHarvestGapReleaseLeadSeconds
+            if let heldAt = held?.harvestGapAt, let farSide = entries.first?.ptsSeconds, farSide > releaseAt,
                (held?.harvestGapTicksLeft ?? 0) > 0, !isReset,
                !SubtitleOverlayDrainer.harvestGapHoldResumes(
                 firstSequence: entries.first?.sequence,
-                heldSequence: held?.harvestGapSequence ?? 0) {
+                heldSequence: held?.harvestGapSequence ?? 0,
+                firstPts: farSide, heldAt: heldAt, isRead: isRead) {
                 // Still waiting: the window past the hold begins with the same island as before.
                 decodeEnd = 0
                 gapHoldAt = heldAt
@@ -524,7 +553,7 @@ extension AetherEngine {
                 ptsAt: { entries[$0].ptsSeconds },
                 sequenceAt: { entries[$0].sequence },
                 resumeFrom: isReset ? nil : held.map { ($0.lastDecodedPts, $0.lastDecodedSequence) },
-                notBefore: playhead), held?.harvestGapAt != cut.at || (held?.harvestGapTicksLeft ?? 0) > 0 {
+                notBefore: releaseAt, isRead: isRead), held?.harvestGapAt != cut.at || (held?.harvestGapTicksLeft ?? 0) > 0 {
                 decodeEnd = cut.index
                 gapHoldAt = cut.at
                 gapHoldSequence = cut.sequence
@@ -1045,7 +1074,7 @@ extension AetherEngine {
         // claim. Stated even when the positioning fell back or failed: what the loop then reads is
         // still forwards from wherever it sits, and the anchor is the earliest it can be.
         store.noteHarvestAnchor(.prefetch, at: startAt)
-        if landed != .seek {
+        if landed != .seek, !Task.isCancelled {  // AE#944: a cancelled session's positioning is noise
             EngineLog.emit(
                 "[AetherEngine] #151 forward prefetch seek to \(String(format: "%.2f", startAt))s timed out "
                 + "or failed; byte-estimate fallback \(landed == .byteEstimate ? "applied" : "unavailable")",
@@ -1665,6 +1694,10 @@ extension AetherEngine {
         subtitleTracks.removeAll { $0.id == id }
         if activeSubtitleTrackIndex == id { clearSubtitle() }
         if activeSecondaryExternalSubtitleTrackID == id { clearSecondarySubtitle() }
+        if pendingSecondaryExternalSubtitleTrackID == id {
+            cancelSidecarTask(channel: .secondary, preservingActiveBitmap: true)
+            isLoadingSecondarySubtitles = false
+        }
     }
 
     /// Fetch and decode a sidecar subtitle file (.srt / .ass / .vtt / .ssa) via `SubtitleDecoder.decodeFile`, replacing `subtitleCues` atomically. `httpHeaders` nil inherits `LoadOptions.httpHeaders` only for the same HTTP scheme, host and effective port as the media; cross-origin sidecars need explicit headers. Prefer registering via `addExternalSubtitleTrack` + `selectSubtitleTrack` (#88), which keeps the track listed and `activeSubtitleTrackIndex` populated; this API stays for compatibility and one-shot use.
@@ -1769,9 +1802,18 @@ extension AetherEngine {
         hostExplicitSubtitleAction = true
         cancelSidecarTask(channel: .secondary)
         clearSubtitleDrainTarget(channel: .secondary, reason: .secondarySidecarSelected)   // #112 rework
-        activeSecondaryEmbeddedSubtitleStreamIndex = -1
-        activeSecondaryExternalSubtitleTrackID = nil
         startSecondarySidecarDecode(url: url, httpHeaders: httpHeaders)
+        setSecondarySubtitleIdentity()
+    }
+
+    /// Both reload paths snapshot selection intent, including a candidate not yet published.
+    /// This also survives a second rebuild before the first restore has finished decoding.
+    var secondarySelectionForRebuild: (externalID: Int?, sidecarURL: URL?, embeddedIndex: Int32) {
+        let external = pendingSecondaryExternalSubtitleTrackID ?? activeSecondaryExternalSubtitleTrackID
+        let embedded: Int32 = external == nil ? activeSecondaryEmbeddedSubtitleStreamIndex : -1
+        let url = external.flatMap { externalSubtitleRegistry[$0]?.url }
+            ?? (isSecondarySubtitleActive && embedded < 0 ? loadedSecondarySidecarURL : nil)
+        return (external, url, embedded)
     }
 
     /// Audio rebuilds keep the registry. Restore through its id so headers and a container's
@@ -1790,21 +1832,35 @@ extension AetherEngine {
     }
 
     /// Shared secondary sidecar-decode start (#88): the pre-#88 selectSecondarySidecarSubtitle body.
-    func startSecondarySidecarDecode(url: URL, httpHeaders: [String: String]?,
-                                     sourceStreamIndex: Int32? = nil) {
-        loadedSecondarySidecarURL = url
-        isSecondarySubtitleActive = true
-        secondarySubtitleCues = []
-        secondarySidecarASSHeader = nil
-        pgsStaleArrivalGates[.secondary]?.reset()   // #100
+    func startSecondarySidecarDecode(
+        url: URL, httpHeaders: [String: String]?,
+        sourceStreamIndex: Int32? = nil, externalTrackID: Int? = nil
+    ) {
+        // A registered external is decoded as a candidate while the previous secondary remains
+        // published. This lets a container whose extension/format hint hides a bitmap stream fail
+        // closed without destroying the user's active text selection. The compatibility one-shot
+        // API has no identity to validate and keeps its historical replace-on-start behavior.
+        if externalTrackID == nil {
+            loadedSecondarySidecarURL = url
+            isSecondarySubtitleActive = true
+            secondarySubtitleCues = []
+            pgsStaleArrivalGates[.secondary]?.reset()   // #100
+            secondarySidecarASSHeader = nil
+        }
         isLoadingSecondarySubtitles = true
+        // A synchronous loading observer may have cleared or replaced this selection.
+        if let externalTrackID, pendingSecondaryExternalSubtitleTrackID != externalTrackID { return }
 
         let effectiveHeaders = Self.resolvedSubtitleHeaders(
             for: url, explicit: httpHeaders, mediaURL: loadedURL,
             mediaHeaders: loadedOptions.httpHeaders)
+        let selectedExternal = externalTrackID.flatMap { externalSubtitleRegistry[$0] }
+        let preparationPolicy = selectedExternal?.preparationPolicy
         let preserveASS = loadedOptions.preserveASSMarkup
         let sessionGeneration = loadGeneration
-        let preparationPolicy = activeSecondaryExternalSubtitleTrackID.flatMap { externalSubtitleRegistry[$0] }?.preparationPolicy
+        #if DEBUG
+        let decoderFactory = secondarySidecarDecoderFactoryForTesting
+        #endif
         secondarySidecarTask = Task { [weak self] in
             let result: SidecarDecodeResult
             do {
@@ -1815,23 +1871,61 @@ extension AetherEngine {
             } catch {
                 EngineLog.emit("[AetherEngine] secondary sidecar decode failed: \(error)", category: .engine)
                 await MainActor.run {
-                    guard !Task.isCancelled, let self = self,
-                          self.loadGeneration == sessionGeneration else { return }
-                    if self.isSecondarySubtitleActive { self.isLoadingSecondarySubtitles = false }
+                    guard !Task.isCancelled, let self = self else { return }
+                    guard self.loadGeneration == sessionGeneration else { return }
+                    self.pendingSecondaryExternalSubtitleTrackID = nil
+                    self.isLoadingSecondarySubtitles = false
                 }
                 return
             }
+            let bitmapDecoder: EmbeddedSubtitleDecoder?
+            if let source = result.bitmapSource {
+                let prepared = await BlockingWork.detached(priority: .userInitiated) {
+                    #if DEBUG
+                    if let decoderFactory { return PreparedSidecarDecoder(decoder: decoderFactory(source)) }
+                    #endif
+                    return PreparedSidecarDecoder(decoder: source.makeDecoder())
+                }.value
+                bitmapDecoder = prepared.decoder
+            } else {
+                bitmapDecoder = nil
+            }
             await MainActor.run {
-                guard !Task.isCancelled, let self = self,
-                          self.loadGeneration == sessionGeneration else { return }
-                guard self.isSecondarySubtitleActive else { return }
-                if let source = result.bitmapSource {
+                guard !Task.isCancelled, let self = self else { return }
+                guard self.loadGeneration == sessionGeneration else { return }
+                guard result.bitmapSource == nil || bitmapDecoder != nil else {
+                    self.pendingSecondaryExternalSubtitleTrackID = nil
                     self.isLoadingSecondarySubtitles = false
-                    self.installSidecarBitmapSource(source, channel: .secondary)
                     return
                 }
-                self.secondarySidecarASSHeader = result.assHeader
+                guard externalTrackID != nil || self.isSecondarySubtitleActive else { return }
+                if let externalTrackID,
+                   self.externalSubtitleRegistry[externalTrackID] != selectedExternal {
+                    self.pendingSecondaryExternalSubtitleTrackID = nil
+                    self.isLoadingSecondarySubtitles = false
+                    return
+                }
+                self.pendingSecondaryExternalSubtitleTrackID = nil
+                if let externalTrackID {
+                    self.clearSubtitleDrainTarget(channel: .secondary, reason: .secondarySidecarSelected)
+                    self.loadedSecondarySidecarURL = url
+                    self.isSecondarySubtitleActive = true
+                    self.pgsStaleArrivalGates[.secondary]?.reset()
+                    self.setSecondarySubtitleIdentity(external: externalTrackID)
+                    // A synchronous identity subscriber may have cleared or replaced this commit.
+                    guard !Task.isCancelled,
+                          self.activeSecondaryExternalSubtitleTrackID == externalTrackID else { return }
+                }
+                if let source = result.bitmapSource {
+                    self.secondarySubtitleCues = []
+                    self.secondarySidecarASSHeader = nil
+                    self.installSidecarBitmapSource(
+                        source, channel: .secondary, preparedDecoder: bitmapDecoder)
+                    self.isLoadingSecondarySubtitles = false
+                    return
+                }
                 self.secondarySubtitleCues = result.cues
+                self.secondarySidecarASSHeader = result.assHeader
                 self.isLoadingSecondarySubtitles = false
             }
         }
@@ -1894,8 +1988,9 @@ extension AetherEngine {
         }
     }
 
-    func cancelSidecarTask(channel: SubtitleChannel = .primary) {
-        releaseSidecarBitmapSource(channel: channel)   // #921
+    func cancelSidecarTask(channel: SubtitleChannel = .primary, preservingActiveBitmap: Bool = false) {
+        // A candidate is not yet the active source. Failure must leave its predecessor drainable.
+        if !preservingActiveBitmap { releaseSidecarBitmapSource(channel: channel) }
         switch channel {
         case .primary:
             sidecarTask?.cancel()
@@ -1903,6 +1998,7 @@ extension AetherEngine {
         case .secondary:
             secondarySidecarTask?.cancel()
             secondarySidecarTask = nil
+            pendingSecondaryExternalSubtitleTrackID = nil
         }
     }
 
@@ -1911,10 +2007,14 @@ extension AetherEngine {
     public func clearSecondarySubtitle() {
         externalSubtitleIntentGeneration &+= 1
         hostExplicitSubtitleAction = true
+        clearSecondarySubtitleContent()
+        setSecondarySubtitleIdentity()
+    }
+
+    /// Tear down content without publishing an intermediate off selection during a replacement.
+    func clearSecondarySubtitleContent() {
         cancelSidecarTask(channel: .secondary)
         clearSubtitleDrainTarget(channel: .secondary, reason: .subtitlesCleared)   // #112 rework
-        activeSecondaryEmbeddedSubtitleStreamIndex = -1
-        activeSecondaryExternalSubtitleTrackID = nil
         loadedSecondarySidecarURL = nil
         isSecondarySubtitleActive = false
         secondarySubtitleCues = []
@@ -1934,6 +2034,13 @@ extension AetherEngine {
     func startNativeSubtitleReaders(url: URL, stores: [NativeSubtitleCueStore],
                                     readToEOF: Bool = false, startAtSeconds: Double? = nil) {
         cancelNativeSubtitleReaders()
+        guard Self.nativeSubtitleReadersAllowed(
+            isCustomSource: isCustomSource,
+            originSerial: OriginRequestBudget.shared.requiresSerialRequests(url)) else {
+            EngineLog.emit("[AetherEngine] AE#937 native subtitle readers skipped: one-request origin, "
+                           + "the pump tap covers the produced region", category: .engine)
+            return
+        }
         nativeSubtitleReadersRunToEOF = readToEOF
         var pairs: [(streamIndex: Int32, store: NativeSubtitleCueStore)] = []
         for (ordinal, entry) in nativeSubtitleTrackTable.enumerated() {
@@ -2561,13 +2668,15 @@ extension AetherEngine {
     /// wired external display), where the host's on-frame overlay cannot draw; `active == false` deselects when
     /// the video returns to fullscreen inside the app. Maps the active subtitle's source stream (embedded) or
     /// synthetic id (load-declared external, #88) to the native ordinal. No-op (no native subtitle) when the
-    /// active subtitle has no native text equivalent: a bitmap (PGS/DVB), CEA-708 (608 now rides a native
-    /// rendition, #98), or a track added after load (dynamic external / one-shot sidecar).
+    /// active subtitle has no native equivalent: CEA-708 (608 now rides a native rendition, #98), or a track
+    /// added after load (dynamic external / one-shot sidecar). A bitmap track rides its OCR-fed rendition.
+    /// On a wireless AirPlay receiver the engine raises this request itself when the host has not (AE#955).
     public func setNativeSubtitleRendering(_ active: Bool) {
         // Sodalite#156: the host's request is a STANDING one, not a one-shot. It says where the
         // picture is, and it holds until the picture comes back or the session ends, which is what
         // lets a later track pick or a subtitles-off know that the rendition is the display.
         nativeSubtitleRenderingRequested = active
+        nativeRenderingImpliedByAirPlay = false
         // #170: the AirPlay flip triggers both the engine's LAN-swap reload and the host's
         // documented rendering call; landing mid-reload the active track is transiently nil and
         // this call would be misread as a deselect. Latch the newest request instead;
@@ -2609,11 +2718,10 @@ extension AetherEngine {
         carryover.activeSubtitleTrackIndex = activeSubtitleTrackIndex
         carryover.primarySidecarURL = (isSubtitleActive && activeSubtitleTrackIndex == nil
             && activeEmbeddedSubtitleStreamIndex < 0) ? loadedSidecarURL : nil
-        carryover.secondaryTrackIndex = activeSecondaryExternalSubtitleTrackID
-            ?? (activeSecondaryEmbeddedSubtitleStreamIndex >= 0
-                ? Int(activeSecondaryEmbeddedSubtitleStreamIndex) : nil)
-        carryover.secondarySidecarURL = (isSecondarySubtitleActive && carryover.secondaryTrackIndex == nil)
-            ? loadedSecondarySidecarURL : nil
+        let secondary = secondarySelectionForRebuild
+        carryover.secondaryTrackIndex = secondary.externalID
+            ?? (secondary.embeddedIndex >= 0 ? Int(secondary.embeddedIndex) : nil)
+        carryover.secondarySidecarURL = carryover.secondaryTrackIndex == nil ? secondary.sidecarURL : nil
         carryover.nativeReapplyOrdinal = nativeSubtitleReapplyOrdinal
         carryover.reapplyOrdinalMatchesActiveTrack = currentReapplyOrdinalMatchesActiveTrack()
         return carryover
@@ -2976,4 +3084,10 @@ struct SubtitleDrainDecodeHandoff: @unchecked Sendable {
             job.packets.map { AetherEngine.decodeStoredSubtitlePacket($0, with: job.decoder) }
         }
     }
+}
+
+/// Transfers a newly created, unused decoder from the worker to the MainActor. Subsequent
+/// access uses the existing single-in-flight SubtitleDrainDecodeHandoff discipline.
+private struct PreparedSidecarDecoder: @unchecked Sendable {
+    let decoder: EmbeddedSubtitleDecoder?
 }

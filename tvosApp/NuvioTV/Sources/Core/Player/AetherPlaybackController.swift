@@ -2670,6 +2670,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     private var coarseThumbnailComplete = false
     private var isRemoteStream = false
     private var isLocalPlaybackCache = false
+    private var activePlaybackRequest: PlaybackLoadRequest?
+    private var didRecoverWithSequentialOrigin = false
 
     // MARK: PlaybackEngineControlling surface
 
@@ -3802,7 +3804,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         let fpsStr = fpsVal.map { String(format: "%.3f fps", $0) } ?? ""
         let sourceRange = Self.dynamicRangeLabel(
             engine.sourceVideoFormat,
-            dolbyVisionProfile: engine.sourceDVProfile ?? sourceProbe?.dvProfile
+            dolbyVisionProfile: engine.sourceDVProfile ?? sourceProbe?.dvProfile,
+            compatID: engine.sourceDVBLCompatID
         )
         let outputRange = Self.dynamicRangeLabel(engine.videoFormat, dolbyVisionProfile: nil)
         let range = engine.sourceVideoFormat == engine.videoFormat
@@ -3822,9 +3825,26 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
 
         let codecName = (sourceProbe?.videoCodecName ?? "hevc").lowercased()
         let isDV = engine.sourceDVProfile != nil || (sourceProbe?.dvProfile ?? 0) > 0 || engine.sourceVideoFormat == .dolbyVision
+        let scanTag: String = {
+            switch engine.sourceVideoScan {
+            case .interlaced(let order):
+                let orderStr = order == .bottomFieldFirst ? "bff" : "tff"
+                return " · \(height)i (\(orderStr))"
+            case .progressive:
+                return height > 0 ? " · \(height)p" : ""
+            case .unknown:
+                return ""
+            }
+        }()
+        let deinterlaceTag: String = {
+            guard let deint = engine.decodedVideoFormat?.deinterlace else { return "" }
+            let filterName = deint.filter
+            let rateStr = deint.fieldRate == .field ? "double-rate" : "single-rate"
+            return " · deint(\(filterName), \(rateStr))"
+        }()
         let videoStr = width > 0 && height > 0
-            ? "\(width)×\(height) · \(fpsStr) · \(isDV ? "dolby-vision" : codecName)"
-            : "\(fpsStr) · \(isDV ? "dolby-vision" : codecName)"
+            ? "\(width)×\(height)\(scanTag)\(deinterlaceTag) · \(fpsStr) · \(isDV ? "dolby-vision" : codecName)"
+            : "\(fpsStr)\(scanTag)\(deinterlaceTag) · \(isDV ? "dolby-vision" : codecName)"
 
         // Video Bitrate
         let telemetry = engine.liveTelemetry
@@ -3844,20 +3864,48 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
 
         // Dolby Vision line
         let dvProfile = engine.sourceDVProfile ?? sourceProbe?.dvProfile
+        let dvCompatID = engine.sourceDVBLCompatID
         let dvStr = Self.dolbyVisionRouteDescription(
             sourceProfile: dvProfile,
+            compatID: dvCompatID,
             conversion: engine.dolbyVisionConversion,
-            felComposedFrameCount: engine.dolbyVisionFELComposedFrameCount
+            felComposedFrameCount: engine.dolbyVisionFELComposedFrameCount,
+            elType: engine.sourceElType
         ) ?? (isDV ? "Dolby Vision" : "None")
 
         // DV HDR Metadata line
-        let dvHdrStr = isDV
-            ? "Dolby Vision (Metadata unavailable)"
-            : (sourceRange.contains("HDR") ? "BT.2020 · PQ Transfer" : "BT.709 · Standard Dynamic Range")
+        let dvHdrStr: String
+        if isDV {
+            var parts = [String]()
+            if let profile = dvProfile {
+                let elStr = (profile == 7 && engine.sourceElType != nil) ? " \(engine.sourceElType!)" : ""
+                let compatStr: String = {
+                    guard let c = dvCompatID else { return "" }
+                    switch c {
+                    case 1: return " · HDR10 base"
+                    case 2: return " · SDR base"
+                    case 4: return " · HLG base"
+                    case 6: return " · Blu-ray base"
+                    default: return " · Base compat \(c)"
+                    }
+                }()
+                parts.append("Profile \(profile)\(elStr)\(compatStr)")
+            } else {
+                parts.append("Dolby Vision")
+            }
+            if engine.sourceDolbyVisionBaseLayerPresentable {
+                parts.append("BL presentable")
+            }
+            dvHdrStr = parts.joined(separator: " · ")
+        } else {
+            dvHdrStr = sourceRange.contains("HDR") ? "BT.2020 · PQ Transfer" : "BT.709 · Standard Dynamic Range"
+        }
 
         // Decoder
         let decoderStr: String
-        if let active = engine.activeVideoDecoder, !active.isEmpty {
+        if engine.isDualLayerOutputRouteActive {
+            decoderStr = "AVPlayer VideoOutput · DualLayer (Metal)"
+        } else if let active = engine.activeVideoDecoder, !active.isEmpty {
             decoderStr = active
         } else if engine.playbackBackend == .native {
             decoderStr = isDV ? "c2.apple.dolby-vision.dvhe.decoder" : "com.apple.videotoolbox (Hardware)"
@@ -3966,12 +4014,16 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         let socTempStr = thermal.tempString
         let cpuClockStr = PlaybackSystemMonitor.cpuInfo()
 
+        let resolutionStr = width > 0 && height > 0
+            ? (engine.sourceVideoScan.isInterlaced ? "\(width)×\(height) (\(height)i)" : "\(width)×\(height)")
+            : "Unknown"
+
         return PlaybackDebugInfo(
             player: "AetherEngine",
             pipeline: engine.playbackBackend.rawValue.capitalized,
             videoCodec: Self.codecLabel(sourceProbe?.videoCodecName),
             dynamicRange: range,
-            resolution: width > 0 && height > 0 ? "\(width)×\(height)" : "Unknown",
+            resolution: resolutionStr,
             frameRate: fpsStr,
             audio: audioFormatted,
             audioSourceCodec: audioSource.codec,
@@ -4527,6 +4579,19 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             isPlayerEnded = true
             isAtEndOfFile = true
         case .error(let message):
+            if engine.errorInfo?.kind == .sourceFabricatesRanges,
+               !didRecoverWithSequentialOrigin,
+               let activeRequest = activePlaybackRequest {
+                didRecoverWithSequentialOrigin = true
+                screensaverDebugLog("[ScreensaverDebug][AetherController] Origin answers byte ranges with fabricated data; recovering with sequentialOrigin: true")
+                let resumePos = (lastKnownPositionMs > 0 ? Double(lastKnownPositionMs) / 1000.0 : nil) ?? activeRequest.resumePositionSeconds
+                var recoveryRequest = activeRequest
+                recoveryRequest.resumePositionSeconds = resumePos
+                recoveryRequest.forceSequentialOrigin = true
+                load(recoveryRequest, generation: loadGeneration, forceSequentialOrigin: true)
+                break
+            }
+
             if needsForegroundReload || foregroundReloadTask != nil {
                 // Aether may briefly report an error while its lifecycle
                 // reload is being canceled or reopened. The reload task owns
@@ -4778,22 +4843,43 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
 
     static func dolbyVisionRouteDescription(
         sourceProfile: Int?,
+        compatID: Int? = nil,
         conversion: DolbyVisionConversion?,
-        felComposedFrameCount: Int?
+        felComposedFrameCount: Int?,
+        elType: String? = nil
     ) -> String? {
         if let felComposedFrameCount {
+            let el = elType ?? "FEL"
             return felComposedFrameCount > 0
-                ? "P7 FEL · \(felComposedFrameCount) frames composed"
-                : "P7 FEL route · awaiting composition"
+                ? "P7 \(el) · \(felComposedFrameCount) frames composed"
+                : "P7 \(el) route · awaiting composition"
         }
         if conversion == .profile7ToProfile81 {
+            if let elType {
+                return "P7→8.1 libdovi (\(elType))"
+            }
             return "P7→8.1 libdovi"
         }
         guard let sourceProfile, sourceProfile > 0 else { return nil }
         switch sourceProfile {
-        case 7: return "P7"
-        case 8: return "P8"
-        default: return "P\(sourceProfile) (Single Track)"
+        case 7:
+            let elPart = elType.map { " \($0)" } ?? ""
+            if let compatID, compatID == 6 {
+                return "P7\(elPart) (Blu-ray)"
+            }
+            return "P7\(elPart)"
+        case 8:
+            if let compatID {
+                switch compatID {
+                case 1: return "P8.1 (HDR10)"
+                case 2: return "P8.2 (SDR)"
+                case 4: return "P8.4 (HLG)"
+                default: return "P8.\(compatID)"
+                }
+            }
+            return "P8"
+        default:
+            return "P\(sourceProfile) (Single Track)"
         }
     }
 
@@ -4865,7 +4951,11 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
 
     // MARK: Load
 
-    func load(_ request: PlaybackLoadRequest, generation: UInt64) {
+    func load(_ request: PlaybackLoadRequest, generation: UInt64, forceSequentialOrigin: Bool = false) {
+        activePlaybackRequest = request
+        if !forceSequentialOrigin {
+            didRecoverWithSequentialOrigin = false
+        }
         cancelScrubThumbnailWork()
         thumbnailSourceContext = nil
         seekPreviewLaneHost.reset()
@@ -5023,6 +5113,17 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
 
         let isLive = request.isLiveStream || request.isSports
         let preferDualLayerDolbyVision = ProfileSettings.current.bool(forKey: SettingsKey.preferDualLayerDolbyVision)
+        if preferDualLayerDolbyVision {
+            Task(priority: .utility) {
+                await AetherEngine.prewarmDualLayerDolbyVision()
+            }
+        }
+        let dualLayerRouteRaw = ProfileSettings.current.string(forKey: SettingsKey.dualLayerRoute) ?? "softwareHost"
+        let dualLayerRoute: DualLayerRoute = dualLayerRouteRaw == "avPlayerOutput" ? .avPlayerOutput : .softwareHost
+        let sourceSupportsHDR10PlusPreflight = ["file", "http", "https"].contains(
+            request.videoURL.scheme?.lowercased() ?? "")
+        let prefersHDR10PlusForThisLoad = !panelPresentsDV
+            && !isLive && !isRemoteHLS && sourceSupportsHDR10PlusPreflight
         let upscalesLowResolutionVideo = ProfileSettings.current.object(forKey: SettingsKey.lowResUpscaling) as? Bool ?? true
         let losslessAudioBridge = ProfileSettings.current.bool(forKey: SettingsKey.losslessAudioBridge)
         // Bound find_stream_info probe budget for remote VOD streams (#68).
@@ -5032,12 +5133,19 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         let isRemoteVOD = (isRemote || isLocalPlaybackCache || isUsenetStream) && !isLive
         let probeBudgetBytes: Int64? = isRemoteVOD ? 15 * 1024 * 1024 : nil
         let maxAnalyzeDurationMicroseconds: Int64? = isRemoteVOD ? 10 * 1_000_000 : nil
+        // Skip embedded container font attachments on non-anime streams (and on anime when ASS styling is stripped),
+        // preventing multi-megabyte font downloads during container open over remote connections.
+        let skipsContainerAttachments = !request.isAnime || request.assMode == .strip
+        let seekPreviewEnabled = ProfileSettings.current.object(forKey: SettingsKey.seekPreviewEnabled) as? Bool ?? true
+        let generatesBackgroundScrubPreviews = seekPreviewEnabled && request.trickplayURL == nil
 
         let options = LoadOptions(
             httpHeaders: request.httpHeaders,
             discImageHint: PlaybackBackendPolicy.isDiscImage(
                 request.videoURL.absoluteString, filename: request.filename),
+            dolbyVisionHandling: prefersHDR10PlusForThisLoad ? .hdr10BaseLayerOnly : .automatic,
             preferDualLayerDolbyVision: preferDualLayerDolbyVision,
+            dualLayerRoute: dualLayerRoute,
             upscalesLowResolutionVideo: upscalesLowResolutionVideo,
             matchContentEnabled: matchContent,
             panelIsInHDRMode: panelInHDR,
@@ -5056,10 +5164,16 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             // subtitle decoders keep their normal styled/plain cue path.
             preserveASSMarkup: true,
             prepareNativeSubtitles: false,
+            generatesBackgroundScrubPreviews: generatesBackgroundScrubPreviews,
+            sequentialOrigin: forceSequentialOrigin || request.forceSequentialOrigin,
             maxConcurrentSourceRequests: isRemote || isUsenetStream ? 1 : nil,
             heldSourceConnection: isLocalPlaybackCache || isRemote || isUsenetStream,
+            declaredDurationSeconds: (forceSequentialOrigin || request.forceSequentialOrigin)
+                ? (durationMs > 0 ? Double(durationMs) / 1000.0 : (lastKnownDurationMs > 0 ? Double(lastKnownDurationMs) / 1000.0 : nil))
+                : nil,
             probesize: probeBudgetBytes,
             maxAnalyzeDuration: maxAnalyzeDurationMicroseconds,
+            skipsContainerAttachments: skipsContainerAttachments,
             preferredAudioLanguages: request.preferredAudioLanguages,
             preferredSubtitleLanguages: request.preferredSubtitleLanguages,
             externalSubtitles: externalRegistration.tracks,
@@ -5178,10 +5292,14 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
 
     func seekToMs(_ ms: Int64) {
-        screensaverDebugLog("[ScreensaverDebug][AetherController] seekToMs(\(ms)) called: lastKnownPos=\(lastKnownPositionMs)ms, clock=\(engine.clock.currentTime)")
+        seekToMs(ms, exact: false)
+    }
+
+    func seekToMs(_ ms: Int64, exact: Bool) {
+        screensaverDebugLog("[ScreensaverDebug][AetherController] seekToMs(\(ms), exact=\(exact)) called: lastKnownPos=\(lastKnownPositionMs)ms, clock=\(engine.clock.currentTime)")
         lastKnownPositionMs = max(0, ms)
         Task { @MainActor in
-            await engine.seek(to: Double(ms) / 1000.0)
+            await engine.seek(to: Double(ms) / 1000.0, exact: exact)
         }
     }
 
@@ -5354,14 +5472,20 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         sourceProbe = nil
     }
 
-    private static func dynamicRangeLabel(_ format: VideoFormat, dolbyVisionProfile: Int?) -> String {
+    private static func dynamicRangeLabel(_ format: VideoFormat, dolbyVisionProfile: Int?, compatID: Int? = nil) -> String {
         switch format {
         case .sdr: return "SDR"
         case .hdr10: return "HDR10/PQ"
         case .hdr10Plus: return "HDR10+"
         case .hlg: return "HLG"
         case .dolbyVision:
-            return dolbyVisionProfile.map { "Dolby Vision P\($0)" } ?? "Dolby Vision"
+            if let p = dolbyVisionProfile {
+                if p == 8, let c = compatID {
+                    return "Dolby Vision P8.\(c)"
+                }
+                return "Dolby Vision P\(p)"
+            }
+            return "Dolby Vision"
         }
     }
 

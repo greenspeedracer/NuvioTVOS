@@ -41,6 +41,11 @@ struct NuvioTVApp: App {
         Task(priority: .utility) { @MainActor in
             _ = try? AetherEngine()
         }
+        if ProfileSettings.current.bool(forKey: SettingsKey.preferDualLayerDolbyVision) {
+            Task(priority: .utility) {
+                await AetherEngine.prewarmDualLayerDolbyVision()
+            }
+        }
         #endif
     }
 
@@ -286,7 +291,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
 
     static var allCases: [Self] {
         var tabs: [Self] = [.profile, .home]
-        if WatchPartyConfiguration.isEnabled { tabs.append(.party) }
+        if isWatchPartyEnabled { tabs.append(.party) }
         tabs += [.search, .library]
         if isCalendarEnabled { tabs.append(.calendar) }
         tabs.append(.settings)
@@ -296,6 +301,12 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
     /// Settings → Appearance → Sidebar → Calendar (on unless turned off).
     static var isCalendarEnabled: Bool {
         ProfileSettings.current.object(forKey: SettingsKey.showCalendarTab) as? Bool ?? true
+    }
+
+    /// Settings → Appearance → Sidebar → Watch Party (on unless turned off).
+    static var isWatchPartyEnabled: Bool {
+        WatchPartyConfiguration.isEnabled
+            && (ProfileSettings.current.object(forKey: SettingsKey.showWatchPartyTab) as? Bool ?? true)
     }
     var id: String { rawValue }
     var rawValue: String {
@@ -849,8 +860,10 @@ struct ContentView: View {
                 watchPartyOwner.suspendForInactivity()
                 backgroundedAt = Date()
                 syncManager.flushPendingPushes()
+                TopShelfLibraryFeed.write()
                 TopShelfBackgroundRefresh.schedule()
             case .active:
+                TopShelfLibraryFeed.prefetchRemoteLibraryIfNeeded()
                 if backgroundedAt != nil {
                     releaseUpdateService.beginForegroundSession()
                     announcementService.beginForegroundSession()
@@ -1030,6 +1043,13 @@ struct ContentView: View {
         if isResolvingContinueWatchingStream { return true }
         switch activeScreen {
         case .details, .player, .cloudLibrary, .collectionFolder, .productionBrowse, .personBrowse: return true
+        default: return false
+        }
+    }
+
+    private var isDetailsOrPlayerOverlayPresented: Bool {
+        switch activeScreen {
+        case .details, .player: return true
         default: return false
         }
     }
@@ -1269,12 +1289,26 @@ struct ContentView: View {
         // session still makes retries/idempotent duplicate callbacks harmless.
         guard !callback.isError else { return }
 
-        let duration = session.duration.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+        let callbackDuration = callback.duration.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+        let duration = callbackDuration
+            ?? session.duration.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
         let progress = callback.progress ?? callback.position.flatMap { position in
             guard let duration, position.isFinite, position >= 0 else { return nil }
-            return position / duration
+            let normalizedProgress = position / duration
+            guard callbackDuration != nil,
+                  position > duration,
+                  position - duration <= 1 else {
+                return normalizedProgress
+            }
+            return 1
         }
         guard let progress, progress.isFinite, (0...1).contains(progress) else { return }
+        // External callbacks can underreport EOF position; allow up to two minutes of grace,
+        // with an 80% floor, while built-in playback keeps its stream-timed threshold.
+        let callbackCompletionCutoff: (Double) -> Double = { completionFraction in
+            guard let duration else { return completionFraction }
+            return max(0.80, completionFraction - 120 / duration)
+        }
 
         let isEpisode = session.meta.isSeries && session.season != nil && session.episode != nil
         guard !session.meta.isSeries || isEpisode else { return }
@@ -1293,18 +1327,19 @@ struct ContentView: View {
             let completionFraction = TraktSettingsStore.watchProgressSource == .mdblist
                 ? MdbListProgressService.completionPercent / 100
                 : WatchProgressLedger.completionFraction
+            let isComplete = progress >= callbackCompletionCutoff(completionFraction)
             if progress > 0 {
                 let reportDuration = duration ?? 100
-                let reportPosition = duration.map { $0 * progress } ?? (100 * progress)
-                let action: TraktScrobbleAction = progress >= completionFraction
-                    ? .stop
-                    : .pause
+                let reportPosition = isComplete
+                    ? reportDuration
+                    : (duration.map { $0 * progress } ?? (100 * progress))
+                let action: TraktScrobbleAction = isComplete ? .stop : .pause
                 let store = ProfileSettings.current
-                if let duration {
+                if let localCheckpointDuration = duration ?? (isComplete ? reportDuration : nil) {
                     TraktProgressService.recordLocalPlayback(
                         meta: session.meta,
                         position: reportPosition,
-                        duration: duration,
+                        duration: localCheckpointDuration,
                         season: session.season,
                         episode: session.episode,
                         notify: action == .stop
@@ -1321,8 +1356,21 @@ struct ContentView: View {
                         store: store
                     )
                 }
+                if isComplete,
+                   RemoteTrackingState.shouldSaveNuvioSyncPlayback(
+                       usesRemoteProgress: true,
+                       in: store
+                   ),
+                   let duration {
+                    ContinueWatchingStore.markPlaybackCompleted(
+                        meta: session.meta,
+                        duration: duration,
+                        season: session.season,
+                        episode: session.episode
+                    )
+                }
             }
-            if progress >= completionFraction {
+            if isComplete {
                 _ = WatchedStore.markWatched(
                     session.meta,
                     season: session.season,
@@ -1332,7 +1380,7 @@ struct ContentView: View {
             return
         }
 
-        if progress >= WatchProgressLedger.completionFraction {
+        if progress >= callbackCompletionCutoff(WatchProgressLedger.completionFraction) {
             if let duration {
                 ContinueWatchingStore.markPlaybackCompleted(
                     meta: session.meta,
@@ -2811,6 +2859,8 @@ struct ContentView: View {
             homeCatalogRevision: syncManager.homeCatalogRevision,
             homeCollectionsRevision: syncManager.homeCollectionsRevision,
             isFullScreenOverlayPresented: fullScreenOverlayPresented,
+            isDetailsOrPlayerOverlayPresented: isDetailsOrPlayerOverlayPresented,
+            isVisibleCardMenuPresented: cardMenuMeta != nil,
             detailsDidDisappearGeneration: detailsDidDisappearGeneration,
             accountEmail: authManager.currentEmail,
             isAuthenticated: authManager.isAuthenticated,
@@ -2874,6 +2924,10 @@ struct ContentView: View {
             },
             onChangeProfileAvatar: { profileId, avatarId in
                 profileViewModel.updateProfileAvatar(id: profileId, avatarId: avatarId)
+                syncManager.syncProfilesAfterLocalEdit()
+            },
+            onChangeProfileBackground: { profileId, backgroundId, backgroundUrl in
+                profileViewModel.updateProfileBackground(id: profileId, backgroundId: backgroundId, backgroundUrl: backgroundUrl)
                 syncManager.syncProfilesAfterLocalEdit()
             },
             onChangeProfileName: { profileId, name in
@@ -4311,6 +4365,8 @@ private struct TVMainTabView: View {
     let homeCatalogRevision: UInt
     let homeCollectionsRevision: UInt
     let isFullScreenOverlayPresented: Bool
+    let isDetailsOrPlayerOverlayPresented: Bool
+    let isVisibleCardMenuPresented: Bool
     let detailsDidDisappearGeneration: UInt
     let accountEmail: String?
     let isAuthenticated: Bool
@@ -4330,6 +4386,7 @@ private struct TVMainTabView: View {
     let onCancelPartySelection: () -> Void
     let onSwitchProfile: () -> Void
     let onChangeProfileAvatar: (String, String) -> Void
+    var onChangeProfileBackground: ((String, String?, String?) -> Void)? = nil
     let onChangeProfileName: (String, String) -> Void
     let onChangeProfilePin: (String, String?, String?) async -> Bool
     let onVerifyProfilePin: (String, String) async -> Bool
@@ -4356,9 +4413,11 @@ private struct TVMainTabView: View {
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.discoverLocation) private var discoverLocation = "Search"
     @AppStorage(SettingsKey.showCalendarTab) private var showCalendarTab = true
+    @AppStorage(SettingsKey.showWatchPartyTab) private var showWatchPartyTab = true
     @AppStorage(SettingsKey.searchStyle) private var searchStyle = "Netflix"
     @AppStorage("nuvio.keyboard.detectedLayout") private var detectedKeyboardMode: TVOSKeyboardLayoutMode = .linear
     @AppStorage(SettingsKey.profileName) private var settingsProfileName = "Nuvio User"
+    @State private var selectedSettingsCategory: SettingsCategory = .account
     @State private var collectionDestinations: [CollectionHomeDestination] = []
     @State private var directCollectionDestinations: [CollectionHomeDestination] = []
     @State private var genreCollectionDestinations: [CollectionHomeDestination] = []
@@ -4390,6 +4449,9 @@ private struct TVMainTabView: View {
         .onChange(of: showCalendarTab) { _, isShown in
             if !isShown, selectedTab == .calendar { selectedTab = .home }
         }
+        .onChange(of: showWatchPartyTab) { _, isShown in
+            if !isShown, selectedTab == .party { selectedTab = .home }
+        }
     }
 
     /// Search screen chosen in Settings → Layout & Discovery → Search Style.
@@ -4409,6 +4471,7 @@ private struct TVMainTabView: View {
                 forcedLayoutMode: .grid,
                 isFullScreenOverlayPresented: isFullScreenOverlayPresented,
                 detailsDidDisappearGeneration: detailsDidDisappearGeneration,
+                isActive: selectedTab == .search,
                 onContentClick: onNavigateToDetails,
                 onLongPress: onLongPressCard
             )
@@ -4419,6 +4482,7 @@ private struct TVMainTabView: View {
                 forcedLayoutMode: detectedKeyboardMode == .grid ? .grid : .linear,
                 isFullScreenOverlayPresented: isFullScreenOverlayPresented,
                 detailsDidDisappearGeneration: detailsDidDisappearGeneration,
+                isActive: selectedTab == .search,
                 onContentClick: onNavigateToDetails,
                 onLongPress: onLongPressCard
             )
@@ -4428,6 +4492,7 @@ private struct TVMainTabView: View {
                 showDiscover: discoverLocation == "Search",
                 isFullScreenOverlayPresented: isFullScreenOverlayPresented,
                 detailsDidDisappearGeneration: detailsDidDisappearGeneration,
+                isActive: selectedTab == .search,
                 onContentClick: onNavigateToDetails,
                 onLongPress: onLongPressCard
             )
@@ -4475,6 +4540,8 @@ private struct TVMainTabView: View {
             repository: CinemetaCatalogRepository(),
             isActive: selectedTab == .home,
             isFullScreenOverlayPresented: isFullScreenOverlayPresented,
+            isDetailsOrPlayerOverlayPresented: isDetailsOrPlayerOverlayPresented,
+            isVisibleCardMenuPresented: isVisibleCardMenuPresented,
             detailsDidDisappearGeneration: detailsDidDisappearGeneration,
             isProfileFocusPending: isProfileFocusPending,
             profileGateGeneration: profileGateGeneration,
@@ -4533,12 +4600,14 @@ private struct TVMainTabView: View {
 
     private var settingsTabContent: some View {
         SettingsView(
+            selectedCategory: $selectedSettingsCategory,
             activeProfile: displayedProfile,
             accountEmail: accountEmail,
             isAuthenticated: isAuthenticated,
             sessionNeedsReauthentication: sessionNeedsReauthentication,
             onChangeProfileName: onChangeProfileName,
             onChangeProfileAvatar: onChangeProfileAvatar,
+            onChangeProfileBackground: onChangeProfileBackground,
             onChangeProfilePin: onChangeProfilePin,
             onVerifyProfilePin: onVerifyProfilePin,
             onSignIn: {
@@ -4558,6 +4627,8 @@ private struct TVMainTabView: View {
             catalogRevision: homeCatalogRevision,
             isActive: selectedTab == .collection(destination.id),
             isFullScreenOverlayPresented: isFullScreenOverlayPresented,
+            isDetailsOrPlayerOverlayPresented: isDetailsOrPlayerOverlayPresented,
+            isVisibleCardMenuPresented: isVisibleCardMenuPresented,
             detailsDidDisappearGeneration: detailsDidDisappearGeneration,
             collectionArtwork: collectionSidebarArtwork.images[destination.id],
             onNavigateToDetails: onNavigateToDetails,
@@ -4593,7 +4664,7 @@ private struct TVMainTabView: View {
             homeTabContent
                 .tabItem { Label(TVTab.home.title, systemImage: TVTab.home.symbol) }
                 .tag(TVTab.home)
-            if WatchPartyConfiguration.isEnabled {
+            if WatchPartyConfiguration.isEnabled && showWatchPartyTab {
                 partyTabContent
                     .tabItem { Label(TVTab.party.title, systemImage: TVTab.party.symbol) }
                     .tag(TVTab.party)
@@ -4644,7 +4715,7 @@ private struct TVMainTabView: View {
             Tab(TVTab.home.title, systemImage: TVTab.home.symbol, value: TVTab.home) {
                 homeTabContent
             }
-            if WatchPartyConfiguration.isEnabled {
+            if WatchPartyConfiguration.isEnabled && showWatchPartyTab {
                 Tab(TVTab.party.title, systemImage: TVTab.party.symbol, value: TVTab.party) {
                     partyTabContent
                 }
@@ -5083,6 +5154,185 @@ struct TVScrollViewFocusConfigurator: UIViewRepresentable {
 }
 #endif
 
+#if os(tvOS)
+/// Adds a remote-Left-only press observer to the marker's containing window.
+/// The snapshot is captured when UIKit accepts the press and passed back only
+/// if the recognizer completes it.
+struct TVRemoteLeftPressMonitor<Snapshot>: UIViewRepresentable {
+    let snapshotProvider: () -> Snapshot?
+    let onRecognized: (Snapshot) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(snapshotProvider: snapshotProvider, onRecognized: onRecognized)
+    }
+
+    func makeUIView(context: Context) -> TVRemoteLeftPressMarkerView {
+        let view = TVRemoteLeftPressMarkerView(frame: .zero)
+        view.isUserInteractionEnabled = false
+        view.backgroundColor = .clear
+        let coordinator = context.coordinator
+        view.onWindowChange = { [weak coordinator] window in
+            coordinator?.attach(to: window)
+        }
+        coordinator.attach(to: view.window)
+        return view
+    }
+
+    func updateUIView(_ uiView: TVRemoteLeftPressMarkerView, context: Context) {
+        context.coordinator.update(
+            snapshotProvider: snapshotProvider,
+            onRecognized: onRecognized
+        )
+        let coordinator = context.coordinator
+        uiView.onWindowChange = { [weak coordinator] window in
+            coordinator?.attach(to: window)
+        }
+        coordinator.attach(to: uiView.window)
+    }
+
+    static func dismantleUIView(_ uiView: TVRemoteLeftPressMarkerView, coordinator: Coordinator) {
+        uiView.onWindowChange = nil
+        coordinator.detach()
+    }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        private var snapshotProvider: () -> Snapshot?
+        private var onRecognized: (Snapshot) -> Void
+        private weak var attachedWindow: UIWindow?
+        private var leftPressRecognizer: UITapGestureRecognizer?
+        private var target: TVRemoteLeftPressTarget?
+        private var acceptedSnapshot: Snapshot?
+
+        init(
+            snapshotProvider: @escaping () -> Snapshot?,
+            onRecognized: @escaping (Snapshot) -> Void
+        ) {
+            self.snapshotProvider = snapshotProvider
+            self.onRecognized = onRecognized
+        }
+
+        func update(
+            snapshotProvider: @escaping () -> Snapshot?,
+            onRecognized: @escaping (Snapshot) -> Void
+        ) {
+            self.snapshotProvider = snapshotProvider
+            self.onRecognized = onRecognized
+        }
+
+        func attach(to window: UIWindow?) {
+            guard attachedWindow !== window || (window != nil && leftPressRecognizer == nil) else { return }
+            detach()
+            guard let window else { return }
+
+            let target = TVRemoteLeftPressTarget()
+            target.onRecognized = { [weak self] recognizer in
+                self?.handleRecognizedPress(recognizer)
+            }
+            let recognizer = UITapGestureRecognizer(
+                target: target,
+                action: #selector(TVRemoteLeftPressTarget.recognized(_:))
+            )
+            recognizer.allowedPressTypes = [NSNumber(value: UIPress.PressType.leftArrow.rawValue)]
+            recognizer.allowedTouchTypes = []
+            recognizer.delaysTouchesBegan = true
+            recognizer.delaysTouchesEnded = true
+            recognizer.cancelsTouchesInView = true
+            recognizer.delegate = self
+            window.addGestureRecognizer(recognizer)
+            self.attachedWindow = window
+            self.leftPressRecognizer = recognizer
+            self.target = target
+        }
+
+        func detach() {
+            if let leftPressRecognizer {
+                attachedWindow?.removeGestureRecognizer(leftPressRecognizer)
+                leftPressRecognizer.delegate = nil
+            }
+            target?.onRecognized = nil
+            target = nil
+            leftPressRecognizer = nil
+            attachedWindow = nil
+            acceptedSnapshot = nil
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive press: UIPress) -> Bool {
+            guard gestureRecognizer === leftPressRecognizer,
+                  press.type == .leftArrow,
+                  let snapshot = snapshotProvider() else {
+                acceptedSnapshot = nil
+                return false
+            }
+            acceptedSnapshot = snapshot
+            return true
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+            false
+        }
+
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer
+        ) -> Bool {
+            guard gestureRecognizer === leftPressRecognizer,
+                  otherGestureRecognizer !== leftPressRecognizer,
+                  snapshotProvider() != nil else { return false }
+            return true
+        }
+
+        private func handleRecognizedPress(_ recognizer: UITapGestureRecognizer) {
+            guard recognizer === leftPressRecognizer,
+                  let acceptedSnapshot else { return }
+            self.acceptedSnapshot = nil
+            onRecognized(acceptedSnapshot)
+        }
+    }
+}
+
+final class TVRemoteLeftPressMarkerView: UIView {
+    var onWindowChange: ((UIWindow?) -> Void)?
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        onWindowChange?(window)
+    }
+}
+
+private final class TVRemoteLeftPressTarget: NSObject {
+    var onRecognized: ((UITapGestureRecognizer) -> Void)?
+
+    @objc func recognized(_ recognizer: UITapGestureRecognizer) {
+        onRecognized?(recognizer)
+    }
+}
+#endif
+
+enum TVHomeRestoreLeftNeighbor {
+    enum RowLayout: Equatable {
+        case horizontal
+        case grid(columns: Int)
+    }
+
+    static func predecessor(of currentKey: String, in keys: [String], layout: RowLayout) -> String? {
+        guard let currentIndex = keys.firstIndex(of: currentKey), currentIndex > 0 else { return nil }
+        if case .grid(let columns) = layout {
+            guard columns > 0, currentIndex % columns != 0 else { return nil }
+        }
+        return keys[currentIndex - 1]
+    }
+}
+
+private struct TVHomeRestoreLeftPressSnapshot {
+    let sourceCardID: String
+    let predecessorCardID: String
+    let restoreGeneration: Int
+    let fullScreenPresentationID: Int
+    let visibleOverlayPresentationID: Int
+    let browsePresentationGeneration: Int
+    let focusMovedAwayGeneration: Int
+}
+
 private enum TVHomeProfileFocusTarget: Equatable {
     case card(key: String, sectionID: String, sectionIndex: Int)
     case gridHero
@@ -5110,6 +5360,9 @@ struct TVHomeView: View {
     let repository: CatalogRepository
     let isActive: Bool
     let isFullScreenOverlayPresented: Bool
+    let isDetailsOrPlayerOverlayPresented: Bool
+    let isVisibleCardMenuPresented: Bool
+    var isExternalRetryFocusActive: Bool = false
     let detailsDidDisappearGeneration: UInt
     /// True while a freshly picked profile is being prepared. Keeps Home's own
     /// focus handoff coordinated with the root profile cover.
@@ -5234,9 +5487,25 @@ struct TVHomeView: View {
     /// an older Details/Player return must never clear the next return's focus
     /// lock when the user opens the same card twice in quick succession.
     @State private var overlayRestoreGeneration = 0
+    /// Visible overlays and full-screen overlays can overlap during dismissal.
+    /// Track their restore attempts independently so one lifecycle cannot
+    /// consume the other's dismissal signal.
+    @State private var visibleOverlayPresentationID = 0
+    @State private var visibleRestoreStartedForPresentationID: Int?
+    @State private var fullScreenOverlayPresentationID = 0
+    @State private var fullScreenRestoreStartedForPresentationID: Int?
+    @State private var fullScreenRestoreIsDetailsOrPlayer = false
+    @State private var detailsPlayerRestoreTargetCardID: String?
+    @State private var detailsPlayerRestoreExpectedFocusCardID: String?
+    @State private var detailsPlayerRestoreNativeFocusReachedTarget = false
+    @State private var detailsPlayerRestoreNativeFocusLostTarget = false
+    @State private var detailsPlayerRestoreGeneration: Int?
+    @State private var detailsPlayerRestorePresentationID: Int?
+    @State private var focusMovedAwayGeneration = 0
     @Environment(\.isEnabled) private var isEnabled
     @State private var focusedRowIndex: Int = 0
     @State private var browsingSection: TVHomeSection?
+    @State private var browsePresentationGeneration = 0
     @State private var gridHeroIndex = 0
     @State private var didRequestInitialGridHeroFocus = false
     /// The Grid hero owns its own focus state, so `focusedCardID` goes nil while
@@ -5756,6 +6025,8 @@ struct TVHomeView: View {
                 overlayRestoreGeneration &+= 1
                 overlayRestoreCardID = nil
                 focusWork.acknowledgedNativeOverlayFocusCardID = nil
+                clearDetailsPlayerReturnRestore()
+                fullScreenRestoreIsDetailsOrPlayer = false
                 // Screen-scoped work cancellation.
                 continueWatchingRefreshTask?.cancel()
                 continueWatchingRefreshTask = nil
@@ -5768,6 +6039,14 @@ struct TVHomeView: View {
 
     @ViewBuilder private var homeBodySecondHalf: some View {
         homeBodyFirstHalf
+        #if os(tvOS)
+        .background {
+            TVRemoteLeftPressMonitor<TVHomeRestoreLeftPressSnapshot>(
+                snapshotProvider: { overlayRestoreLeftPressSnapshot() },
+                onRecognized: handleOverlayRestoreLeftPress
+            )
+        }
+        #endif
         .onChange(of: continueWatchingSort) { _, _ in
             if !rawContinueWatchingItems.isEmpty {
                 setContinueWatching(rawContinueWatchingItems)
@@ -5916,8 +6195,7 @@ struct TVHomeView: View {
         }
     }
 
-    var body: some View {
-        let _ = TVHomeDebugTrace.breadcrumb("home.body.render active=\(isActive) row=\(focusedRowIndex)")
+    @ViewBuilder private var bodyWithModifiersFirstHalf: some View {
         homeBodySecondHalf
         .onChange(of: isLoading) { _, loading in
             TVHomeDebugTrace.log("home.onChange(isLoading) loading=\(loading) showsLoading=\(showsLoading)")
@@ -5967,18 +6245,12 @@ struct TVHomeView: View {
             }
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active {
-                checkAndTriggerAutoRefresh()
-                if isActive && !isFullScreenOverlayPresented {
-                    if usesRemoteProgress {
-                        scheduleContinueWatchingRefresh()
-                        scheduleTraktWatchedHistorySync()
-                    } else {
-                        refreshContinueWatching()
-                    }
-                }
-            }
+            handleScenePhaseChange(phase)
         }
+    }
+
+    @ViewBuilder private var bodyWithModifiers: some View {
+        bodyWithModifiersFirstHalf
         .onChange(of: focusedPosterBackdropEnabled) { _, enabled in
             guard !enabled else { return }
             focusWork.pendingLandscapeFocusedId = nil
@@ -5986,121 +6258,168 @@ struct TVHomeView: View {
             landscapeFocusedId = nil
         }
         .onChange(of: focusedCardID) { oldValue, newValue in
-            TVHomeDebugTrace.measure("home.focusedCardID.onChange") {
-                TVHomeDebugTrace.log(
-                    "home.focusedCardID changed from \(oldValue ?? "nil") to \(newValue ?? "nil") "
-                        + "pendingInitial=\(pendingInitialFocusCardKey ?? "nil") "
-                        + "suppressAnimations=\(suppressReturnFocusAnimations) "
-                        + "lastFocused=\(store.lastFocusedCardID ?? "nil") "
-                        + "didPrepareViewport=\(didPrepareInitialFocusViewport)"
-                )
-                if newValue == nil {
-                    // A FocusState assignment can request focus, but only a
-                    // native card callback below can acknowledge it.
-                    nativeProfileFocusedCardKey = nil
-                }
-                if let newValue {
-                    if let pending = pendingInitialFocusCardKey {
-                        if pending == newValue {
-                            TVHomeDebugTrace.log("home.focusedCardID matched pendingInitialFocusCardKey=\(pending)")
-                            self.pendingInitialFocusCardKey = nil
-                            self.suppressReturnFocusAnimations = false
-                        } else {
-                            // While waiting for pending initial focus target, ignore transient focus
-                            // events during layout/viewport scroll passes.
-                            TVHomeDebugTrace.log("home.focusedCardID ignoring transient focus on \(newValue) while waiting for \(pending)")
-                            return
-                        }
-                    } else if !didPrepareInitialFocusViewport,
-                              let saved = store.lastFocusedCardID,
-                              saved != newValue
-                    {
-                        pendingInitialFocusCardKey = saved
-                        return
-                    }
-                    store.lastFocusedCardID = newValue
-                    if isActive {
-                        releaseReturnFocusAnimationSuppression()
-                    }
-                    if isEnabled, let target = overlayRestoreCardID, newValue == target {
-                        focusWork.acknowledgedNativeOverlayFocusCardID = target
-                        completeOverlayFocusRestore(for: target)
-                    }
-                }
-            }
+            handleFocusedCardIDChange(oldValue: oldValue, newValue: newValue)
         }
         // Visible menus still toggle Home's disabled environment. Full-screen
         // overlays do not: their opacity-zero Home tree is already unfocusable,
         // and handling the overlay transition directly avoids invalidating all
         // resident shelves on Details entry.
         .onChange(of: isEnabled) { _, enabled in
-            TVHomeDebugTrace.log(
-                "home.overlay.isEnabled changed to \(enabled) active=\(isActive) defersPrep=\(focusWork.defersOverlayPreparation)"
-            )
-            // Full-screen transitions have their own handler below. This one
-            // remains for the visible card-menu path and inactive TabView tabs.
-            guard !isFullScreenOverlayPresented else { return }
-            handleHomeOverlayStateChange(isPresented: !enabled)
+            handleIsEnabledChange(enabled)
         }
         .onChange(of: isFullScreenOverlayPresented) { _, presented in
-            TVHomeDebugTrace.log(
-                "home.overlay.fullScreen changed to \(presented) active=\(isActive) defersPrep=\(focusWork.defersOverlayPreparation)"
-            )
-            handleHomeOverlayStateChange(isPresented: presented)
+            handleFullScreenOverlayPresentedChange(presented)
+        }
+        .onChange(of: isDetailsOrPlayerOverlayPresented) { _, presented in
+            handleDetailsOrPlayerOverlayPresentedChange(presented)
         }
         .onChange(of: detailsDidDisappearGeneration) { _, generation in
-            guard !isFullScreenOverlayPresented, isActive else { return }
-            if pendingContinueWatchingRefreshAfterOverlay {
-                pendingContinueWatchingRefreshAfterOverlay = false
-                if usesRemoteProgress {
-                    scheduleContinueWatchingRefresh()
-                    scheduleTraktWatchedHistorySync()
-                } else {
-                    refreshContinueWatching()
-                    refreshWatchedTitles()
-                }
-            }
-            let savedTarget = overlayRestoreCardID
-                ?? focusWork.pendingOverlayRestoreCardID
-                ?? store.lastFocusedCardID
-            guard let rawTarget = savedTarget,
-                  let target = validRestoreTarget(rawTarget) else { return }
-            TVHomeDebugTrace.log(
-                "home.details.disappeared generation=\(generation) restoring target=\(target)"
-            )
-            restoreFocusState(for: target)
-            // Re-acquire the one-card lock instead of assigning focus directly.
-            // On the first frames after Details fades out, the row has not
-            // re-rendered with its restriction yet, so a bare assignment lets
-            // the focus engine settle on a neighbouring card — and the restore
-            // then confirms that neighbour. Details, the card menu, and the
-            // player all return through this one locked path.
-            armReturnFocusAnimationSuppression()
-            overlayRestoreGeneration &+= 1
-            overlayRestoreCardID = target
-            restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+            handleDetailsDidDisappear(generation: generation)
         }
         .onChange(of: focusRows) { _, _ in
             retargetMissingFocusIfNeeded()
         }
-        .fullScreenCover(item: $browsingSection) { section in
-            TVHomeCatalogBrowseView(
-                section: section,
-                repository: repository,
-                watchedTitleKeys: watchedTitleKeys,
-                collectionSource: collectionHome?.source(for: section.id),
-                collectionProfileID: collectionHome?.destination.id.profileID,
-                onDismiss: { browsingSection = nil },
-                onSelect: { meta in
-                    browsingSection = nil
-                    DispatchQueue.main.async {
-                        navigateToDetailsFromHome(id: meta.id, type: meta.type)
-                    }
-                },
-                onLongPress: onLongPressCard
-            )
+        .onChange(of: browsingSection?.id) { _, _ in
+            browsePresentationGeneration &+= 1
         }
-        .onExitCommand(perform: canHandleExitCommand ? handleBackCommand : nil)
+    }
+
+    var body: some View {
+        let _ = TVHomeDebugTrace.breadcrumb("home.body.render active=\(isActive) row=\(focusedRowIndex)")
+        bodyWithModifiers
+            .fullScreenCover(item: $browsingSection) { section in
+                browseSectionView(section: section)
+            }
+            .onExitCommand(perform: canHandleExitCommand ? handleBackCommand : nil)
+    }
+
+    @ViewBuilder
+    private func browseSectionView(section: TVHomeSection) -> some View {
+        TVHomeCatalogBrowseView(
+            section: section,
+            repository: repository,
+            watchedTitleKeys: watchedTitleKeys,
+            collectionSource: collectionHome?.source(for: section.id),
+            collectionProfileID: collectionHome?.destination.id.profileID,
+            onDismiss: { browsingSection = nil },
+            onSelect: { meta in
+                browsingSection = nil
+                DispatchQueue.main.async {
+                    navigateToDetailsFromHome(id: meta.id, type: meta.type)
+                }
+            },
+            onLongPress: onLongPressCard
+        )
+    }
+
+    private func handleScenePhaseChange(_ phase: ScenePhase) {
+        guard phase == .active else { return }
+        checkAndTriggerAutoRefresh()
+        if isActive && !isFullScreenOverlayPresented {
+            if usesRemoteProgress {
+                scheduleContinueWatchingRefresh()
+                scheduleTraktWatchedHistorySync()
+            } else {
+                refreshContinueWatching()
+            }
+        }
+    }
+
+    private func handleDetailsDidDisappear(generation: UInt) {
+        guard !isFullScreenOverlayPresented, isActive else { return }
+        if pendingContinueWatchingRefreshAfterOverlay {
+            pendingContinueWatchingRefreshAfterOverlay = false
+            if usesRemoteProgress {
+                scheduleContinueWatchingRefresh()
+                scheduleTraktWatchedHistorySync()
+            } else {
+                refreshContinueWatching()
+                refreshWatchedTitles()
+            }
+        }
+        let savedTarget: String? = overlayRestoreCardID
+            ?? focusWork.pendingOverlayRestoreCardID
+            ?? store.lastFocusedCardID
+        guard let rawTarget = savedTarget,
+              let target = validRestoreTarget(rawTarget) else { return }
+        TVHomeDebugTrace.log(
+            "home.details.disappeared generation=\(generation) restoring target=\(target)"
+        )
+        // Re-acquire the one-card lock if the overlay state change has not
+        // already started this presentation's restoration. A delayed
+        // unmount after native focus settles must not re-lock Home.
+        beginOverlayFocusRestore(
+            to: target,
+            isFullScreen: true,
+            suppressAnimations: true,
+            source: "details.unmount"
+        )
+    }
+
+    private func handleFocusedCardIDChange(oldValue: String?, newValue: String?) {
+        if let newValue,
+           let expected = detailsPlayerRestoreExpectedFocusCardID,
+           newValue != expected {
+            focusMovedAwayGeneration &+= 1
+        }
+        TVHomeDebugTrace.measure("home.focusedCardID.onChange") {
+            TVHomeDebugTrace.log(
+                "home.focusedCardID changed from \(oldValue ?? "nil") to \(newValue ?? "nil") "
+                    + "pendingInitial=\(pendingInitialFocusCardKey ?? "nil") "
+                    + "suppressAnimations=\(suppressReturnFocusAnimations) "
+                    + "lastFocused=\(store.lastFocusedCardID ?? "nil") "
+                    + "didPrepareViewport=\(didPrepareInitialFocusViewport)"
+            )
+            if newValue == nil {
+                nativeProfileFocusedCardKey = nil
+            }
+            if let newValue {
+                if let pending = pendingInitialFocusCardKey {
+                    if pending == newValue {
+                        TVHomeDebugTrace.log("home.focusedCardID matched pendingInitialFocusCardKey=\(pending)")
+                        self.pendingInitialFocusCardKey = nil
+                        self.suppressReturnFocusAnimations = false
+                    } else {
+                        TVHomeDebugTrace.log("home.focusedCardID ignoring transient focus on \(newValue) while waiting for \(pending)")
+                        return
+                    }
+                } else if !didPrepareInitialFocusViewport,
+                          let saved = store.lastFocusedCardID,
+                          saved != newValue
+                {
+                    pendingInitialFocusCardKey = saved
+                    return
+                }
+                store.lastFocusedCardID = newValue
+                if isActive {
+                    releaseReturnFocusAnimationSuppression()
+                }
+                if isEnabled, let target = overlayRestoreCardID, newValue == target {
+                    completeOverlayFocusRestore(for: target)
+                }
+            }
+        }
+    }
+
+    private func handleIsEnabledChange(_ enabled: Bool) {
+        TVHomeDebugTrace.log(
+            "home.overlay.isEnabled changed to \(enabled) active=\(isActive) defersPrep=\(focusWork.defersOverlayPreparation)"
+        )
+        guard !isFullScreenOverlayPresented else { return }
+        handleHomeOverlayStateChange(isPresented: !enabled, isFullScreen: false)
+    }
+
+    private func handleFullScreenOverlayPresentedChange(_ presented: Bool) {
+        TVHomeDebugTrace.log(
+            "home.overlay.fullScreen changed to \(presented) active=\(isActive) defersPrep=\(focusWork.defersOverlayPreparation)"
+        )
+        handleHomeOverlayStateChange(isPresented: presented, isFullScreen: true)
+    }
+
+    private func handleDetailsOrPlayerOverlayPresentedChange(_ presented: Bool) {
+        guard presented, isFullScreenOverlayPresented else { return }
+        fullScreenRestoreIsDetailsOrPlayer = true
+        clearDetailsPlayerReturnRestore()
     }
 
     /// - Parameter heroBleed: Horizontal safe-area inset this grid sits inside.
@@ -6448,6 +6767,110 @@ struct TVHomeView: View {
         )
     }
 
+    private func previousHorizontalCardID(before source: String) -> String? {
+        guard let row = focusRows
+                .filter({ $0.keys.contains(source) })
+                .max(by: { $0.id.count < $1.id.count }),
+              let section = visibleSections.first(where: { $0.id == row.id }),
+              !section.isLoadingPlaceholder else { return nil }
+
+        let isGridCatalog = homeLayout == "Grid View"
+            && section.collectionFolders.isEmpty
+            && section.id != TVHomeSection.continueWatchingId
+            && section.id != TVHomeSection.upcomingId
+            && section.id != TVHomeSection.calendarTodayId
+        let layout: TVHomeRestoreLeftNeighbor.RowLayout = isGridCatalog
+            ? .grid(columns: TVHomeGridLayout.columns)
+            : .horizontal
+        return TVHomeRestoreLeftNeighbor.predecessor(of: source, in: row.keys, layout: layout)
+    }
+
+    private func overlayRestoreLeftPressSnapshot() -> TVHomeRestoreLeftPressSnapshot? {
+        guard isActive,
+              isEnabled,
+              !isFullScreenOverlayPresented,
+              !isVisibleCardMenuPresented,
+              !isExternalRetryFocusActive,
+              browsingSection == nil,
+              fullScreenRestoreIsDetailsOrPlayer,
+              let source = detailsPlayerRestoreTargetCardID,
+              !detailsPlayerRestoreNativeFocusLostTarget,
+              let restoreGeneration = detailsPlayerRestoreGeneration,
+              let presentationID = detailsPlayerRestorePresentationID,
+              source == overlayRestoreCardID,
+              detailsPlayerRestoreExpectedFocusCardID == source,
+              focusedCardID == nil || focusedCardID == source,
+              restoreGeneration == overlayRestoreGeneration,
+              presentationID == fullScreenOverlayPresentationID,
+              let predecessor = previousHorizontalCardID(before: source)
+        else { return nil }
+
+        return TVHomeRestoreLeftPressSnapshot(
+            sourceCardID: source,
+            predecessorCardID: predecessor,
+            restoreGeneration: restoreGeneration,
+            fullScreenPresentationID: presentationID,
+            visibleOverlayPresentationID: visibleOverlayPresentationID,
+            browsePresentationGeneration: browsePresentationGeneration,
+            focusMovedAwayGeneration: focusMovedAwayGeneration
+        )
+    }
+
+    private func handleOverlayRestoreLeftPress(_ snapshot: TVHomeRestoreLeftPressSnapshot) {
+        let focusStayedOnRestoreSource = focusMovedAwayGeneration == snapshot.focusMovedAwayGeneration
+            && (focusedCardID == nil || focusedCardID == snapshot.sourceCardID)
+        let restoreStillPending = detailsPlayerRestoreTargetCardID == snapshot.sourceCardID
+            && detailsPlayerRestoreExpectedFocusCardID == snapshot.sourceCardID
+            && detailsPlayerRestoreGeneration == snapshot.restoreGeneration
+            && detailsPlayerRestorePresentationID == snapshot.fullScreenPresentationID
+            && overlayRestoreCardID == snapshot.sourceCardID
+        let restoreJustCompleted = detailsPlayerRestoreTargetCardID == nil
+            && detailsPlayerRestoreExpectedFocusCardID == snapshot.sourceCardID
+            && detailsPlayerRestoreGeneration == nil
+            && overlayRestoreCardID == nil
+            && focusStayedOnRestoreSource
+
+        guard isActive,
+              isEnabled,
+              !isFullScreenOverlayPresented,
+              !isVisibleCardMenuPresented,
+              !isExternalRetryFocusActive,
+              browsingSection == nil,
+              !detailsPlayerRestoreNativeFocusLostTarget,
+              fullScreenRestoreStartedForPresentationID == snapshot.fullScreenPresentationID,
+              visibleOverlayPresentationID == snapshot.visibleOverlayPresentationID,
+              browsePresentationGeneration == snapshot.browsePresentationGeneration,
+              restoreStillPending || restoreJustCompleted,
+              overlayRestoreGeneration == snapshot.restoreGeneration,
+              fullScreenOverlayPresentationID == snapshot.fullScreenPresentationID,
+              focusStayedOnRestoreSource,
+              previousHorizontalCardID(before: snapshot.sourceCardID) == snapshot.predecessorCardID
+        else {
+            TVHomeDebugTrace.log("home.restoreLeftPress rejected source=\(snapshot.sourceCardID)")
+            return
+        }
+
+        // The window recognizer owns this one remote press while Home has no
+        // native focus. Move the existing restore target so the native card
+        // callback still performs row-index synchronization before unlocking.
+        overlayRestoreGeneration &+= 1
+        let generation = overlayRestoreGeneration
+        overlayRestoreCardID = snapshot.predecessorCardID
+        focusWork.restoringOverlayCardID = nil
+        focusWork.acknowledgedNativeOverlayFocusCardID = nil
+        detailsPlayerRestoreTargetCardID = snapshot.predecessorCardID
+        detailsPlayerRestoreExpectedFocusCardID = snapshot.predecessorCardID
+        detailsPlayerRestoreNativeFocusReachedTarget = false
+        detailsPlayerRestoreNativeFocusLostTarget = false
+        detailsPlayerRestoreGeneration = generation
+        detailsPlayerRestorePresentationID = snapshot.fullScreenPresentationID
+        TVHomeDebugTrace.log(
+            "home.restoreLeftPress retarget source=\(snapshot.sourceCardID) "
+                + "destination=\(snapshot.predecessorCardID) gen=\(generation)"
+        )
+        restoreOverlayFocus(to: snapshot.predecessorCardID, generation: generation)
+    }
+
     /// Refresh saved destinations while an overlay owns focus, but request
     /// focus only after Home becomes active and the overlay has disappeared.
     private func retargetMissingFocusIfNeeded() {
@@ -6464,15 +6887,25 @@ struct TVHomeView: View {
               !focusWork.defersOverlayPreparation else { return }
         overlayRestoreGeneration &+= 1
         let wasRestoring = overlayRestoreCardID != nil
+        let wasDetailsPlayerRestore = detailsPlayerRestoreTargetCardID != nil
         overlayRestoreCardID = nil
         focusWork.restoringOverlayCardID = nil
         focusWork.acknowledgedNativeOverlayFocusCardID = nil
         guard let target else {
+            clearDetailsPlayerReturnRestore()
             focusedCardID = nil
             return
         }
         if wasRestoring {
             overlayRestoreCardID = target
+            if wasDetailsPlayerRestore {
+                detailsPlayerRestoreTargetCardID = target
+                detailsPlayerRestoreExpectedFocusCardID = target
+                detailsPlayerRestoreNativeFocusReachedTarget = false
+                detailsPlayerRestoreNativeFocusLostTarget = false
+                detailsPlayerRestoreGeneration = overlayRestoreGeneration
+                detailsPlayerRestorePresentationID = fullScreenOverlayPresentationID
+            }
             restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
         } else {
             focusedCardID = target
@@ -6483,13 +6916,27 @@ struct TVHomeView: View {
     /// Full-screen presentation intentionally does not toggle Home's disabled
     /// environment, so this transition hook replaces the old Details-specific
     /// `isEnabled` callback without rebuilding every resident shelf.
-    private func handleHomeOverlayStateChange(isPresented: Bool) {
+    private func handleHomeOverlayStateChange(isPresented: Bool, isFullScreen: Bool) {
+        if isPresented {
+            if isFullScreen {
+                fullScreenOverlayPresentationID &+= 1
+                fullScreenRestoreStartedForPresentationID = nil
+                clearDetailsPlayerReturnRestore()
+                fullScreenRestoreIsDetailsOrPlayer = isDetailsOrPlayerOverlayPresented
+            } else {
+                visibleOverlayPresentationID &+= 1
+                visibleRestoreStartedForPresentationID = nil
+            }
+        }
+
         // TabView may disable an unselected Home tab. Only overlay restoration
         // while Home remains selected should touch the saved focus target.
         guard isActive else {
             overlayRestoreGeneration &+= 1
             overlayRestoreCardID = nil
             focusWork.acknowledgedNativeOverlayFocusCardID = nil
+            clearDetailsPlayerReturnRestore()
+            fullScreenRestoreIsDetailsOrPlayer = false
             return
         }
 
@@ -6526,6 +6973,7 @@ struct TVHomeView: View {
                 overlayRestoreCardID = nil
                 focusWork.restoringOverlayCardID = nil
                 focusWork.acknowledgedNativeOverlayFocusCardID = nil
+                clearDetailsPlayerReturnRestore()
                 TVHomeDebugTrace.log("home.overlay.dismissal defersPrep with nil target")
                 return
             }
@@ -6533,27 +6981,89 @@ struct TVHomeView: View {
             // Build the restriction only on return. Details may still be
             // finishing its opacity transition, so use the short retry window
             // instead of relying on a single onDisappear callback ordering.
-            restoreFocusState(for: target)
-            armReturnFocusAnimationSuppression()
-            overlayRestoreGeneration &+= 1
-            TVHomeDebugTrace.log("home.overlay.dismissal restoring to target=\(target) gen=\(overlayRestoreGeneration)")
-            overlayRestoreCardID = target
-            restoreOverlayFocus(
+            beginOverlayFocusRestore(
                 to: target,
-                generation: overlayRestoreGeneration
+                isFullScreen: isFullScreen,
+                suppressAnimations: true,
+                source: "overlay.dismissal"
             )
         } else if let saved = overlayRestoreCardID ?? store.lastFocusedCardID {
             guard let target = validRestoreTarget(saved) else {
                 overlayRestoreCardID = nil
                 focusWork.restoringOverlayCardID = nil
                 focusWork.acknowledgedNativeOverlayFocusCardID = nil
+                clearDetailsPlayerReturnRestore()
                 return
             }
-            restoreFocusState(for: target)
-            overlayRestoreCardID = target
-            TVHomeDebugTrace.log("home.overlay.dismissal fallback restoring to target=\(target) gen=\(overlayRestoreGeneration)")
-            restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+            beginOverlayFocusRestore(
+                to: target,
+                isFullScreen: isFullScreen,
+                suppressAnimations: false,
+                source: "overlay.dismissal.fallback"
+            )
         }
+    }
+
+    /// Starts at most one locked restore for a presentation, whether the
+    /// dismissal arrives through the state transition or the outgoing view's
+    /// unmount callback.
+    private func beginOverlayFocusRestore(
+        to target: String,
+        isFullScreen: Bool,
+        suppressAnimations: Bool,
+        source: String
+    ) {
+        let presentationID = isFullScreen
+            ? fullScreenOverlayPresentationID
+            : visibleOverlayPresentationID
+        let restoreAlreadyStarted = isFullScreen
+            ? fullScreenRestoreStartedForPresentationID == presentationID
+            : visibleRestoreStartedForPresentationID == presentationID
+        guard !restoreAlreadyStarted else {
+            TVHomeDebugTrace.log(
+                "home.overlay.dismissal duplicate source=\(source) presentation=\(presentationID)"
+            )
+            return
+        }
+
+        if isFullScreen {
+            fullScreenRestoreStartedForPresentationID = presentationID
+        } else {
+            visibleRestoreStartedForPresentationID = presentationID
+        }
+        restoreFocusState(for: target)
+        if suppressAnimations {
+            armReturnFocusAnimationSuppression()
+        }
+        overlayRestoreGeneration &+= 1
+        overlayRestoreCardID = target
+        if isFullScreen && fullScreenRestoreIsDetailsOrPlayer {
+            detailsPlayerRestoreTargetCardID = target
+            detailsPlayerRestoreExpectedFocusCardID = target
+            detailsPlayerRestoreNativeFocusReachedTarget = false
+            detailsPlayerRestoreNativeFocusLostTarget = false
+            detailsPlayerRestoreGeneration = overlayRestoreGeneration
+            detailsPlayerRestorePresentationID = fullScreenOverlayPresentationID
+        } else {
+            clearDetailsPlayerReturnRestore()
+            fullScreenRestoreIsDetailsOrPlayer = false
+        }
+        TVHomeDebugTrace.log(
+            "home.overlay.dismissal restoring source=\(source) target=\(target) "
+                + "presentation=\(presentationID) gen=\(overlayRestoreGeneration)"
+        )
+        restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+    }
+
+    private func clearDetailsPlayerReturnRestore(clearExpectedFocus: Bool = true) {
+        detailsPlayerRestoreTargetCardID = nil
+        if clearExpectedFocus {
+            detailsPlayerRestoreExpectedFocusCardID = nil
+            detailsPlayerRestoreNativeFocusReachedTarget = false
+            detailsPlayerRestoreNativeFocusLostTarget = false
+        }
+        detailsPlayerRestoreGeneration = nil
+        detailsPlayerRestorePresentationID = nil
     }
 
     private func restoreFocusState(for rawTarget: String) {
@@ -6639,6 +7149,11 @@ struct TVHomeView: View {
                 overlayRestoreCardID = nil
                 focusWork.restoringOverlayCardID = nil
                 focusWork.acknowledgedNativeOverlayFocusCardID = nil
+                if detailsPlayerRestoreGeneration == generation,
+                   detailsPlayerRestoreTargetCardID == target {
+                    clearDetailsPlayerReturnRestore(clearExpectedFocus: false)
+                    fullScreenRestoreIsDetailsOrPlayer = false
+                }
             }
         }
     }
@@ -6647,6 +7162,16 @@ struct TVHomeView: View {
     /// synchronize their horizontal index before calling this closure, so a
     /// matching acknowledgement can safely release the one-card lock.
     private func acknowledgeNativeOverlayFocusRestore(for cardKey: String) {
+        if let expected = detailsPlayerRestoreExpectedFocusCardID {
+            if cardKey == expected {
+                detailsPlayerRestoreNativeFocusReachedTarget = true
+            } else {
+                focusMovedAwayGeneration &+= 1
+                if detailsPlayerRestoreNativeFocusReachedTarget {
+                    detailsPlayerRestoreNativeFocusLostTarget = true
+                }
+            }
+        }
         guard focusWork.restoringOverlayCardID == cardKey,
               overlayRestoreCardID == cardKey else { return }
         focusWork.acknowledgedNativeOverlayFocusCardID = cardKey
@@ -6687,6 +7212,11 @@ struct TVHomeView: View {
                 overlayRestoreCardID = nil
                 focusedCardID = cardKey
                 focusWork.acknowledgedNativeOverlayFocusCardID = nil
+                if detailsPlayerRestoreGeneration == generation,
+                   detailsPlayerRestoreTargetCardID == cardKey {
+                    clearDetailsPlayerReturnRestore(clearExpectedFocus: false)
+                    fullScreenRestoreIsDetailsOrPlayer = false
+                }
             }
         }
     }
@@ -6788,6 +7318,12 @@ struct TVHomeView: View {
     }
 
     private func clearNativeProfileCardFocus(_ cardKey: String) {
+        if detailsPlayerRestoreExpectedFocusCardID == cardKey,
+           detailsPlayerRestoreNativeFocusReachedTarget,
+           !detailsPlayerRestoreNativeFocusLostTarget {
+            detailsPlayerRestoreNativeFocusLostTarget = true
+            focusMovedAwayGeneration &+= 1
+        }
         guard nativeProfileFocusedCardKey == cardKey else { return }
         nativeProfileFocusedCardKey = nil
         TVHomeDebugTrace.log("home.profileGate.nativeCardBlur key=\(cardKey)")
@@ -7814,12 +8350,37 @@ struct TVHomeView: View {
     }
 
     /// Continue Watching context for the hero — only when the focused card is
-    /// actually in the Continue Watching / Upcoming row. The same title can also appear in
+    /// actually in the Continue Watching / Upcoming / Today row. The same title can also appear in
     /// catalog rows (Popular etc.), where the hero should stay generic.
     private func heroContinueItem(for meta: NuvioMeta) -> ContinueWatchingItem? {
-        guard visibleFocusedMeta != nil,
-              (focusedSectionId == TVHomeSection.continueWatchingId || focusedSectionId == TVHomeSection.upcomingId) else { return nil }
-        return continueWatchingByMetaId[meta.id]
+        guard visibleFocusedMeta != nil else { return nil }
+        if focusedSectionId == TVHomeSection.continueWatchingId || focusedSectionId == TVHomeSection.upcomingId {
+            return continueWatchingByMetaId[meta.id]
+        }
+        if focusedSectionId == TVHomeSection.calendarTodayId {
+            if let existing = continueWatchingByMetaId[meta.id] {
+                return existing
+            }
+            if let entry = calendarToday.entries[meta.id],
+               let season = entry.seasonNumber,
+               let episode = entry.episodeNumber {
+                return ContinueWatchingItem(
+                    meta: meta,
+                    streamUrl: "",
+                    position: 0,
+                    duration: 0,
+                    lastWatchedAt: Date(),
+                    season: season,
+                    episode: episode,
+                    released: nil,
+                    episodeTitleOverride: entry.episodeName,
+                    episodeOverviewOverride: entry.overview,
+                    episodeThumbnailOverride: entry.stillURL?.absoluteString,
+                    isUpNext: true
+                )
+            }
+        }
+        return nil
     }
 
     private var visibleHero: NuvioMeta? {
@@ -10835,11 +11396,13 @@ enum TVSceneTabOrder {
     static let changedNotification = Notification.Name("nuvio.tv.sceneTabOrder.changed")
     /// Chapters first: they show only for a file that has them, and the panel then opens on
     /// the playing chapter. A saved order without them gets them at the end.
-    static let defaultOrder: [SceneTab] = [.chapters, .scene, .info, .upNext, .watchParty]
+    static let defaultOrder: [SceneTab] = [.chapters, .autoSync, .scene, .info, .upNext, .watchParty]
+    static let defaultDisabledTabs: Set<SceneTab> = [.autoSync]
 
     static func stableID(for tab: SceneTab) -> String {
         switch tab {
         case .chapters: return "chapters"
+        case .autoSync: return "auto_sync"
         case .scene: return "scene"
         case .info: return "info"
         case .upNext: return "up_next"
@@ -10869,7 +11432,7 @@ enum TVSceneTabOrder {
     static func disabledTabs(in settings: UserDefaults = ProfileSettings.current) -> Set<SceneTab> {
         guard let data = settings.data(forKey: SettingsKey.sceneTabDisabled),
               let rawIDs = try? JSONDecoder().decode([String].self, from: data) else {
-            return []
+            return defaultDisabledTabs
         }
         return Set(rawIDs.compactMap { sceneTab(for: $0) })
     }
@@ -10914,7 +11477,9 @@ enum TVSceneTabOrder {
 
     static func resetToDefaults(in settings: UserDefaults = ProfileSettings.current) {
         if let orderData = try? JSONEncoder().encode(defaultOrder.map { stableID(for: $0) }),
-           let disabledData = try? JSONEncoder().encode([String]()) {
+           let disabledData = try? JSONEncoder().encode(
+               defaultOrder.filter { defaultDisabledTabs.contains($0) }.map { stableID(for: $0) }
+           ) {
             settings.set(orderData, forKey: SettingsKey.sceneTabOrder)
             settings.set(disabledData, forKey: SettingsKey.sceneTabDisabled)
         }
@@ -10925,6 +11490,7 @@ enum TVSceneTabOrder {
     private static func sceneTab(for rawID: String) -> SceneTab? {
         switch rawID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "chapters": return .chapters
+        case "auto_sync", "autosync": return .autoSync
         case "scene", "insight", "in_sight": return .scene
         case "info": return .info
         case "up_next", "up next", "upnext": return .upNext
@@ -11346,7 +11912,7 @@ private struct TVHeroView: View {
                     .foregroundColor(.white)
             }
 
-            TVHeroMetaLine(meta: meta, episodeLine: episodeLine)
+            TVHeroMetaLine(meta: meta, episodeLine: episodeLine, continueItem: continueItem)
 
             if let continueItem {
                 Text(continueItem.isUpNextEntry ? continueItem.upNextBadgeText : continueItem.remainingText.uppercased())
@@ -11400,6 +11966,9 @@ extension TVHeroView: Equatable {
             && lhs.continueItem?.meta.id == rhs.continueItem?.meta.id
             && lhs.continueItem?.episodeLabel == rhs.continueItem?.episodeLabel
             && lhs.continueItem?.remainingText == rhs.continueItem?.remainingText
+            && lhs.continueItem?.episodeVideo?.rating == rhs.continueItem?.episodeVideo?.rating
+            && lhs.continueItem?.season == rhs.continueItem?.season
+            && lhs.continueItem?.episode == rhs.continueItem?.episode
     }
 }
 
@@ -12741,12 +13310,37 @@ private struct TVHeroMetaLine: View {
     /// "S1 E3 · Title" for a series in progress; replaces the type/runtime
     /// items so the line reads "S1 E3 · Title • Crime • 2026–".
     var episodeLine: String? = nil
+    var continueItem: ContinueWatchingItem? = nil
     @AppStorage(SettingsKey.showFullDates) private var showFullDates = true
     @AppStorage(SettingsKey.homeHeroRatingSource) private var homeHeroRatingSource = "imdb"
+    @AppStorage(SettingsKey.continueWatchingEpisodeRatings) private var continueWatchingEpisodeRatings = true
     @State private var fetchedRatings: [NuvioExternalRating]?
     /// Which title/source `fetchedRatings` belong to, so a reused view never
     /// shows the previous title's scores.
     @State private var fetchedRatingsKey: String?
+
+    private var targetEpisodeVideo: NuvioVideo? {
+        guard continueWatchingEpisodeRatings, meta.isSeries, let continueItem else { return nil }
+        if let video = continueItem.episodeVideo, video.rating != nil {
+            return video
+        }
+        if let numbers = continueItem.episodeNumbers {
+            if let video = meta.videos?.first(where: { $0.season == numbers.season && $0.episode == numbers.episode }) {
+                return video
+            }
+        }
+        return continueItem.episodeVideo
+    }
+
+    private var episodeRatingsIdentifier: String? {
+        guard continueWatchingEpisodeRatings, meta.isSeries, let continueItem,
+              let numbers = continueItem.episodeNumbers else { return nil }
+        if let video = targetEpisodeVideo {
+            return meta.canonicalEpisodeStreamId(for: video)
+        }
+        let baseId = NuvioMeta.canonicalImdbID(from: meta.imdbId ?? meta.id) ?? meta.streamId
+        return "\(baseId):\(numbers.season):\(numbers.episode)"
+    }
 
     var body: some View {
         let values = [
@@ -12757,23 +13351,50 @@ private struct TVHeroMetaLine: View {
         ].compactMap { $0 }.filter { !$0.isEmpty }
 
         let badge = meta.statusBadgeLabel
+        let isEpisodeMode = episodeRatingsIdentifier != nil
+        let episodeId = episodeRatingsIdentifier
         // Same key as the ratings cache: enrichment can add an IMDb id to a
         // kitsu:/tmdb: item, which must re-run the lookup below.
-        let ratingsKey = "\(AddonRatingsService.homeHeroRatingsKey(for: meta))-\(homeHeroRatingSource)"
+        let ratingsKey = isEpisodeMode
+            ? "\(episodeId!)-\(homeHeroRatingSource)"
+            : "\(AddonRatingsService.homeHeroRatingsKey(for: meta))-\(homeHeroRatingSource)"
         let fetched = fetchedRatingsKey == ratingsKey ? fetchedRatings : nil
-        let cached = AddonRatingsService.cachedHomeHeroRatings(for: meta)
+        let cached = isEpisodeMode
+            ? episodeId.flatMap { HomeHeroRatingsCache.shared.cachedRatings(for: $0) }
+            : AddonRatingsService.cachedHomeHeroRatings(for: meta)
         let showsAllRatings = AddonRatingsService.heroShowsAllRatings(homeHeroRatingSource)
-        let ratingBadges = showsAllRatings
-            ? TvRatingBadge.badges(from: AddonRatingsService.heroDisplayRatings(for: meta, fetched: fetched))
-            : []
+        let ratingBadges: [TvRatingBadge] = {
+            guard showsAllRatings else { return [] }
+            if isEpisodeMode {
+                return TvRatingBadge.badges(from: AddonRatingsService.heroEpisodeDisplayRatings(for: meta, video: targetEpisodeVideo, fetched: fetched ?? cached))
+            } else {
+                return TvRatingBadge.badges(from: AddonRatingsService.heroDisplayRatings(for: meta, fetched: fetched))
+            }
+        }()
         // Still waiting for MDBList/add-on scores: keep the ratings line.
         let ratingsPending = showsAllRatings && fetched == nil && cached == nil
-        let effectiveRatings = (meta.externalRatings?.isEmpty == false ? meta.externalRatings : nil)
-            ?? nonEmpty(fetched)
-            ?? nonEmpty(cached)
-        let rating = showsAllRatings
-            ? nil
-            : AddonRatingsService.heroRatingString(for: meta, source: homeHeroRatingSource, ratings: effectiveRatings)
+        let rating: String? = {
+            if showsAllRatings {
+                return nil
+            } else if isEpisodeMode {
+                let epEffective = nonEmpty(fetched) ?? nonEmpty(cached)
+                return AddonRatingsService.heroEpisodeRatingString(
+                    for: meta,
+                    video: targetEpisodeVideo,
+                    source: homeHeroRatingSource,
+                    ratings: epEffective
+                )
+            } else {
+                let effectiveRatings = (meta.externalRatings?.isEmpty == false ? meta.externalRatings : nil)
+                    ?? nonEmpty(fetched)
+                    ?? nonEmpty(cached)
+                return AddonRatingsService.heroRatingString(
+                    for: meta,
+                    source: homeHeroRatingSource,
+                    ratings: effectiveRatings
+                )
+            }
+        }()
         // Movies have no status badge, so their rating would sit alone on the
         // second line; ride it on the primary line right after the date instead.
         let isMovie = !meta.isSeries
@@ -12827,17 +13448,36 @@ private struct TVHeroMetaLine: View {
             }
         }
         .task(id: ratingsKey) {
-            guard AddonRatingsService.heroNeedsFetchedRatings(source: homeHeroRatingSource, meta: meta) else { return }
-            if let cached = AddonRatingsService.cachedHomeHeroRatings(for: meta) {
-                // Keep them here too, so the row survives the cache entry expiring.
-                fetchedRatings = cached
+            if isEpisodeMode, let episodeId {
+                if let cached = HomeHeroRatingsCache.shared.cachedRatings(for: episodeId) {
+                    fetchedRatings = cached
+                    fetchedRatingsKey = ratingsKey
+                    return
+                }
+                if let tmdbId = meta.tmdbId {
+                    await SeriesGraphRatingsService.shared.registerTmdbId(tmdbId, forImdbId: meta.id)
+                    if let imdb = meta.imdbId {
+                        await SeriesGraphRatingsService.shared.registerTmdbId(tmdbId, forImdbId: imdb)
+                    }
+                }
+                let ratings = await AddonRatingsService.fetchRatingsForEpisode(episodeId: episodeId)
+                guard !Task.isCancelled else { return }
+                HomeHeroRatingsCache.shared.setRatings(ratings, for: episodeId)
+                fetchedRatings = ratings
                 fetchedRatingsKey = ratingsKey
-                return
+            } else {
+                guard AddonRatingsService.heroNeedsFetchedRatings(source: homeHeroRatingSource, meta: meta) else { return }
+                if let cached = AddonRatingsService.cachedHomeHeroRatings(for: meta) {
+                    // Keep them here too, so the row survives the cache entry expiring.
+                    fetchedRatings = cached
+                    fetchedRatingsKey = ratingsKey
+                    return
+                }
+                let ratings = await AddonRatingsService.fetchHomeHeroRatings(for: meta)
+                guard !Task.isCancelled else { return }
+                fetchedRatings = ratings
+                fetchedRatingsKey = ratingsKey
             }
-            let ratings = await AddonRatingsService.fetchHomeHeroRatings(for: meta)
-            guard !Task.isCancelled else { return }
-            fetchedRatings = ratings
-            fetchedRatingsKey = ratingsKey
         }
     }
 

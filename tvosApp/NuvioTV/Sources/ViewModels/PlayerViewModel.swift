@@ -198,6 +198,9 @@ class PlayerViewModel: ObservableObject {
 
     @Published var status: PlayerStatus = .idle {
         didSet {
+            if status == .playing {
+                tryPresentContentWarningsIfReady()
+            }
             if case .error = status, oldValue != status {
                 PlaybackTimelineRecorder.record(.playbackError, engine: activeEngineKind)
             }
@@ -245,6 +248,27 @@ class PlayerViewModel: ObservableObject {
     @Published var discTitles: [PlaybackDiscTitleInfo] = []
     @Published var selectedDiscTitleId: Int? = nil
     @Published var playbackSpeed: PlaybackSpeed = .normal
+    /// Remote gestures: switched on in the player's Gestures tab.
+    @Published var areGesturesEnabled = PlayerGestureSettings.isEnabled()
+    /// Expert mode: one's own gestures, shapes and sensitivity (off: the ready-made gestures).
+    @Published var isGestureExpert = PlayerGestureSettings.isExpert()
+    /// The recognizer's settings from the Gestures tab's sensitivity.
+    @Published var gestureTuning = PlayerGestureSettings.activeSensitivity().tuning
+    /// Shapes of one's own, made in the Gestures tab (none with Expert mode off).
+    @Published var customGestureShapes = PlayerGestureSettings.activeShapes()
+    /// The gesture layer holds the remote (playing, controls hidden): the touch taps and edge
+    /// clicks below leave it to that layer, which plays the built-in ones itself.
+    var isGestureCaptureActive = false
+    /// Where the gesture layers (the player's, and the recorder in the Gestures tab) get the
+    /// pad's absolute positions, by name.
+    var gesturePadObservers: [String: (Double, Double) -> Void] = [:]
+    /// With the controls shown: the sides whose touch tap waits for a bound double tap (the gesture
+    /// layer seeks for it).
+    var passiveGestureTapSides: Set<PadSide> = []
+    /// The button of a hold seek a gesture started, ended when that button is released.
+    var gestureHoldSeekButton: RemoteButton?
+    /// The subtitle a gesture switched off, switched back on by the same gesture.
+    var gestureLastSubtitleID: String?
     @Published var seekStepSeconds: Int = PlayerSeekSettings.current
     @Published var qualities: [QualityOption] = [.auto]
     @Published var currentQuality: QualityOption = .auto
@@ -283,9 +307,28 @@ class PlayerViewModel: ObservableObject {
     /// Live channels use a sliding timeline rather than a finite media duration.
     /// Expose that distinction so transport chrome can avoid a misleading scrubber.
     @Published private(set) var isLiveStream = false
+    @Published private(set) var contentWarnings: [PlayerContentWarning] = []
+    @Published private(set) var showContentWarnings = false
     /// Every external subtitle the stream offered (all languages), browsable in
     /// the player's subtitle panel and loaded into mpv on demand.
     @Published var availableExternalSubtitles: [NuvioSubtitle] = []
+    /// AutoSubSync per add-on subtitle URL (see `SubtitleAutoSync`).
+    @Published private(set) var subtitleAutoSyncStates: [String: SubtitleAutoSyncState] = [:]
+    /// What the last Auto Sync run of each add-on subtitle looked at (the Auto Sync tab).
+    @Published private(set) var subtitleAutoSyncReports: [String: SubtitleAutoSyncReport] = [:]
+    /// Add-on subtitles the viewer switched back to their own timing.
+    @Published private(set) var subtitleAutoSyncOriginals: Set<String> = []
+    /// Synced copy URL → the add-on subtitle URL it was made from.
+    private var subtitleAutoSyncCopies: [String: String] = [:]
+    /// The playing file as Auto Sync reads it, resolved per load.
+    private var subtitleAutoSyncSourceTask: Task<SubtitleAutoSyncSource?, Never>?
+    private var subtitleAutoSyncPlayback: (url: URL, headers: [String: String], fileKey: String, isLive: Bool)?
+    private var subtitleAutoSyncTasks: [String: Task<Void, Never>] = [:]
+    /// Sync by Audio: what it is doing, the run, and the audio heard in this
+    /// playback (kept for a restart).
+    @Published var audioSyncStatus: AudioSyncStatus?
+    var audioSyncRun: AudioSyncRun?
+    var audioSyncHeard: (generation: UInt64, listener: AudioSyncListener)?
     /// True while installed subtitle add-ons are still returning results.
     @Published var isLoadingExternalSubtitles: Bool = false
     /// Current mpv `sub-delay`, in milliseconds. Per-session, not persisted.
@@ -401,8 +444,8 @@ class PlayerViewModel: ObservableObject {
     let postPlayController = PostPlayRecommendationController()
 
     var isNextEpisodeMetadataResolved: Bool {
-        guard let meta = activeMeta, meta.isSeries else { return true }
-        return !seriesEpisodes.isEmpty || currentEpisodeVideo != nil
+        guard let meta = activeMeta, meta.isSeries, !isStandalonePlaybackSession else { return true }
+        return !seriesEpisodes.isEmpty
     }
     private var isAdvanceInFlight: Bool = false
     private var advanceGeneration: UInt64 = 0
@@ -478,6 +521,11 @@ class PlayerViewModel: ObservableObject {
 
     private var pollTimer: Timer?
     private var controlsHideTimer: Timer?
+    private var contentWarningsTask: Task<Void, Never>?
+    private var contentWarningsIdentity: String?
+    private var contentWarningsCandidateSignature: String?
+    private var contentWarningsGeneration: UInt64 = 0
+    private var didPresentContentWarningsForIdentity = false
     private var hasLoaded = false
     private var didShutdown = false
     private(set) var watchPartyPlayerBridge: WatchPartyPlayerBridge?
@@ -873,6 +921,7 @@ class PlayerViewModel: ObservableObject {
                     }
                 }
                 self.tick()
+                self.tryPresentContentWarningsIfReady()
             }
         }
         playerController.onPlaybackSuspended = suspend
@@ -1085,6 +1134,9 @@ class PlayerViewModel: ObservableObject {
         subtitleFetchTask?.cancel()
         scrubThumbnailTask?.cancel()
         preResolvedNextEpisodeTask?.cancel()
+        if let url = preResolvedNextStream?.url {
+            AetherEngine.discardPrewarmedSource(url: url)
+        }
         if let token = preResolvedStreamWarmToken {
             PlaybackStreamCacheManager.discardRangeProbeMemo(token: token)
         }
@@ -1361,6 +1413,11 @@ class PlayerViewModel: ObservableObject {
             request,
             requiresMPVAudioControls: audioAmplificationDb > 0
         )
+        prepareSubtitleAutoSync(
+            url: url,
+            headers: httpHeaders,
+            fileKey: canonicalKey + "|" + (filename ?? url.lastPathComponent)
+        )
 
         // Launch asynchronous storyboard resolver (direct URL or community trickplay)
         trickplayResolveTask?.cancel()
@@ -1607,6 +1664,7 @@ class PlayerViewModel: ObservableObject {
         } else if !meta.isSeries {
             self.currentEpisodeVideo = nil
         }
+        reconcileContentWarningsForCurrentItem()
         if !isStandalonePlaybackSession {
             let completionIdentity = playbackCompletionIdentity(for: meta)
             if beginsNewPlaybackCompletionSession {
@@ -1892,6 +1950,182 @@ class PlayerViewModel: ObservableObject {
         }
     }
 
+    private func reconcileContentWarningsForCurrentItem() {
+        guard !didShutdown, let meta = activeMeta else {
+            contentWarningsGeneration &+= 1
+            contentWarningsTask?.cancel()
+            contentWarningsTask = nil
+            contentWarningsIdentity = nil
+            contentWarningsCandidateSignature = nil
+            contentWarnings = []
+            showContentWarnings = false
+            didPresentContentWarningsForIdentity = false
+            return
+        }
+
+        let parentIdentity = Self.imdbID(in: meta.imdbId) ?? meta.id
+        let episodeIdentity: String
+        if meta.isSeries {
+            if let episode = currentEpisodeVideo, episode.season > 0, episode.episode > 0 {
+                episodeIdentity = "s\(episode.season)e\(episode.episode)"
+            } else if let numbers = activeEpisodeNumbers, numbers.season > 0, numbers.episode > 0 {
+                episodeIdentity = "s\(numbers.season)e\(numbers.episode)"
+            } else {
+                episodeIdentity = currentEpisodeVideo?.id ?? "unknown-episode"
+            }
+        } else {
+            episodeIdentity = "movie"
+        }
+        let identity = "\(parentIdentity.lowercased())|\(episodeIdentity.lowercased())"
+        let episodeID = currentEpisodeVideo?.id
+        let directIMDbIDs = Self.directContentWarningsIMDbIDs(for: meta, episodeID: episodeID)
+        let tmdbIDs = Self.contentWarningsTMDBIDs(for: meta, episodeID: episodeID)
+        let candidateSignature = "imdb:\(directIMDbIDs.joined(separator: ","))|tmdb:\(tmdbIDs.map(String.init).joined(separator: ","))"
+        let identityChanged = identity != contentWarningsIdentity
+        let candidatesChanged = candidateSignature != contentWarningsCandidateSignature
+
+        guard identityChanged || candidatesChanged else {
+            tryPresentContentWarningsIfReady()
+            return
+        }
+        if !identityChanged, didPresentContentWarningsForIdentity {
+            contentWarningsCandidateSignature = candidateSignature
+            return
+        }
+
+        contentWarningsGeneration &+= 1
+        let generation = contentWarningsGeneration
+        contentWarningsTask?.cancel()
+        contentWarningsTask = nil
+        contentWarningsIdentity = identity
+        contentWarningsCandidateSignature = candidateSignature
+        contentWarnings = []
+        showContentWarnings = false
+        if identityChanged {
+            didPresentContentWarningsForIdentity = false
+        }
+
+        contentWarningsTask = Task { [weak self] in
+            guard let self else { return }
+            var triedIMDbIDs = Set<String>()
+
+            for imdbID in directIMDbIDs {
+                guard self.isCurrentContentWarningsRequest(identity: identity, generation: generation) else { return }
+                guard triedIMDbIDs.insert(imdbID).inserted else { continue }
+                let warnings = await ContentWarningsRepository.shared.warnings(for: imdbID)
+                guard self.isCurrentContentWarningsRequest(identity: identity, generation: generation) else { return }
+                guard !warnings.isEmpty else { continue }
+                self.contentWarnings = warnings
+                self.contentWarningsTask = nil
+                self.tryPresentContentWarningsIfReady()
+                return
+            }
+
+            guard self.isCurrentContentWarningsRequest(identity: identity, generation: generation) else { return }
+            if let apiKey = TmdbDetailsService.currentApiKey {
+                let client = CalendarTmdb.Client(apiKey: apiKey)
+                for tmdbID in tmdbIDs {
+                    guard self.isCurrentContentWarningsRequest(identity: identity, generation: generation) else { return }
+                    do {
+                        let resolved = try await client.imdbId(
+                            tmdbId: tmdbID,
+                            kind: meta.isSeries ? .series : .movie
+                        )
+                        guard self.isCurrentContentWarningsRequest(identity: identity, generation: generation) else { return }
+                        guard let imdbID = Self.imdbID(in: resolved), triedIMDbIDs.insert(imdbID).inserted else {
+                            continue
+                        }
+
+                        let warnings = await ContentWarningsRepository.shared.warnings(for: imdbID)
+                        guard self.isCurrentContentWarningsRequest(identity: identity, generation: generation) else { return }
+                        guard !warnings.isEmpty else { continue }
+                        self.contentWarnings = warnings
+                        self.contentWarningsTask = nil
+                        self.tryPresentContentWarningsIfReady()
+                        return
+                    } catch {
+                        guard self.isCurrentContentWarningsRequest(identity: identity, generation: generation) else { return }
+                    }
+                }
+            }
+
+            guard self.isCurrentContentWarningsRequest(identity: identity, generation: generation) else { return }
+            self.contentWarningsTask = nil
+        }
+    }
+
+    private static func directContentWarningsIMDbIDs(for meta: NuvioMeta, episodeID: String?) -> [String] {
+        var seen = Set<String>()
+        return [imdbID(in: meta.imdbId), imdbID(in: meta.id), imdbID(in: episodeID)]
+            .compactMap { $0 }
+            .filter { seen.insert($0).inserted }
+    }
+
+    private static func contentWarningsTMDBIDs(for meta: NuvioMeta, episodeID: String?) -> [Int] {
+        var ids: [Int] = []
+        if let parentID = meta.tmdbId {
+            ids.append(parentID)
+        }
+        if let parentID = tmdbID(in: meta.id), !ids.contains(parentID) {
+            ids.append(parentID)
+        }
+        if let episodeID = episodeID.flatMap(tmdbID(in:)), !ids.contains(episodeID) {
+            ids.append(episodeID)
+        }
+        return ids
+    }
+
+    private func isCurrentContentWarningsRequest(identity: String, generation: UInt64) -> Bool {
+        !Task.isCancelled
+            && !didShutdown
+            && contentWarningsIdentity == identity
+            && contentWarningsGeneration == generation
+    }
+
+    private func tryPresentContentWarningsIfReady() {
+        guard !didShutdown,
+              !didPresentContentWarningsForIdentity,
+              !contentWarnings.isEmpty,
+              status == .playing,
+              !showSettingsPanel,
+              !showScenePanel,
+              !isSceneDetailVisible,
+              sidePanel == nil,
+              hasRenderedFirstFrame || (isLiveStream && livePlaybackHasStarted) else { return }
+
+        didPresentContentWarningsForIdentity = true
+        showControls = true
+        cancelControlsHideTimer()
+        showContentWarnings = true
+    }
+
+    func contentWarningsDidDismiss() {
+        guard showContentWarnings else { return }
+        showContentWarnings = false
+        if status == .playing, showControls {
+            scheduleControlsHide()
+        }
+    }
+
+    private static func imdbID(in value: String?) -> String? {
+        guard let value,
+              let range = value.range(of: #"tt\d+"#, options: [.regularExpression, .caseInsensitive]) else {
+            return nil
+        }
+        return value[range].lowercased()
+    }
+
+    private static func tmdbID(in value: String) -> Int? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.allSatisfy(\.isNumber) { return Int(trimmed) }
+        guard let range = trimmed.range(
+            of: #"tmdb[:/|](\d+)"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) else { return nil }
+        let token = String(trimmed[range])
+        return token.split(whereSeparator: { !$0.isNumber }).last.flatMap { Int($0) }
+    }
+
     // MARK: - Next episode
 
     /// Supplies the series context and the resolver that turns a next episode
@@ -1917,13 +2151,30 @@ class PlayerViewModel: ObservableObject {
             self.allowsManualEpisodeSelection = false
             nextEpisode = nil
             clearNextEpisodeCard()
+            reconcileContentWarningsForCurrentItem()
             return
         }
         seriesEpisodes = episodes
-        if currentEpisodeVideo?.id != current?.id {
+        let resolvedCurrentEpisode: NuvioVideo?
+        if let current {
+            resolvedCurrentEpisode = current
+        } else if activeMeta?.isSeries == true, let existingEpisode = currentEpisodeVideo {
+            if let numbers = activeEpisodeNumbers,
+               existingEpisode.season != numbers.season || existingEpisode.episode != numbers.episode {
+                resolvedCurrentEpisode = nil
+            } else {
+                // Keep the episode inferred from the active stream when the
+                // playlist configuration has no current-item value.
+                resolvedCurrentEpisode = existingEpisode
+            }
+        } else {
+            resolvedCurrentEpisode = nil
+        }
+        if currentEpisodeVideo?.id != resolvedCurrentEpisode?.id {
             lastAdvancedEpisodeId = nil
         }
-        currentEpisodeVideo = current
+        currentEpisodeVideo = resolvedCurrentEpisode
+        reconcileContentWarningsForCurrentItem()
         autoPlayNextEnabled = autoPlayEnabled
         autoPlayNextCountdownSeconds = max(1, autoPlayCountdownSeconds)
         resolveNextStream = resolver
@@ -1937,7 +2188,7 @@ class PlayerViewModel: ObservableObject {
         nextEpisodeAutoHideDeadline = nil
         nextEpisodeAutoPlayDeadline = nil
         isAutoPlayCancelled = false
-        nextEpisode = Self.nextEpisode(after: current, in: episodes)
+        nextEpisode = Self.nextEpisode(after: resolvedCurrentEpisode, in: episodes)
 
         if let meta = activeMeta, let urlString = activeStreamURL, let url = URL(string: urlString) {
             let context = ActivePlaybackContext(
@@ -1950,7 +2201,7 @@ class PlayerViewModel: ObservableObject {
                 externalSubtitles: pendingExternalSubtitles,
                 resumeFrom: pendingResumeSeconds,
                 episodes: episodes,
-                currentEpisode: current,
+                currentEpisode: resolvedCurrentEpisode,
                 autoPlayNextEnabled: autoPlayEnabled,
                 autoPlayNextCountdownSeconds: autoPlayCountdownSeconds,
                 playbackOrigin: activePlaybackOrigin,
@@ -2220,12 +2471,19 @@ class PlayerViewModel: ObservableObject {
                     profileID: profileID,
                     token: token
                 )
+                _ = await AetherEngine.prewarm(
+                    url: prepared.url,
+                    httpHeaders: prepared.httpHeaders
+                )
             }
             return prepared
         }
     }
 
     private func cancelPreResolvedNextEpisode() {
+        if let url = preResolvedNextStream?.url {
+            AetherEngine.discardPrewarmedSource(url: url)
+        }
         preResolvedNextEpisodeTask?.cancel()
         preResolvedNextEpisodeTask = nil
         preResolvedNextStream = nil
@@ -3687,6 +3945,7 @@ class PlayerViewModel: ObservableObject {
             isAdvancingEpisode = false
             markLoadStarted()
         }
+        tryPresentContentWarningsIfReady()
 
         let engineStatus: PlayerStatus
         if isFailingOver || isReloadingStream || isSwitchingSource {
@@ -3956,6 +4215,8 @@ class PlayerViewModel: ObservableObject {
                 isNativelyRenderedSubtitle: track.isNativelyRenderedSubtitle
             )
         }
+        subs = SubtitleAutoSyncTracks.present(
+            subs, copies: subtitleAutoSyncCopies, originals: subtitleAutoSyncOriginals)
         if let selectedURL = pendingSelectedExternalSubtitleURL,
            let selectedTrack = subs.first(where: { $0.externalFilename == selectedURL }) {
             subs = subs.map { var t = $0; t.isSelected = (t.id == selectedTrack.id); return t }
@@ -4252,7 +4513,7 @@ class PlayerViewModel: ObservableObject {
             switch self.activeEngineKind {
             case .aether:
                 guard let controller = self.aetherController else { throw WatchPartyPlayerBridgeError.notReady }
-                await controller.engine.seek(to: Double(target) / 1000)
+                await controller.engine.seek(to: Double(target) / 1000, exact: true)
             case .mpv:
                 try self.playerController.beginWatchPartySeek(target)
             }
@@ -4491,6 +4752,15 @@ class PlayerViewModel: ObservableObject {
         detachWatchPartyPlayerBridge()
         cancelPendingAdvanceResolution()
         didShutdown = true
+        resetAudioSync()
+        contentWarningsGeneration &+= 1
+        contentWarningsTask?.cancel()
+        contentWarningsTask = nil
+        contentWarningsIdentity = nil
+        contentWarningsCandidateSignature = nil
+        contentWarnings = []
+        showContentWarnings = false
+        didPresentContentWarningsForIdentity = false
         PlaybackTimelineRecorder.record(.playbackStopRequested, engine: activeEngineKind)
         pollTimer?.invalidate()
         pollTimer = nil
@@ -4599,7 +4869,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     func seekToChapter(_ chapter: PlaybackChapter) {
-        seek(to: chapter.startSeconds)
+        seek(to: chapter.startSeconds, exact: true)
     }
 
     /// Whether the Chapters panel shows stills: seek previews are on and the player can make
@@ -4749,7 +5019,7 @@ class PlayerViewModel: ObservableObject {
         SeekPreviewDiagnostics.shared.updateChapters("")
     }
 
-    func seek(to seconds: Double) {
+    func seek(to seconds: Double, exact: Bool = false) {
         guard !isLiveStream, seconds.isFinite else { return }
         recordWatchPartyTransportIntent()
         if watchPartyPlayerBridge != nil {
@@ -4762,9 +5032,9 @@ class PlayerViewModel: ObservableObject {
             ? min(max(seconds, 0), max(duration - 0.25, 0))
             : max(seconds, 0)
         let prevCurrent = time.current
-        seekWatchdogLog("[SeekWatchdog][PlayerVM] 👆 User seek to \(String(format: "%.3f", seconds))s (target: \(String(format: "%.3f", target))s, current: \(String(format: "%.3f", time.current))s, duration: \(String(format: "%.3f", duration))s)")
-        screensaverDebugLog("[ScreensaverDebug][PlayerVM] seek(to: \(seconds)) called: target=\(target), prevCurrent=\(time.current), duration=\(duration)")
-        engine.seekToMs(Int64(target * 1000))
+        seekWatchdogLog("[SeekWatchdog][PlayerVM] 👆 User seek to \(String(format: "%.3f", seconds))s (target: \(String(format: "%.3f", target))s, current: \(String(format: "%.3f", time.current))s, duration: \(String(format: "%.3f", duration))s, exact: \(exact))")
+        screensaverDebugLog("[ScreensaverDebug][PlayerVM] seek(to: \(seconds), exact: \(exact)) called: target=\(target), prevCurrent=\(time.current), duration=\(duration)")
+        engine.seekToMs(Int64(target * 1000), exact: exact)
         recordCommittedSeek(to: target, previous: prevCurrent, duration: duration)
     }
 
@@ -4857,7 +5127,7 @@ class PlayerViewModel: ObservableObject {
             postPlayController.showImmediately()
         }
         let targetTime = postCredits?.startTime ?? interval.endTime
-        seek(to: min(targetTime + 0.25, max(time.duration - 0.5, targetTime)))
+        seek(to: min(targetTime + 0.25, max(time.duration - 0.5, targetTime)), exact: true)
         showControls = false
         scheduleControlsHide()
     }
@@ -5648,12 +5918,26 @@ class PlayerViewModel: ObservableObject {
         case .undecided:
             let adx = abs(dx), ady = abs(dy)
             guard max(adx, ady) >= 15 else { return }
-            suppressMoveBriefly()
             if ady > adx {
-                touchIntent = .consumed
-                // Vertical swipe: reveal controls. (Info panel is a later port.)
-                revealControls()
+                if showPauseOverlay {
+                    suppressMoveBriefly()
+                    touchIntent = .consumed
+                    revealControls()
+                } else if dy > 0 {
+                    suppressMoveBriefly()
+                    touchIntent = .consumed
+                    if isSceneEnabled {
+                        openScene()
+                    } else {
+                        revealControls()
+                    }
+                } else if !showControls {
+                    suppressMoveBriefly()
+                    touchIntent = .consumed
+                    revealControls()
+                }
             } else {
+                suppressMoveBriefly()
                 // While playing: horizontal swipes are suppressed (no swipe seeking, only tap seek).
                 // While paused: enter scrub only when playback was already paused when the touch began.
                 guard status == .paused,
@@ -5678,8 +5962,13 @@ class PlayerViewModel: ObservableObject {
         guard !isHoldingSeek, pendingSeekDelta == 0, !showScenePanel, !isSceneDetailVisible else { return }
         if touchIntent == .scrub {
             endScrubGesture()
-        } else if touchIntent == .consumed || max(abs(dx), abs(dy)) >= 15 {
+        } else if touchIntent == .consumed {
             suppressMoveBriefly(0.3)
+        } else if max(abs(dx), abs(dy)) >= 15 {
+            let isUpwardFocusSwipe = showControls && isTimelineFocused && dy < 0 && abs(dy) > abs(dx)
+            if !isUpwardFocusSwipe {
+                suppressMoveBriefly(0.3)
+            }
         }
         scrubEngagedThisStroke = false
         touchBeganWhileStatus = nil
@@ -5776,6 +6065,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     func dpadSample(x: Double, y: Double) {
+        for observer in gesturePadObservers.values { observer(x, y) }
         guard !showScenePanel, !isSceneDetailVisible else { return }
         if isScrubbing {
             wheelSample(x: x, y: y)
@@ -5797,11 +6087,11 @@ class PlayerViewModel: ObservableObject {
             gcTouchDown = false
             let dur = Date().timeIntervalSince(gcTouchStartTime)
             let lastX = gcLastTouchX ?? gcTouchStartX
-            if dur < 0.5, !gcPanFiredThisTouch, !gcDidHandlePressAsSeek, !gcButtonAPressed {
+            if dur < 0.5, !gcPanFiredThisTouch, !gcDidHandlePressAsSeek, !gcButtonAPressed, !isGestureCaptureActive {
                 if canPerformDiscreteSeek, lastX < -0.45 {
-                    handleMoveSeek(direction: .left)
+                    if !passiveGestureTapSides.contains(.left) { handleMoveSeek(direction: .left) }
                 } else if canPerformDiscreteSeek, lastX > 0.45 {
-                    handleMoveSeek(direction: .right)
+                    if !passiveGestureTapSides.contains(.right) { handleMoveSeek(direction: .right) }
                 } else {
                     remoteTapped()
                 }
@@ -5819,7 +6109,7 @@ class PlayerViewModel: ObservableObject {
             gcButtonAPressedStartTime = Date()
             gcButtonAPressX = currentTouchX
 
-            if canPerformDiscreteSeek, abs(currentTouchX) > 0.35 {
+            if canPerformDiscreteSeek, abs(currentTouchX) > 0.35, !isGestureCaptureActive {
                 gcHoldSeekTimer?.invalidate()
                 let direction: MoveCommandDirection = currentTouchX < 0 ? .left : .right
                 let timer = Timer(timeInterval: 0.35, repeats: false) { [weak self] _ in
@@ -5841,7 +6131,7 @@ class PlayerViewModel: ObservableObject {
             gcHoldSeekTimer?.invalidate()
             gcHoldSeekTimer = nil
 
-            if isHoldingSeek {
+            if isHoldingSeek, !isGestureCaptureActive {
                 stopRepeatingSkip()
                 gcDidHandlePressAsSeek = true
                 Task { @MainActor in
@@ -5852,7 +6142,7 @@ class PlayerViewModel: ObservableObject {
             }
 
             let pressX = gcButtonAPressX ?? currentTouchX
-            if canPerformDiscreteSeek, abs(pressX) > 0.35 {
+            if canPerformDiscreteSeek, abs(pressX) > 0.35, !isGestureCaptureActive {
                 if !gcDidHandlePressAsSeek {
                     gcDidHandlePressAsSeek = true
                     if pressX < -0.35 {
@@ -6185,6 +6475,159 @@ class PlayerViewModel: ObservableObject {
         engine.setAudioProcessing(dialogue: enhanceDialogueMode, reduceLoud: isReduceLoudSoundsActive)
     }
 
+    // MARK: - AutoSubSync
+
+    /// A new file: forget the last one's Auto Sync, and start reading this one's subtitle index
+    /// when Auto Sync is on (the Auto Sync tab resolves it on demand otherwise).
+    private func prepareSubtitleAutoSync(url: URL, headers: [String: String], fileKey: String) {
+        subtitleAutoSyncSourceTask?.cancel()
+        subtitleAutoSyncSourceTask = nil
+        subtitleAutoSyncTasks.values.forEach { $0.cancel() }
+        subtitleAutoSyncTasks = [:]
+        subtitleAutoSyncStates = [:]
+        subtitleAutoSyncReports = [:]
+        subtitleAutoSyncOriginals = []
+        subtitleAutoSyncCopies = [:]
+        resetAudioSync()
+        SeekPreviewDiagnostics.shared.updateSync("")
+        guard !isTrailerPlaybackSession else {
+            subtitleAutoSyncPlayback = nil
+            return
+        }
+        subtitleAutoSyncPlayback = (url, headers, fileKey, isLiveStream)
+        if SubtitleAutoSyncSettings.isEnabled(in: ProfileSettings.current) {
+            _ = subtitleAutoSyncSource(prefetch: true)
+        }
+    }
+
+    private func subtitleAutoSyncSource(prefetch: Bool) -> Task<SubtitleAutoSyncSource?, Never>? {
+        if let task = subtitleAutoSyncSourceTask { return task }
+        guard let playback = subtitleAutoSyncPlayback else { return nil }
+        let task = Task<SubtitleAutoSyncSource?, Never> {
+            let source = await SubtitleAutoSync.source(
+                playbackURL: playback.url, headers: playback.headers,
+                fileKey: playback.fileKey, isLive: playback.isLive)
+            if prefetch, let source { await SubtitleAutoSync.shared.prefetchIndex(for: source) }
+            return source
+        }
+        subtitleAutoSyncSourceTask = task
+        return task
+    }
+
+    /// Lines the add-on subtitle up once per file, when AutoSubSync is on. `force` (the
+    /// AutoSubSync tab's button) runs it anyway; pressed again, without the remembered answer.
+    private func startSubtitleAutoSyncIfNeeded(for subtitle: NuvioSubtitle, force: Bool = false) {
+        guard subtitleAutoSyncCopies[subtitle.url] == nil, !subtitle.url.hasPrefix("file:") else { return }
+        if !force {
+            guard SubtitleAutoSyncSettings.isEnabled(in: ProfileSettings.current),
+                  subtitleAutoSyncStates[subtitle.url] == nil else { return }
+        }
+        guard let sourceTask = subtitleAutoSyncSource(prefetch: false) else { return }
+        // Sync Now always checks again (a remembered answer has no details to show).
+        let useCache = !force
+        subtitleAutoSyncTasks[subtitle.url]?.cancel()
+        subtitleAutoSyncStates[subtitle.url] = .checking
+        let generation = sessionCoordinator.loadGeneration
+        let tolerance = SubtitleAutoSyncSettings.toleranceMs(in: ProfileSettings.current)
+        subtitleAutoSyncTasks[subtitle.url] = Task { @MainActor [weak self] in
+            let run: SubtitleAutoSyncRun
+            if let source = await sourceTask.value {
+                run = await SubtitleAutoSync.shared.sync(
+                    subtitle: subtitle, source: source, toleranceMs: tolerance, useCache: useCache, force: force)
+            } else {
+                run = SubtitleAutoSyncRun(
+                    outcome: .kept(.unsupportedSource),
+                    report: SubtitleAutoSyncReport(result: SubtitleAutoSyncIssue.unsupportedSource.message))
+                SeekPreviewDiagnostics.shared.updateSync("kept: unsupportedSource")
+            }
+            guard !Task.isCancelled, let self, self.sessionCoordinator.loadGeneration == generation else { return }
+            self.finishSubtitleAutoSync(subtitle, run: run, announce: force)
+        }
+    }
+
+    private func finishSubtitleAutoSync(_ subtitle: NuvioSubtitle, run: SubtitleAutoSyncRun, announce: Bool) {
+        subtitleAutoSyncTasks[subtitle.url] = nil
+        subtitleAutoSyncReports[subtitle.url] = run.report
+        switch run.outcome {
+        case .synced(let fileURL, let result):
+            subtitleAutoSyncStates[subtitle.url] = .synced(result)
+            let copy = NuvioSubtitle(
+                url: fileURL.absoluteString, language: subtitle.language,
+                label: subtitle.label, source: subtitle.source)
+            let isSelected = isExternalSubtitleSelected(subtitle)
+            // A copy from an earlier run of this subtitle steps aside for the new one.
+            subtitleAutoSyncCopies = subtitleAutoSyncCopies.filter { $0.value != subtitle.url }
+            subtitleAutoSyncCopies[copy.url] = subtitle.url
+            subtitleAutoSyncOriginals.remove(subtitle.url)
+            if let loaded = engine.subtitleTracks.first(where: { $0.externalFilename == copy.url }) {
+                if isSelected { engine.selectSubtitle(loaded.id) }
+            } else {
+                engine.addSubtitle(copy, select: isSelected)
+                addedExternalSubtitleURLs.insert(copy.url)
+            }
+            syncTracks()
+            if announce {
+                showPlayerToast(L10n.format(
+                    "subtitle_autosync_synced_toast", fallback: "Subtitles synced (%@)", result.shortLabel))
+            }
+        case .kept(let issue):
+            subtitleAutoSyncStates[subtitle.url] = .kept(issue)
+            if announce || (issue != .inSync && issue != .unsupportedSource) {
+                showPlayerToast("AutoSubSync: " + issue.message)
+            }
+        }
+    }
+
+    /// The add-on subtitle that is playing, if any.
+    var activeAddonSubtitle: NuvioSubtitle? {
+        guard let selected = subtitles.first(where: { $0.isSelected && !$0.externalFilename.isEmpty }) else { return nil }
+        return availableExternalSubtitles.first { $0.url == selected.externalFilename }
+    }
+
+    /// The Auto Sync tab's button: line the playing add-on subtitle up now.
+    func runSubtitleAutoSyncNow() {
+        guard let subtitle = activeAddonSubtitle else { return }
+        startSubtitleAutoSyncIfNeeded(for: subtitle, force: true)
+    }
+
+    /// Switches the playing add-on subtitle between its synced copy and its own timing.
+    func toggleSubtitleAutoSyncTiming() {
+        guard let subtitle = activeAddonSubtitle,
+              case .synced? = subtitleAutoSyncStates[subtitle.url],
+              let copyURL = subtitleAutoSyncCopies.first(where: { $0.value == subtitle.url })?.key else { return }
+        let toOriginal = !subtitleAutoSyncOriginals.contains(subtitle.url)
+        if toOriginal {
+            subtitleAutoSyncOriginals.insert(subtitle.url)
+        } else {
+            subtitleAutoSyncOriginals.remove(subtitle.url)
+        }
+        let target = toOriginal ? subtitle.url : copyURL
+        if let track = engine.subtitleTracks.first(where: { $0.externalFilename == target }) {
+            engine.selectSubtitle(track.id)
+        }
+        syncTracks()
+    }
+
+    func isSubtitleAutoSyncUsingOriginal(_ url: String) -> Bool {
+        subtitleAutoSyncOriginals.contains(url)
+    }
+
+    /// The note after an add-on subtitle in the subtitle list.
+    func subtitleAutoSyncNote(for url: String) -> String? {
+        switch subtitleAutoSyncStates[url] {
+        case .checking:
+            return "↻ …"
+        case .synced(let result):
+            return subtitleAutoSyncOriginals.contains(url)
+                ? "↻ " + L10n.string("player_subtitle_autosync_original", fallback: "Original timing")
+                : "↻ " + result.shortLabel
+        case .kept(.inSync):
+            return "✓ " + L10n.string("player_subtitle_autosync_in_sync_short", fallback: "In sync")
+        case .kept, nil:
+            return nil
+        }
+    }
+
     // MARK: - Track selection
 
     func selectSubtitle(_ track: SubtitleTrack, persist: Bool = true) {
@@ -6197,6 +6640,10 @@ class PlayerViewModel: ObservableObject {
         }
         PlaybackTimelineRecorder.record(.subtitleSelectionReturned, engine: activeEngineKind)
         subtitles = subtitles.map { var t = $0; t.isSelected = (t.id == track.id); return t }
+        if !track.externalFilename.isEmpty,
+           let subtitle = availableExternalSubtitles.first(where: { $0.url == track.externalFilename }) {
+            startSubtitleAutoSyncIfNeeded(for: subtitle)
+        }
         if persist {
             saveSubtitleSelection(track)
             didApplySavedSubtitleSelection = true
@@ -6233,6 +6680,7 @@ class PlayerViewModel: ObservableObject {
     /// otherwise `sub-add` it now and explicitly select that requested track.
     func selectExternalSubtitle(_ subtitle: NuvioSubtitle) {
         PlaybackTimelineRecorder.record(.externalSubtitleRequested, engine: activeEngineKind)
+        startSubtitleAutoSyncIfNeeded(for: subtitle)
         if let track = subtitles.first(where: { $0.externalFilename == subtitle.url }) {
             selectSubtitle(track)
         } else {
@@ -6300,11 +6748,10 @@ class PlayerViewModel: ObservableObject {
             subtitlesToAdd.append(selected)
         }
         subtitlesToAdd.forEach { subtitle in
-            engine.addSubtitle(
-                subtitle,
-                select: subtitle.url == pendingSelectedExternalSubtitleURL
-            )
+            let selects = subtitle.url == pendingSelectedExternalSubtitleURL
+            engine.addSubtitle(subtitle, select: selects)
             addedExternalSubtitleURLs.insert(subtitle.url)
+            if selects { startSubtitleAutoSyncIfNeeded(for: subtitle) }
         }
         didAddExternalSubtitles = true
     }
@@ -6885,6 +7332,10 @@ class PlayerViewModel: ObservableObject {
     // MARK: - Controls visibility
 
     func scheduleControlsHide(after interval: TimeInterval? = nil) {
+        guard !showContentWarnings else {
+            cancelControlsHideTimer()
+            return
+        }
         guard status == .playing else {
             cancelControlsHideTimer()
             return
@@ -6895,6 +7346,7 @@ class PlayerViewModel: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 guard self.status == .playing else { return }
+                guard !self.showContentWarnings else { return }
                 guard !self.controlsAutoHideSuspended else { return }
                 guard !self.isHoldingSeek else { return }
                 guard !self.showSettingsPanel, !self.showScenePanel, !self.isSceneDetailVisible else { return }
@@ -7474,12 +7926,19 @@ class PlayerViewModel: ObservableObject {
 
         var dvProfile: String? = nil
         if let p = aether?.engine.sourceDVProfile, p > 0 {
-            dvProfile = "\(p)"
+            if p == 8, let c = aether?.engine.sourceDVBLCompatID, c > 0 {
+                dvProfile = "\(p).\(c)"
+            } else {
+                dvProfile = "\(p)"
+            }
         } else if mpvDVProfile > 0 {
             dvProfile = "\(mpvDVProfile)"
         } else if !dvRaw.isEmpty, dvRaw.caseInsensitiveCompare("None") != .orderedSame {
             let dvStr = dvRaw
-            if dvStr.contains("5") { dvProfile = "5" }
+            if dvStr.contains("8.1") { dvProfile = "8.1" }
+            else if dvStr.contains("8.4") { dvProfile = "8.4" }
+            else if dvStr.contains("8.2") { dvProfile = "8.2" }
+            else if dvStr.contains("5") { dvProfile = "5" }
             else if dvStr.contains("7") { dvProfile = "7" }
             else if dvStr.contains("8") { dvProfile = "8" }
             else if let firstDigit = dvStr.first(where: { $0.isNumber }) {
@@ -7498,26 +7957,48 @@ class PlayerViewModel: ObservableObject {
         }
 
         let engineOutputFormat = aether?.engine.videoFormat
+        let dynamicRangeReport = reportedValue([debug?.dynamicRange, debug?.hdr]) ?? hdrRaw
+        let effectiveHDRRaw = dynamicRangeReport
+            .components(separatedBy: "→")
+            .last?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? dynamicRangeReport
         let dynamicRange: String
-        if isDV {
-            if engineOutputFormat == .hdr10 || (!tvSupportsDV && tvSupportsHDR) {
-                dynamicRange = "Dolby Vision → HDR10"
-            } else if engineOutputFormat == .sdr || (!tvSupportsDV && !tvSupportsHDR) {
+        if let engineOutputFormat {
+            switch engineOutputFormat {
+            case .hdr10Plus:
+                dynamicRange = isDV ? "Dolby Vision → HDR10+" : "HDR10+"
+            case .hdr10:
+                dynamicRange = isDV ? "Dolby Vision → HDR10" : "HDR10"
+            case .hlg:
+                dynamicRange = isDV ? "Dolby Vision → HLG" : "HLG"
+            case .sdr:
+                dynamicRange = isDV ? "Dolby Vision → SDR" : "SDR"
+            case .dolbyVision:
+                dynamicRange = "Dolby Vision"
+            }
+        } else if isDV {
+            if effectiveHDRRaw.localizedCaseInsensitiveContains("HDR10+") {
+                dynamicRange = "Dolby Vision → HDR10+"
+            } else if effectiveHDRRaw.localizedCaseInsensitiveContains("HLG") {
+                dynamicRange = "Dolby Vision → HLG"
+            } else if effectiveHDRRaw.localizedCaseInsensitiveContains("SDR") {
                 dynamicRange = "Dolby Vision → SDR"
-            } else if debug?.dynamicRange.contains("→") == true {
+            } else if effectiveHDRRaw.localizedCaseInsensitiveContains("HDR") || (!tvSupportsDV && tvSupportsHDR) {
                 dynamicRange = "Dolby Vision → HDR10"
             } else if tvSupportsDV {
                 dynamicRange = "Dolby Vision"
-            } else {
+            } else if tvSupportsHDR {
                 dynamicRange = "Dolby Vision → HDR10"
+            } else {
+                dynamicRange = "Dolby Vision → SDR"
             }
-        } else if hdrRaw.localizedCaseInsensitiveContains("HLG") {
+        } else if effectiveHDRRaw.localizedCaseInsensitiveContains("HDR10+") {
+            dynamicRange = "HDR10+"
+        } else if effectiveHDRRaw.localizedCaseInsensitiveContains("HLG") {
             dynamicRange = "HLG"
-        } else if hdrRaw.localizedCaseInsensitiveContains("HDR") || engineOutputFormat == .hdr10 {
+        } else if effectiveHDRRaw.localizedCaseInsensitiveContains("HDR") {
             dynamicRange = "HDR10"
-        } else if hdrRaw.localizedCaseInsensitiveContains("SDR") {
-            dynamicRange = "SDR"
-        } else if engineOutputFormat == .sdr {
+        } else if effectiveHDRRaw.localizedCaseInsensitiveContains("SDR") {
             dynamicRange = "SDR"
         } else {
             dynamicRange = "—"
@@ -7725,7 +8206,8 @@ class PlayerViewModel: ObservableObject {
             runtime: activeMeta?.runtime,
             nextEpisode: nextEpisode,
             playbackInfo: playbackInfo,
-            hasChapters: !chapters.isEmpty
+            hasChapters: !chapters.isEmpty,
+            hasAutoSync: !availableExternalSubtitles.isEmpty && !isLiveStream && !isTrailerPlaybackSession
         )
         sceneViewModel.open()
     }
@@ -7762,7 +8244,7 @@ class PlayerViewModel: ObservableObject {
         let target = isTrailerPlaybackSession
             ? min(pendingResumeSeconds, max(time.duration - 1, 0))
             : min(pendingResumeSeconds, max(time.duration - 5, 0))
-        seek(to: target)
+        seek(to: target, exact: true)
     }
 
     private func rememberManualSourceIfReady() {

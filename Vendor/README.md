@@ -1,8 +1,8 @@
 # Vendored playback dependencies
 
-## AetherEngine (pin 7.53.1)
+## AetherEngine (pin 7.58.0)
 
-Local pin of [AetherEngine 7.53.1](https://github.com/superuser404notfound/AetherEngine/releases/tag/7.53.1), upstream commit `0839aeee18dd0818c5c307a3c5ecba8ea3161b22`. Imports remain rewritten to the namespaced FFmpeg modules below, and Nuvio's static product, four enabled default traits, local FFmpeg path dependency, and host integration patches are retained. The 7.53.1 upgrade brings MetalFX/CoreML upscaling gating for tvOS 27.1 / Xcode 27.2 (#846), remote-HLS buffered position publishing (#935), forward seek march rate optimization (#932), AV1 Delayed RAP keyframe seek fix (#931), HLS ingest sub-range support (#928), HTTP probe range growth (#927), and libavfilter audio shaping (#923). Nuvio's custom remote playback startup patches, frame extraction, and local traits are preserved.
+Local pin of [AetherEngine 7.58.0](https://github.com/superuser404notfound/AetherEngine/releases/tag/7.58.0), upstream commit `7ea27bff8d8fb4a457d6e0042b0537eb31253583`. Imports remain rewritten to the namespaced FFmpeg modules below, and Nuvio's static product, four enabled default traits, local FFmpeg path dependency, and host integration patches are retained. The 7.58.0 upgrade incorporates source video scan detection (`sourceVideoScan` progressive/interlaced reporting), asynchronous off-main upscale stage creation (`upscalesLowResolutionVideo` non-blocking startup), secondary subtitle identity observation, Dolby Vision base-layer source capabilities and split dual-layer joining, BedRegression object audio, PiP enhancements, and paused session presentation. Nuvio's custom remote playback startup patches, frame extraction, disc image hints, and local traits are preserved.
 
 Retain the local spatial-bridge patch that reports persistent APAC encoding failures independently of successful TrueHD decoding, along with its regression tests. The patch is merged with the 7.40 bed-split renderer and its telemetry reporting.
 

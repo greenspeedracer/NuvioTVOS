@@ -68,7 +68,10 @@ struct RemoteSeekPressCatcher: UIViewRepresentable {
     let onBeginForward: () -> Void
     let onEnd: () -> Void
     var canRevealControls: () -> Bool = { false }
+    var canHandleUp: () -> Bool = { false }
     var onTapUp: () -> Void = {}
+    var canHandleDown: () -> Bool = { false }
+    var onTapDown: () -> Void = {}
 
     func makeUIView(context: Context) -> SeekPressHostView {
         let view = SeekPressHostView()
@@ -80,7 +83,10 @@ struct RemoteSeekPressCatcher: UIViewRepresentable {
             onBeginForward: onBeginForward,
             onEnd: onEnd,
             canRevealControls: canRevealControls,
-            onTapUp: onTapUp
+            canHandleUp: canHandleUp,
+            onTapUp: onTapUp,
+            canHandleDown: canHandleDown,
+            onTapDown: onTapDown
         )
         return view
     }
@@ -94,7 +100,10 @@ struct RemoteSeekPressCatcher: UIViewRepresentable {
             onBeginForward: onBeginForward,
             onEnd: onEnd,
             canRevealControls: canRevealControls,
-            onTapUp: onTapUp
+            canHandleUp: canHandleUp,
+            onTapUp: onTapUp,
+            canHandleDown: canHandleDown,
+            onTapDown: onTapDown
         )
     }
 
@@ -115,7 +124,10 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
     private var onBeginForward: () -> Void = {}
     private var onEnd: () -> Void = {}
     private var canRevealControls: () -> Bool = { false }
+    private var canHandleUp: () -> Bool = { false }
     private var onTapUp: () -> Void = {}
+    private var canHandleDown: () -> Bool = { false }
+    private var onTapDown: () -> Void = {}
 
     private var activeDirection: Direction?
     private var isActive = false
@@ -125,6 +137,7 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
     private var backwardTapRecognizer: UITapGestureRecognizer?
     private var forwardTapRecognizer: UITapGestureRecognizer?
     private var upTapRecognizer: UITapGestureRecognizer?
+    private var downTapRecognizer: UITapGestureRecognizer?
 
     func configure(
         isActive: Bool,
@@ -134,7 +147,10 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
         onBeginForward: @escaping () -> Void,
         onEnd: @escaping () -> Void,
         canRevealControls: @escaping () -> Bool,
-        onTapUp: @escaping () -> Void
+        canHandleUp: @escaping () -> Bool = { false },
+        onTapUp: @escaping () -> Void,
+        canHandleDown: @escaping () -> Bool = { false },
+        onTapDown: @escaping () -> Void = {}
     ) {
         self.isActive = isActive
         self.onTapBackward = onTapBackward
@@ -143,7 +159,10 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
         self.onBeginForward = onBeginForward
         self.onEnd = onEnd
         self.canRevealControls = canRevealControls
+        self.canHandleUp = canHandleUp
         self.onTapUp = onTapUp
+        self.canHandleDown = canHandleDown
+        self.onTapDown = onTapDown
         updateRecognizerState()
     }
 
@@ -176,18 +195,27 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
         upTap.allowedTouchTypes = []
         upTap.isEnabled = true
 
+        let downTap = makeTapRecognizer(
+            pressType: .downArrow,
+            action: #selector(handleDownTap(_:))
+        )
+        downTap.allowedTouchTypes = []
+        downTap.isEnabled = true
+
         backwardTap.require(toFail: backwardHold)
         forwardTap.require(toFail: forwardHold)
 
         window.addGestureRecognizer(backwardTap)
         window.addGestureRecognizer(forwardTap)
         window.addGestureRecognizer(upTap)
+        window.addGestureRecognizer(downTap)
         window.addGestureRecognizer(backwardHold)
         window.addGestureRecognizer(forwardHold)
 
         backwardTapRecognizer = backwardTap
         forwardTapRecognizer = forwardTap
         upTapRecognizer = upTap
+        downTapRecognizer = downTap
         backwardHoldRecognizer = backwardHold
         forwardHoldRecognizer = forwardHold
         attachedWindow = window
@@ -209,6 +237,9 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
             if let upTapRecognizer {
                 attachedWindow.removeGestureRecognizer(upTapRecognizer)
             }
+            if let downTapRecognizer {
+                attachedWindow.removeGestureRecognizer(downTapRecognizer)
+            }
             if let backwardHoldRecognizer {
                 attachedWindow.removeGestureRecognizer(backwardHoldRecognizer)
             }
@@ -219,6 +250,7 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
         backwardTapRecognizer = nil
         forwardTapRecognizer = nil
         upTapRecognizer = nil
+        downTapRecognizer = nil
         backwardHoldRecognizer = nil
         forwardHoldRecognizer = nil
         attachedWindow = nil
@@ -249,9 +281,10 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
         forwardHoldRecognizer?.isEnabled = enabled
         backwardTapRecognizer?.isEnabled = isActive && activeDirection == nil
         forwardTapRecognizer?.isEnabled = isActive && activeDirection == nil
-        // Keep the Up catcher installed; its live closure suppresses presses
-        // whenever playback state says controls should stay hidden.
+        // Keep the Up and Down catchers installed; their live closures suppress presses
+        // whenever playback state says they should not trigger.
         upTapRecognizer?.isEnabled = true
+        downTapRecognizer?.isEnabled = true
     }
 
     @objc private func handleBackwardTap(_ recognizer: UITapGestureRecognizer) {
@@ -264,9 +297,18 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
         onTapForward()
     }
 
+    private func shouldHandleUpPress() -> Bool {
+        canHandleUp() || canRevealControls()
+    }
+
     @objc private func handleUpTap(_ recognizer: UITapGestureRecognizer) {
-        guard canRevealControls() else { return }
+        guard shouldHandleUpPress() else { return }
         onTapUp()
+    }
+
+    @objc private func handleDownTap(_ recognizer: UITapGestureRecognizer) {
+        guard canHandleDown() else { return }
+        onTapDown()
     }
 
     @objc private func handleBackwardHold(_ recognizer: UILongPressGestureRecognizer) {
@@ -310,12 +352,15 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive press: UIPress) -> Bool {
         if gestureRecognizer === upTapRecognizer {
-            return canRevealControls()
+            return shouldHandleUpPress()
+        }
+        if gestureRecognizer === downTapRecognizer {
+            return canHandleDown()
         }
         return isActive || activeDirection != nil
     }
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-        gestureRecognizer !== upTapRecognizer
+        gestureRecognizer !== upTapRecognizer && gestureRecognizer !== downTapRecognizer
     }
 }

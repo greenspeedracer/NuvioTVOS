@@ -326,6 +326,62 @@ final class CalendarBuilderTests: XCTestCase {
     }
 }
 
+// MARK: - Calendar Back navigation
+
+final class CalendarBackFocusTests: XCTestCase {
+    private let firstDay = CalendarDay(year: 2026, month: 11, day: 5)
+    private let laterDay = CalendarDay(year: 2026, month: 11, day: 17)
+
+    private func event(_ id: Int, on date: CalendarDay) -> CalendarEntry {
+        CalendarEntry(
+            itemId: "tt\(id)",
+            kind: .series,
+            tmdbId: id,
+            title: "Show \(id)",
+            date: date,
+            releaseKind: .episode,
+            seasonNumber: 1,
+            episodeNumber: 1
+        )
+    }
+
+    func testBackFromFocusedEventUsesItsActualDay() {
+        let first = event(10, on: firstDay)
+        let later = event(20, on: laterDay)
+        let sections = [
+            CalendarDaySection(date: firstDay, entries: [first]),
+            CalendarDaySection(date: laterDay, entries: [later])
+        ]
+        XCTAssertEqual(
+            CalendarBackTarget.day(for: .entry(later.id), selectedDay: firstDay, sections: sections),
+            laterDay
+        )
+    }
+
+    func testBackFromFirstDayRemainsOnThatDay() {
+        let first = event(10, on: firstDay)
+        let sections = [CalendarDaySection(date: firstDay, entries: [first])]
+        XCTAssertEqual(
+            CalendarBackTarget.day(for: .entry(first.id), selectedDay: firstDay, sections: sections),
+            firstDay
+        )
+    }
+
+    func testBackFromDisappearingEntryFallsBackToSelectedDay() {
+        XCTAssertEqual(
+            CalendarBackTarget.day(for: .entry("missing"), selectedDay: firstDay, sections: []),
+            firstDay
+        )
+    }
+
+    func testBackOutsideEventPanelRemainsNativeSidebarAction() {
+        let sections = [CalendarDaySection(date: firstDay, entries: [event(10, on: firstDay)])]
+        XCTAssertNil(CalendarBackTarget.day(for: .day(firstDay), selectedDay: firstDay, sections: sections))
+        XCTAssertNil(CalendarBackTarget.day(for: .nextMonth, selectedDay: firstDay, sections: sections))
+        XCTAssertNil(CalendarBackTarget.day(for: nil, selectedDay: firstDay, sections: sections))
+    }
+}
+
 // MARK: - Service
 
 final class CalendarServiceTests: XCTestCase {
@@ -410,6 +466,28 @@ final class CalendarServiceTests: XCTestCase {
             result.automaticFollowItems["series:5"]?.posterURL,
             "https://image.tmdb.org/t/p/w342/poster.jpg"
         )
+    }
+
+    func testTechnicalIdentifierNamesAreEnrichedInCalendarAndFollowState() async throws {
+        let http = CalendarMockHTTP([
+            "/tv/5": (200, #"{"id":5,"name":"Resolved Series","seasons":[{"season_number":1,"air_date":"2026-10-01"}]}"#),
+            "/tv/5/season/1": (200, #"{"episodes":[{"air_date":"2026-10-20","episode_number":1,"season_number":1}]}"#),
+            "/movie/9": (200, #"{"id":9,"title":"Resolved Film","release_date":"2026-11-01","release_dates":{"results":[]}}"#),
+        ])
+        let series = CalendarItem(
+            id: "tt0053494", kind: .series, name: "tt0053494", imdbId: "tt0053494"
+        )
+        let movie = CalendarItem(id: "tmdb:9", kind: .movie, name: "tmdb:9")
+        let result = try await service(http, ids: ["tt0053494": 5, "tmdb:9": 9]).load(
+            items: [series, movie],
+            first: periodFirst,
+            last: periodLast,
+            automaticFollowItemIDs: [series.sourceIdentityKey, movie.sourceIdentityKey]
+        )
+
+        XCTAssertEqual(result.automaticFollowItems["series:5"]?.name, "Resolved Series")
+        XCTAssertEqual(result.automaticFollowItems["movie:9"]?.name, "Resolved Film")
+        XCTAssertEqual(Set(result.days.flatMap(\.entries).map(\.title)), ["Resolved Series", "Resolved Film"])
     }
 
     func testLongReleasedMoviesAreNotRequested() async throws {
@@ -1017,6 +1095,39 @@ final class CalendarReadableTitleTests: XCTestCase {
         let details = try JSONDecoder().decode(CalendarTmdb.TvDetails.self, from: Data(json.utf8))
         XCTAssertEqual(details.readableName, "The Apothecary Diaries")
         XCTAssertEqual(CalendarTmdb.TvDetails(id: 2, name: "Ordinace").readableName, "Ordinace")
+    }
+
+    func testCalendarRejectsTechnicalLibraryNamesButPreservesRealTitles() {
+        XCTAssertNil(CalendarText.readableLibraryTitle("tt0053494"))
+        XCTAssertNil(CalendarText.readableLibraryTitle("  TT0068069  "))
+        XCTAssertNil(CalendarText.readableLibraryTitle("imdb:tt0056758"))
+        XCTAssertNil(CalendarText.readableLibraryTitle("tmdb:444"))
+        XCTAssertNil(CalendarText.readableLibraryTitle("  "))
+        XCTAssertEqual(CalendarText.readableLibraryTitle("One Piece"), "One Piece")
+        XCTAssertEqual(CalendarText.readableLibraryTitle("  A Real Series  "), "A Real Series")
+        XCTAssertEqual(CalendarText.readableLibraryTitle("Titanic"), "Titanic")
+    }
+
+    func testCalendarEventsPreferResolvedNamesOverImdbAndTmdbIdentifiers() {
+        let day = CalendarDay(year: 2026, month: 11, day: 5)
+        let seriesItem = CalendarItem(id: "tt0053494", kind: .series, name: "tt0053494")
+        let seriesDetails = CalendarTmdb.TvDetails(id: 123, name: "Resolved Series")
+        let episodes = [
+            CalendarTmdb.Episode(airDate: "2026-11-05", episodeNumber: 1, seasonNumber: 1)
+        ]
+        let seriesEntries = CalendarBuilder.episodeEntries(
+            item: seriesItem, details: seriesDetails, episodes: episodes, first: day, last: day
+        )
+        XCTAssertEqual(seriesEntries.first?.title, "Resolved Series")
+
+        let movieItem = CalendarItem(id: "tmdb:444", kind: .movie, name: "tmdb:444")
+        let movieDetails = CalendarTmdb.MovieDetails(
+            id: 444, title: "Resolved Movie", releaseDate: "2026-11-05"
+        )
+        let movieEntries = CalendarBuilder.movieEntries(
+            item: movieItem, details: movieDetails, region: "US", first: day, last: day
+        )
+        XCTAssertEqual(movieEntries.first?.title, "Resolved Movie")
     }
 
     func testCalendarUsesReadableNameAndDropsCJKEpisodeTitles() {

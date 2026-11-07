@@ -48,7 +48,7 @@ final class MP4SegmentMuxer {
         /// Stream-copy the record unchanged. Genuine P5, and P8.x on a DV panel.
         case keep
         /// Drop `AV_PKT_DATA_DOVI_CONF` before write_header. P8.2 (hvc1 + dvcC trips VT -12906), AVC
-        /// Profile 9, and any source served as its base layer (`dolbyVisionHandling = .baseLayerOnly`).
+        /// Profile 9, and any source served as its base layer (`dolbyVisionHandling` base-layer modes).
         case strip
         /// Rewrite to a valid P8.1: `dv_profile=8`, `compat=1`, `el_present=0`. P7 on every display
         /// (paired with the per-packet RPU conversion) and the malformed "P8.6" compat id (#53).
@@ -408,7 +408,7 @@ final class MP4SegmentMuxer {
                     written += n
                 }
                 counter.bytesWrittenCurrentSegment += count
-                counter.lifetimeFragmentBytes += count
+                counter.noteFragmentBytes(count)
             }
         )
 
@@ -987,7 +987,7 @@ final class MP4SegmentMuxer {
             return .failed
         }
 
-        byteCounter.fragmentCuts += 1
+        byteCounter.noteFragmentCut()
 
         let nextPath = Self.stagingPath(forSegmentIndex: nextIdx, in: sessionDir)
         do {
@@ -1325,8 +1325,17 @@ private final class ByteCounter {
     var writeFailed: Bool = false
     /// Reports a staging write that hit a full volume to the session's cache.
     var onStorageExhausted: (@Sendable () -> Void)?
-    var lifetimeFragmentBytes: Int = 0
-    var fragmentCuts: Int = 0
+
+    /// The two lifetime totals are read by the diagnostics heartbeat while the pump writes them (AE#966).
+    private let diagnosticLock = NSLock()
+    private var _lifetimeFragmentBytes = 0
+    private var _fragmentCuts = 0
+
+    var lifetimeFragmentBytes: Int { diagnosticLock.withLock { _lifetimeFragmentBytes } }
+    var fragmentCuts: Int { diagnosticLock.withLock { _fragmentCuts } }
+
+    func noteFragmentBytes(_ count: Int) { diagnosticLock.withLock { _lifetimeFragmentBytes += count } }
+    func noteFragmentCut() { diagnosticLock.withLock { _fragmentCuts += 1 } }
 }
 
 // MARK: - C callback bridge

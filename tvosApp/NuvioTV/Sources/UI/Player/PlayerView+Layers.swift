@@ -41,9 +41,13 @@ extension PlayerView {
             remoteSeekPressCatcherLayer
             playerStatusOverlay
                 .zIndex(10)
+            contentWarningsOverlayLayer
+                .zIndex(11)
             playerToastLayer
                 .zIndex(22)
             focusSinkLayer
+            gestureCaptureLayer
+            gestureObserverLayer
             pauseOverlayLayer
             skipSegmentLayer
             nextEpisodeLayer
@@ -236,7 +240,8 @@ extension PlayerView {
                     && !viewModel.isHoldingSeek
                     && viewModel.pendingSeekDelta == 0
                     && (!viewModel.showControls || viewModel.isScrubbing || viewModel.isTimelineFocused)
-                    && !viewModel.controlsAutoHideSuspended,
+                    && !viewModel.controlsAutoHideSuspended
+                    && !isGestureCaptureActive,
                     isNextEpisodeFocused: nextEpisodeFocused,
                     isCancelAutoPlayFocused: cancelAutoPlayFocused,
                     isSkipSegmentFocused: skipSegmentFocused
@@ -244,7 +249,16 @@ extension PlayerView {
             },
             onBegan: { viewModel.remoteTouchBegan() },
             onMoved: { dx, dy in viewModel.remoteTouchMoved(dx: dx, dy: dy) },
-            onEnded: { dx, dy in viewModel.remoteTouchEnded(dx: dx, dy: dy) }
+            onEnded: { dx, dy in
+                if viewModel.showControls && viewModel.isTimelineFocused && !viewModel.isScrubbing && dy < -15 && abs(dy) > abs(dx) {
+                    if viewModel.showSkipSegmentCard {
+                        focusSkipSegment()
+                    } else {
+                        requestedControlFocus = .firstTransportButton
+                    }
+                }
+                viewModel.remoteTouchEnded(dx: dx, dy: dy)
+            }
         )
         .allowsHitTesting(false)
         .frame(width: 0, height: 0)
@@ -265,7 +279,8 @@ extension PlayerView {
                 && viewModel.sidePanel == nil
                 && !viewModel.isScrubbing
                 && !viewModel.postPlayState.isVisible
-                && (!viewModel.showControls || viewModel.isTimelineFocused),
+                && (!viewModel.showControls || viewModel.isTimelineFocused)
+                && !isGestureCaptureActive,
                 isNextEpisodeFocused: nextEpisodeFocused,
                 isCancelAutoPlayFocused: cancelAutoPlayFocused,
                 isSkipSegmentFocused: skipSegmentFocused
@@ -291,11 +306,33 @@ extension PlayerView {
                 viewModel.stopRepeatingSkip()
             },
             canRevealControls: { canRevealControlsFromRemotePress },
+            canHandleUp: {
+                canRevealControlsFromRemotePress || canFocusTransportFromTimeline
+            },
             onTapUp: {
-                // Capture the first physical Up after Back/Menu returns from controls;
-                // the focus sink can consume that press during focus handoff.
-                guard canRevealControlsFromRemotePress else { return }
-                viewModel.revealControls()
+                if canRevealControlsFromRemotePress {
+                    viewModel.revealControls()
+                } else if canFocusTransportFromTimeline {
+                    if viewModel.showSkipSegmentCard {
+                        focusSkipSegment()
+                    } else {
+                        requestedControlFocus = .firstTransportButton
+                    }
+                }
+            },
+            canHandleDown: {
+                canOpenSceneFromTimeline || canOpenSceneWhenControlsHidden
+            },
+            onTapDown: {
+                if canOpenSceneFromTimeline {
+                    viewModel.openScene()
+                } else if canOpenSceneWhenControlsHidden {
+                    if viewModel.isSceneEnabled {
+                        viewModel.openScene()
+                    } else {
+                        viewModel.revealControls()
+                    }
+                }
             }
         )
         .allowsHitTesting(false)
@@ -303,8 +340,50 @@ extension PlayerView {
         .accessibilityHidden(true)
     }
 
+    private var canOpenSceneFromTimeline: Bool {
+        didReportPlaybackStarted
+            && !isWakingFromBackground
+            && viewModel.currentErrorDiagnostic == nil
+            && !viewModel.showSettingsPanel
+            && !viewModel.showScenePanel
+            && !viewModel.isSceneDetailVisible
+            && viewModel.sidePanel == nil
+            && !viewModel.postPlayState.isVisible
+            && viewModel.showControls
+            && viewModel.isTimelineFocused
+            && !viewModel.isScrubbing
+            && !viewModel.isHoldingSeek
+            && viewModel.pendingSeekDelta == 0
+            && !viewModel.controlsAutoHideSuspended
+            && !isGestureCaptureActive
+            && viewModel.isSceneEnabled
+    }
+
+    private var canOpenSceneWhenControlsHidden: Bool {
+        canRevealControlsFromRemotePress
+    }
+
+    private var canFocusTransportFromTimeline: Bool {
+        didReportPlaybackStarted
+            && !isWakingFromBackground
+            && viewModel.currentErrorDiagnostic == nil
+            && !viewModel.showSettingsPanel
+            && !viewModel.showScenePanel
+            && !viewModel.isSceneDetailVisible
+            && viewModel.sidePanel == nil
+            && !viewModel.postPlayState.isVisible
+            && viewModel.showControls
+            && viewModel.isTimelineFocused
+            && !viewModel.isScrubbing
+            && !viewModel.isHoldingSeek
+            && viewModel.pendingSeekDelta == 0
+            && !viewModel.controlsAutoHideSuspended
+            && !isGestureCaptureActive
+    }
+
     private var canRevealControlsFromRemotePress: Bool {
-        !viewModel.showControls
+        !isGestureCaptureActive
+            && !viewModel.showControls
             && !viewModel.showSettingsPanel
             && !viewModel.showScenePanel
             && !viewModel.isSceneDetailVisible
@@ -424,20 +503,7 @@ extension PlayerView {
         Color.clear
             .ignoresSafeArea()
             .contentShape(Rectangle())
-            .focusable(
-                didReportPlaybackStarted
-                    && (!viewModel.showControls || viewModel.isSwitchingSource || viewModel.showPauseOverlay)
-                    && !viewModel.isScrubbing
-                    && !viewModel.isHoldingSeek
-                    && viewModel.currentErrorDiagnostic == nil
-                    && !viewModel.showNextEpisodeCard
-                    && !viewModel.showSkipSegmentCard
-                    && !viewModel.showSettingsPanel
-                    && !viewModel.showScenePanel
-                    && !viewModel.isSceneDetailVisible
-                    && !viewModel.postPlayState.isVisible
-                    && viewModel.sidePanel == nil
-            )
+            .focusable(isFocusSinkEligible && !isGestureCaptureActive)
             .focused($remoteInputFocused)
             .onTapGesture {
                 let elapsedWake = Date().timeIntervalSince(lastBecameActiveAt)
@@ -549,7 +615,20 @@ extension PlayerView {
                     let chapters = viewModel.chapters
                     guard !chapters.isEmpty else { return "chapter-0" }
                     return PlayerChaptersRow.focusID(of: chapters[viewModel.currentChapterIndex ?? 0])
-                }()
+                }(),
+                autoSyncContent: viewModel.availableExternalSubtitles.isEmpty ? nil : { focus, focusContext in
+                    AnyView(PlayerAutoSyncPanel(
+                        viewModel: viewModel,
+                        focusedControlID: focus,
+                        focusContext: focusContext,
+                        onDismiss: {
+                            withAnimation(.playerControls) {
+                                viewModel.closeScene()
+                                focusRemoteInput()
+                            }
+                        }
+                    ))
+                }
             )
             .transition(.move(edge: .bottom).combined(with: .opacity))
             .zIndex(21)

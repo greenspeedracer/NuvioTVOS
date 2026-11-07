@@ -134,6 +134,47 @@ final class NativeAVPlayerHost {
     /// duration, and publishing that transient would bounce the engine through `.paused` and back for
     /// what the viewer must not even notice; the real status is republished when the recovery settles.
     private var prematureEndRecoveryInFlight = false
+    /// AE#962: the highest clock the observer published since the last seek, and when (uptime ns).
+    private var publishedClockPeak: (seconds: Double, uptimeNanos: UInt64)?
+
+    #if DEBUG
+    /// Replaces only this host's asynchronous end reading without blocking a shared AVFoundation queue.
+    var prematureEndReadForTesting: (@MainActor () async -> PrematureEndReading)?
+    /// Monotonic time for deterministic read-latency regressions; nil uses the system uptime.
+    var prematureEndUptimeForTesting: UInt64?
+    /// Counts recovery seeks so end-notification tests can distinguish completion from replay.
+    var prematureEndAttemptsForTesting: Int { prematureEndRecoveryAttempts }
+
+    /// Models a playing item's published state without opening media or starting AVPlayer.
+    /// Each call advances the session identity, allowing a suspended end reading to be superseded.
+    func preparePrematureEndForTesting(
+        duration: Double,
+        playhead: Double,
+        peak: (seconds: Double, uptimeNanos: UInt64)?
+    ) {
+        sessionID += 1
+        self.duration = duration
+        currentTime = playhead
+        publishedClockPeak = peak
+        playIntent = true
+        didReachEnd = false
+        prematureEndRecoveryAttempts = 0
+        lastPrematureEndRecoveryPlayhead = nil
+    }
+
+    /// Runs the actual end recovery against the instance-owned reading and clock overrides.
+    func recoverFromPrematureEndForTesting() async -> Bool {
+        await recoverFromPrematureEnd()
+    }
+    #endif
+
+    /// Monotonic observation time for peak freshness, independent of the media clock.
+    private var prematureEndUptimeNanos: UInt64 {
+        #if DEBUG
+        if let prematureEndUptimeForTesting { return prematureEndUptimeForTesting }
+        #endif
+        return DispatchTime.now().uptimeNanoseconds
+    }
     /// Mirrors avPlayer.timeControlStatus so the engine can reconcile when AVKit's transport bar, Control Center, or hardware buttons toggle the player externally (without this, engine state goes stale and play/pause presses are swallowed).
     @Published private(set) var timeControlStatus: AVPlayer.TimeControlStatus = .paused
     /// Mirrors avPlayer.reasonForWaitingToPlay. Written before `timeControlStatus` on a status edge, so a
@@ -984,6 +1025,39 @@ final class NativeAVPlayerHost {
         }
         notificationObservers.append(didEndObs)
 
+        // AVKit's transport bar calls pause()/play() straight on this AVPlayer (tvOS), bypassing play()/pause()
+        // here, so playIntent stayed true under a viewer's pause and every path gated on it (item-death reload,
+        // media-playlist fallback, interruption resume, session rebuild) restarted a paused title. Mirror an
+        // explicit rate write (setRateCalled) only: end of item, a dying source and system pauses leave it alone.
+        // Only once the current item is ready to play: a rate write before that is treated as the swap's, not the
+        // viewer's, because clearing the latch there would park the session at readyToPlay+paused (issue #15).
+        let rateObs = NotificationCenter.default.addObserver(
+            forName: AVPlayer.rateDidChangeNotification,
+            object: avPlayer,
+            queue: .main
+        ) { [weak self] notification in
+            let reason = (notification.userInfo?[AVPlayer.rateDidChangeReasonKey] as? String)
+                .map(AVPlayer.RateDidChangeReason.init(rawValue:))
+            // Delivered on .main (queue: .main above), so assert MainActor to reach @MainActor state.
+            MainActor.assumeIsolated {
+                guard let self, self.sessionID == sid else { return }
+                // Live rate, not the notification's: a play() right after a pause() must not be undone by the older echo.
+                let rate = self.avPlayer.rate
+                let ready = self.playerItem?.status == .readyToPlay
+                let old = self.playIntent
+                let intent = (self.prematureEndRecoveryInFlight || !ready)
+                    ? old
+                    : Self.playIntentAfterRateChange(reason: reason, rate: rate, current: old)
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(sid) rate change reason=\(reason?.rawValue ?? "nil") "
+                    + "rate=\(rate) ready=\(ready) play intent \(old) -> \(intent)",
+                    category: .engine
+                )
+                self.playIntent = intent
+            }
+        }
+        notificationObservers.append(rateObs)
+
         // 100ms periodic observer drives scrub bar; Task wrapper satisfies Sendable check.
         timeObserver = avPlayer.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.1, preferredTimescale: 600),
@@ -998,6 +1072,9 @@ final class NativeAVPlayerHost {
                 // seekInFlight suppresses currentTime: AVPlayer still reports pre-seek clock until physical landing (issue #37).
                 guard !self.seekInFlight else { return }
                 self.currentTime = value
+                if value >= (self.publishedClockPeak?.seconds ?? -.infinity) {
+                    self.publishedClockPeak = (value, DispatchTime.now().uptimeNanoseconds)
+                }
                 self.observeVideoPresentation(clock: value)
             }
         }
@@ -1196,6 +1273,15 @@ final class NativeAVPlayerHost {
         surfaceEndFailures: Bool, hasEverPlayed: Bool
     ) -> Bool {
         !surfaceEndFailures && hasEverPlayed
+    }
+
+    /// Pure decision for the rate-change mirror: an explicit rate write (`setRateCalled`, e.g. AVKit's
+    /// transport bar) sets the intent to whether the live rate is non-zero; any other or missing reason
+    /// (end of item, interruption, background) keeps the current intent.
+    nonisolated static func playIntentAfterRateChange(
+        reason: AVPlayer.RateDidChangeReason?, rate: Float, current: Bool
+    ) -> Bool {
+        reason == .setRateCalled ? rate != 0 : current
     }
 
     /// #50: AVPlayer fires .failed for self-healing transients (loopback 404, AVIOReader reconnect) while playback advances uninterrupted (rrgomes: tcs=playing at .failed).
@@ -2104,12 +2190,23 @@ final class NativeAVPlayerHost {
         // Only resume what the viewer was playing: an item that ends while the transport is parked
         // must stay parked.
         guard playIntent, !didReachEnd else { return false }
+        let sid = sessionID
+        let endSeekGeneration = seekGeneration
+        let peak = publishedClockPeak
+        // Freshness belongs to the end notification, not to completion of a slow media-server read.
+        let peakAgeSeconds = peak.map { Double(prematureEndUptimeNanos &- $0.uptimeNanos) / 1e9 }
         // AE#422: one batched off-main reading. A premature end IS a state where the media server is
         // misreporting, so "one read at a rare event" (the note that used to stand on
         // `seekableRangeEndSeconds`) is not the cheap thing it looks like: the reporter measured a
         // single such read holding the main thread for 13.3 s.
         let reading = await prematureEndReading()
-        let playhead = reading.playhead
+        // Yield to a replacement or newer seek; returning false would let this stale notification
+        // complete the item after a same-session seek, whose session ID alone is still current.
+        guard sessionID == sid, seekGeneration == endSeekGeneration else { return true }
+        let playhead = AetherEngine.prematureEndPlayhead(
+            read: reading.playhead,
+            peak: peak?.seconds,
+            peakAgeSeconds: peakAgeSeconds)
         let seekEnd = reading.seekableEnd
         guard AetherEngine.prematureEndRecoveryQualifies(
             isLive: isLiveSession,
@@ -2118,7 +2215,11 @@ final class NativeAVPlayerHost {
             seekableEnd: seekEnd,
             attemptsUsed: prematureEndRecoveryAttempts,
             lastAttemptPlayhead: lastPrematureEndRecoveryPlayhead
-        ) else { return false }
+        ) else {
+            // AE#962: the end stands at where playback was, not where AVPlayer's clock snapped back to.
+            if playhead > reading.playhead { currentTime = playhead }
+            return false
+        }
 
         prematureEndRecoveryAttempts += 1
         lastPrematureEndRecoveryPlayhead = playhead
@@ -2131,11 +2232,29 @@ final class NativeAVPlayerHost {
             + "\(String(format: "%.1f", duration - playhead))s of the presentation lies past the end "
             + "AVPlayer reported, re-seeking in place (attempt \(prematureEndRecoveryAttempts))",
             category: .engine)
-        let sid = sessionID
-        await seek(to: playhead)
+        // The seek bumps the generation before it suspends, so a different one afterwards is a newer seek.
+        let recoveryGeneration = seekGeneration &+ 1
+        let landed = await seek(to: playhead,
+                                deadlineSeconds: AetherEngine.prematureEndRecoverySeekDeadlineSeconds)
         // The session may have been handed over while the seek was in flight; a retired session
         // must not restart the player under its successor.
         guard sessionID == sid else { return true }
+        let outcome = AetherEngine.prematureEndRecoveryOutcome(
+            landed: landed, superseded: seekGeneration != recoveryGeneration)
+        if outcome != .resume {
+            prematureEndRecoveryInFlight = false
+            waitingReason = avPlayer.reasonForWaitingToPlay
+            timeControlStatus = avPlayer.timeControlStatus
+            EngineLog.emit(
+                "[NativeAVPlayerHost] #\(sessionID) AE#287 re-seek "
+                + (outcome == .yield
+                    ? "superseded by a newer seek; leaving the transport to it"
+                    : "did not land within \(Int(AetherEngine.prematureEndRecoverySeekDeadlineSeconds))s; "
+                      + "accepting the end"),
+                category: .engine)
+            if outcome == .acceptEnd { currentTime = playhead }
+            return outcome == .yield
+        }
         avPlayer.play()
         prematureEndRecoveryInFlight = false
         waitingReason = avPlayer.reasonForWaitingToPlay
@@ -2150,6 +2269,9 @@ final class NativeAVPlayerHost {
 
     /// AE#422: the three figures the #287 recovery needs, read once and off the main actor.
     private func prematureEndReading() async -> PrematureEndReading {
+        #if DEBUG
+        if let prematureEndReadForTesting { return await prematureEndReadForTesting() }
+        #endif
         guard let item = playerItem else {
             return PrematureEndReading(playhead: 0, seekableEnd: nil, loadedEnd: nil)
         }
@@ -2190,6 +2312,7 @@ final class NativeAVPlayerHost {
         let gen = seekGeneration
         seekInFlight = true
         liveHLSStarvationPolicy.resetObservation()
+        publishedClockPeak = nil
         // AE#629: this seek's own landing publishes the clock from here on.
         mountSeekPending = false
         latestSeekRenderedTimePublished = false
@@ -2639,6 +2762,7 @@ final class NativeAVPlayerHost {
         prematureEndRecoveryAttempts = 0
         lastPrematureEndRecoveryPlayhead = nil
         prematureEndRecoveryInFlight = false
+        publishedClockPeak = nil
         didSampleSettledRoute = false
         // #168: a reused host must not report the prior session's dynamic range before the new item resolves.
         detectedVideoFormat = nil

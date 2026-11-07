@@ -452,6 +452,17 @@ struct DetailsScreen: View {
             finishSmartPlaybackIfPossible()
             performBackgroundAutoSelectionAndPreResolution()
         }
+        .onChange(of: backgroundStreamPreFetch) { _, isEnabled in
+            if isEnabled {
+                if let meta = viewModel.uiState.meta, meta.id == id {
+                    viewModel.triggerStreamPreFetch(for: meta)
+                }
+                performBackgroundAutoSelectionAndPreResolution()
+            } else {
+                resetPreResolutionCandidate()
+                streamDiscoveryDuration = nil
+            }
+        }
         .onChange(of: viewModel.uiState.isLoading) { _, isLoading in
             if !isLoading {
                 if let meta = viewModel.uiState.meta, meta.id == id, !meta.isSeries {
@@ -1049,8 +1060,7 @@ struct DetailsScreen: View {
 
     private func performBackgroundAutoSelectionAndPreResolution() {
         guard isDetailsPlaybackContextActive, !didHandOffPlayback else { return }
-        let prefetchEnabled = (ProfileSettings.current.object(forKey: SettingsKey.backgroundStreamPreFetch) as? Bool) ?? true
-        guard prefetchEnabled else {
+        guard backgroundStreamPreFetch else {
             resetPreResolutionCandidate()
             return
         }
@@ -1217,6 +1227,7 @@ struct DetailsScreen: View {
             guard !Task.isCancelled,
                   self.isDetailsPlaybackContextActive,
                   !self.didHandOffPlayback,
+                  self.backgroundStreamPreFetch,
                   self.preResolutionGeneration == resolutionGeneration else { return }
 
             guard let candidate else {
@@ -1241,6 +1252,11 @@ struct DetailsScreen: View {
         meta: NuvioMeta,
         smartStreamSelection: Bool
     ) {
+        guard backgroundStreamPreFetch else {
+            resetPreResolutionCandidate()
+            return
+        }
+
         let identity = DetailsBackgroundResolutionIdentity(
             streamID: currentStreamId,
             episodeID: currentEpisode?.id,
@@ -1306,7 +1322,10 @@ struct DetailsScreen: View {
             var resolvedURL: URL? = nil
             var debridFilename: String? = nil
             var debridVideoSize: Int64? = nil
-            if resolver.isEnabled {
+            if resolver.isEnabled,
+               !Task.isCancelled,
+               self.backgroundStreamPreFetch,
+               self.preResolutionGeneration == resolutionGeneration {
                 let result = await resolver.resolvedURL(for: candidate, season: season, episode: episode)
                 if case let .success(url, filename, videoSize)? = result {
                     resolvedURL = url
@@ -1363,7 +1382,7 @@ struct DetailsScreen: View {
         let eligible = DetailsPlaybackPrewarmPolicy.shouldPrewarm(
             url: url,
             backend: backend,
-            backgroundStreamPreFetchEnabled: (ProfileSettings.current.object(forKey: SettingsKey.backgroundStreamPreFetch) as? Bool) ?? true,
+            backgroundStreamPreFetchEnabled: backgroundStreamPreFetch,
             smartStreamSelectionEnabled: smartStreamSelection,
             usesExternalPlayer: effectivePlayer(for: nil) != .builtIn,
             isPlayableMovieOrEpisode: isPlayableMovieOrEpisode,
@@ -1429,7 +1448,7 @@ struct DetailsScreen: View {
         let eligible = DetailsPlaybackPrewarmPolicy.shouldPrewarm(
             url: target.url,
             backend: backend,
-            backgroundStreamPreFetchEnabled: (ProfileSettings.current.object(forKey: SettingsKey.backgroundStreamPreFetch) as? Bool) ?? true,
+            backgroundStreamPreFetchEnabled: backgroundStreamPreFetch,
             smartStreamSelectionEnabled: smartStreamSelection,
             usesExternalPlayer: effectivePlayer(for: nil) != .builtIn,
             isPlayableMovieOrEpisode: isPlayableMovieOrEpisode,
@@ -1819,12 +1838,15 @@ actor YouTubeTrailerResolver {
     private var trailerIdCache: [String: String] = [:]
     private var trailerIdFailureDates: [String: Date] = [:]
     private var trailerioCache: [String: TrailerPlaybackSource] = [:]
+    private var imdbTrailerCache: [String: TrailerPlaybackSource] = [:]
+    private var imdbTrailerFailureDates: [String: Date] = [:]
 
     private let preferredLanguageProvider: () -> String
     private let configurationIdentityProvider: () -> String
     private let trailerYouTubeIdProvider: ((NuvioMeta) async -> String?)?
     private let refreshedTrailerIdsProvider: ((NuvioMeta) async -> [String]?)?
     private let trailerioProvider: ((String, Bool) async -> TrailerPlaybackSource?)?
+    private let imdbTrailerProvider: ((String) async -> TrailerPlaybackSource?)?
     private let youtubeSourceProvider: ((String, String?, String?, Bool) async -> TrailerPlaybackSource?)?
 
     init(
@@ -1833,6 +1855,7 @@ actor YouTubeTrailerResolver {
         trailerYouTubeIdProvider: ((NuvioMeta) async -> String?)? = nil,
         refreshedTrailerIdsProvider: ((NuvioMeta) async -> [String]?)? = nil,
         trailerioProvider: ((String, Bool) async -> TrailerPlaybackSource?)? = nil,
+        imdbTrailerProvider: ((String) async -> TrailerPlaybackSource?)? = nil,
         youtubeSourceProvider: ((String, String?, String?, Bool) async -> TrailerPlaybackSource?)? = nil
     ) {
         self.preferredLanguageProvider = preferredLanguageProvider
@@ -1840,6 +1863,7 @@ actor YouTubeTrailerResolver {
         self.trailerYouTubeIdProvider = trailerYouTubeIdProvider
         self.refreshedTrailerIdsProvider = refreshedTrailerIdsProvider
         self.trailerioProvider = trailerioProvider
+        self.imdbTrailerProvider = imdbTrailerProvider
         self.youtubeSourceProvider = youtubeSourceProvider
     }
 
@@ -1941,6 +1965,295 @@ actor YouTubeTrailerResolver {
         return source
     }
 
+    private struct ImdbGraphQLResponse: Decodable {
+        struct DataNode: Decodable {
+            struct TitleNode: Decodable {
+                struct VideoNode: Decodable {
+                    struct NameNode: Decodable {
+                        let value: String?
+                    }
+                    struct PlaybackURL: Decodable {
+                        let url: String?
+                        let videoMimeType: String?
+                        let videoDefinition: String?
+                    }
+                    let id: String?
+                    let name: NameNode?
+                    let playbackURLs: [PlaybackURL]?
+                }
+                struct PrimaryVideosNode: Decodable {
+                    struct Edge: Decodable {
+                        let node: VideoNode?
+                    }
+                    let edges: [Edge]?
+                }
+                let id: String?
+                let latestTrailer: VideoNode?
+                let primaryVideos: PrimaryVideosNode?
+            }
+            let title: TitleNode?
+        }
+        let data: DataNode?
+    }
+
+    private func scoreImdbDefinition(_ def: String, mime: String) -> Int {
+        switch def {
+        case "DEF_1080p": return 1000
+        case "DEF_720p": return 800
+        case "DEF_AUTO": return 700
+        case "DEF_480p": return 400
+        case "DEF_SD": return 300
+        default:
+            if mime.lowercased().contains("mp4") { return 250 }
+            return 200
+        }
+    }
+
+    static func scoreImdbVideoName(_ name: String, preferredLanguage: String) -> Int {
+        let lower = name.lowercased()
+
+        // Filter out vertical / social aspect ratio promos completely
+        if lower.contains("vertical") || lower.contains("tiktok") || lower.contains("reels") || lower.contains("short") {
+            return -10000
+        }
+
+        var score = 0
+
+        // Deprioritize non-trailer material (interviews, clips, featurettes)
+        if lower.contains("interview") || lower.contains("behind the scenes") || lower.contains("featurette") || lower.contains("b-roll") {
+            score -= 3000
+        }
+
+        let langPrefix = TmdbMetadataLanguage.normalized(preferredLanguage)
+            .split(separator: "-").first.map(String.init)?.lowercased() ?? "en"
+
+        let languageKeywords: [String: [String]] = [
+            "en": ["english", "en trailer", "us trailer", "uk trailer"],
+            "fr": ["french", "français", "francais"],
+            "de": ["german", "deutsch"],
+            "es": ["spanish", "español", "espanol", "castellano", "latin america"],
+            "it": ["italian", "italiano"],
+            "pt": ["portuguese", "português", "brasil"],
+            "ja": ["japanese", "nihongo"],
+            "nl": ["dutch", "nederlands"],
+            "ru": ["russian"],
+            "zh": ["chinese", "mandarin"]
+        ]
+
+        var matchesPreferred = false
+        var matchesOther = false
+
+        if let preferredList = languageKeywords[langPrefix] {
+            for kw in preferredList {
+                if lower.contains(kw) {
+                    matchesPreferred = true
+                    break
+                }
+            }
+        }
+
+        for (code, list) in languageKeywords where code != langPrefix {
+            for kw in list {
+                if lower.contains(kw) {
+                    matchesOther = true
+                    break
+                }
+            }
+            if matchesOther { break }
+        }
+
+        if matchesPreferred {
+            score += 1000
+        } else if matchesOther {
+            // Strongly penalize other languages (e.g. French/German for English user)
+            score -= 2000
+        }
+
+        // Subtitled penalty for foreign titles if not preferred language
+        if (lower.contains("subtitled") || lower.contains("subbed")) && !matchesPreferred {
+            score -= 500
+        }
+
+        // Prefer full official trailers
+        if lower.contains("official trailer") || lower.contains("main trailer") {
+            score += 600
+        } else if lower.contains("official") && lower.contains("trailer") {
+            score += 500
+        } else if lower.contains("trailer") {
+            score += 300
+        } else if lower.contains("teaser") {
+            score += 100
+        }
+
+        return score
+    }
+
+    func resolveImdbTrailer(imdbId: String, preferredLanguage: String? = nil) async -> TrailerPlaybackSource? {
+        let cleanImdb = NuvioMeta.canonicalImdbID(from: imdbId) ?? imdbId
+        guard cleanImdb.hasPrefix("tt") else { return nil }
+
+        let language = preferredLanguage ?? preferredLanguageProvider()
+        let cacheKey = "\(cleanImdb)|\(language)"
+
+        if let cached = imdbTrailerCache[cacheKey] {
+            return cached
+        }
+        if let failedAt = imdbTrailerFailureDates[cacheKey],
+           Date().timeIntervalSince(failedAt) < 300 {
+            return nil
+        }
+
+        guard let url = URL(string: "https://graphql.prod.api.imdb.a2z.com/") else {
+            return nil
+        }
+
+        let query = """
+        query TitleTrailer($const: ID!) {
+          title(id: $const) {
+            id
+            latestTrailer {
+              id
+              name { value }
+              playbackURLs {
+                url
+                videoMimeType
+                videoDefinition
+              }
+            }
+            primaryVideos(first: 10) {
+              edges {
+                node {
+                  id
+                  name { value }
+                  playbackURLs {
+                    url
+                    videoMimeType
+                    videoDefinition
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+
+        let payload: [String: Any] = [
+            "query": query,
+            "variables": ["const": cleanImdb]
+        ]
+
+        guard let body = try? JSONSerialization.data(withJSONObject: payload) else {
+            return nil
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 5
+        request.httpBody = body
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("https://www.imdb.com", forHTTPHeaderField: "Origin")
+        request.setValue("https://www.imdb.com/", forHTTPHeaderField: "Referer")
+        request.setValue(Self.defaultUserAgent, forHTTPHeaderField: "User-Agent")
+
+        guard let (data, response) = try? await session.data(for: request),
+              let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+              let decoded = try? JSONDecoder().decode(ImdbGraphQLResponse.self, from: data) else {
+            imdbTrailerFailureDates[cacheKey] = Date()
+            return nil
+        }
+
+        let titleNode = decoded.data?.title
+        var candidateVideos: [ImdbGraphQLResponse.DataNode.TitleNode.VideoNode] = []
+        if let latest = titleNode?.latestTrailer {
+            candidateVideos.append(latest)
+        }
+        if let edges = titleNode?.primaryVideos?.edges {
+            for edge in edges {
+                if let node = edge.node, !candidateVideos.contains(where: { $0.id == node.id }) {
+                    candidateVideos.append(node)
+                }
+            }
+        }
+
+        let scoredCandidates = candidateVideos
+            .filter { !($0.playbackURLs?.isEmpty ?? true) }
+            .map { (video: $0, score: Self.scoreImdbVideoName($0.name?.value ?? "", preferredLanguage: language)) }
+            .filter { $0.score > -5000 }
+            .sorted { $0.score > $1.score }
+
+        let video = scoredCandidates.first?.video
+            ?? candidateVideos.first(where: { !($0.playbackURLs?.isEmpty ?? true) && !($0.name?.value?.lowercased().contains("vertical") ?? false) })
+            ?? candidateVideos.first(where: { !($0.playbackURLs?.isEmpty ?? true) })
+
+        guard let videoNode = video,
+              let playbackURLs = videoNode.playbackURLs,
+              !playbackURLs.isEmpty else {
+            imdbTrailerFailureDates[cacheKey] = Date()
+            return nil
+        }
+
+        let validURLs = playbackURLs.compactMap { p -> (url: String, def: String, mime: String)? in
+            guard let rawUrl = p.url?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !rawUrl.isEmpty,
+                  rawUrl.hasPrefix("http://") || rawUrl.hasPrefix("https://") else {
+                return nil
+            }
+            return (url: rawUrl, def: p.videoDefinition ?? "", mime: p.videoMimeType ?? "")
+        }
+
+        guard !validURLs.isEmpty else {
+            imdbTrailerFailureDates[cacheKey] = Date()
+            return nil
+        }
+
+        let sorted = validURLs.sorted { a, b in
+            scoreImdbDefinition(a.def, mime: a.mime) > scoreImdbDefinition(b.def, mime: b.mime)
+        }
+
+        guard let best = sorted.first else {
+            imdbTrailerFailureDates[cacheKey] = Date()
+            return nil
+        }
+
+        let label: String
+        if best.def == "DEF_1080p" {
+            label = "1080p (IMDb)"
+        } else if best.def == "DEF_720p" {
+            label = "720p (IMDb)"
+        } else if best.def == "DEF_AUTO" {
+            label = "1080p (IMDb HLS)"
+        } else if best.def == "DEF_480p" {
+            label = "480p (IMDb)"
+        } else {
+            label = "IMDb"
+        }
+
+        let trailerName = videoNode.name?.value ?? "Trailer"
+        let diag = "TRAILER: \(label) [IMDb] \"\(trailerName)\""
+
+        let source = TrailerPlaybackSource(
+            videoUrl: best.url,
+            audioUrl: nil,
+            requestHeaders: ["User-Agent": Self.defaultUserAgent],
+            qualityLabel: label,
+            diagnostics: diag
+        )
+
+        imdbTrailerCache[cacheKey] = source
+        imdbTrailerFailureDates.removeValue(forKey: cacheKey)
+        return source
+    }
+
+    private func resolveImdbTrailer(for meta: NuvioMeta) async -> TrailerPlaybackSource? {
+        guard let imdbId = meta.imdbId ?? NuvioMeta.canonicalImdbID(from: meta.id) else {
+            return nil
+        }
+        if let imdbTrailerProvider {
+            return await imdbTrailerProvider(imdbId)
+        }
+        return await resolveImdbTrailer(imdbId: imdbId)
+    }
+
     func resolve(for meta: NuvioMeta) async -> TrailerPlaybackSource? {
         await TmdbDetailsService.withRequestContext {
             await self.resolveForCurrentContext(meta, preview: false)
@@ -2038,10 +2351,17 @@ actor YouTubeTrailerResolver {
         let isEnglish = TmdbMetadataLanguage.normalized(preferredLanguageProvider())
             .split(separator: "-").first?.lowercased() == "en"
 
+        // 1. Try Trailerio if English (direct 1080p CDN streams from Apple TV, Rotten Tomatoes, Plex)
         if isEnglish, let source = await resolveTrailerio(for: meta) {
             return source
         }
 
+        // 2. High-resolution trailers from IMDb (1080p/720p direct MP4, language-scored)
+        if (isEnglish || preview), let source = await resolveImdbTrailer(for: meta) {
+            return source
+        }
+
+        // 3. Fall back to TMDB / YouTube (allows localized trailers for non-English fullscreen playback)
         if let ytId = await preferredTrailerYouTubeIdInCurrentContext(for: meta) {
             let source: TrailerPlaybackSource?
             if let youtubeSourceProvider {
@@ -2065,6 +2385,11 @@ actor YouTubeTrailerResolver {
                 )
             }
             if let source { return source }
+        }
+
+        // 4. Fallback for non-English if YouTube failed: try IMDb high-res, then Trailerio
+        if let source = await resolveImdbTrailer(for: meta) {
+            return source
         }
 
         // The YouTube ID may be present while its stream is unavailable. Keep
@@ -2230,11 +2555,11 @@ actor YouTubeTrailerResolver {
             return source
         }
 
-        // Full player supports 1080p adaptive video + audio pairs as well as HLS
+        // Full player supports integrated streams with audio (HLS as well as progressive)
         if let source = await resolveWithInnertube(
             videoId: youtubeVideoId,
             forceRefreshConfig: false,
-            preferIntegratedStream: false
+            preferIntegratedStream: true
         ) {
             return source
         }
@@ -2246,7 +2571,7 @@ actor YouTubeTrailerResolver {
         if let source = await resolveWithInnertube(
             videoId: youtubeVideoId,
             forceRefreshConfig: true,
-            preferIntegratedStream: false
+            preferIntegratedStream: true
         ) {
             return source
         }
@@ -2254,7 +2579,7 @@ actor YouTubeTrailerResolver {
         return nil
     }
 
-    /// Returns an HD trailer preview stream and the headers required by its
+    /// Returns an integrated trailer preview stream and the headers required by its
     /// originating YouTube client.
     func resolvePreview(youtubeVideoId: String, title: String?, year: String?) async -> TrailerPlaybackSource? {
         guard Self.isYouTubeVideoId(youtubeVideoId) else { return nil }
@@ -2277,7 +2602,7 @@ actor YouTubeTrailerResolver {
         if let source = await resolveWithInnertube(
             videoId: youtubeVideoId,
             forceRefreshConfig: false,
-            preferIntegratedStream: false
+            preferIntegratedStream: true
         ) {
             previewCache[youtubeVideoId] = (source, Date())
             return source
@@ -2288,7 +2613,7 @@ actor YouTubeTrailerResolver {
         if let source = await resolveWithInnertube(
             videoId: youtubeVideoId,
             forceRefreshConfig: true,
-            preferIntegratedStream: false
+            preferIntegratedStream: true
         ) {
             previewCache[youtubeVideoId] = (source, Date())
             return source
@@ -2532,8 +2857,9 @@ actor YouTubeTrailerResolver {
             )
         }
 
-        // 6. Check for HD adaptive video (>= 720p) if audio was not paired
-        if let bestAdaptive = await firstReachable(
+        // 6. For video-only callers: Check for HD adaptive video (>= 720p) if audio was not paired
+        if !preferIntegratedStream,
+           let bestAdaptive = await firstReachable(
             sortedAdaptiveVideo.filter { $0.height >= 720 },
             includeReferer: false
         ) {
@@ -3853,7 +4179,7 @@ struct TvDetailsContent: View {
                 return
             }
 
-            guard let item = await playbackSource.makePlayerItem() else { return }
+            guard let item = playbackSource.makePlayerItem() else { return }
             guard !Task.isCancelled, isBackgroundTrailerAllowed(hasHandoff: hasHandoff) else { return }
 
             trailerPlayer.replaceCurrentItem(with: item)
@@ -3917,7 +4243,7 @@ struct TvDetailsContent: View {
                 return
             }
 
-            guard let item = await playbackSource.makePlayerItem() else { return }
+            guard let item = playbackSource.makePlayerItem() else { return }
             guard !Task.isCancelled else { return }
 
             trailerPlayer.replaceCurrentItem(with: item)
@@ -5018,20 +5344,19 @@ private struct TvDetailsBackdrop: View {
             }
 
             GeometryReader { proxy in
-                    LinearGradient(
+                LinearGradient(
                     stops: [
-                        .init(color: backdropColor.opacity(0.95), location: 0),
-                        .init(color: backdropColor.opacity(0.86), location: 0.25),
-                        .init(color: backdropColor.opacity(0.64), location: 0.50),
-                        .init(color: backdropColor.opacity(0.34), location: 0.70),
-                        .init(color: backdropColor.opacity(0.10), location: 0.88),
+                        .init(color: backdropColor.opacity(0.96), location: 0),
+                        .init(color: backdropColor.opacity(0.85), location: 0.22),
+                        .init(color: backdropColor.opacity(0.52), location: 0.46),
+                        .init(color: backdropColor.opacity(0.14), location: 0.76),
                         .init(color: .clear, location: 1)
                     ],
                     startPoint: .leading,
                     endPoint: .trailing
                 )
-                .frame(width: proxy.size.width * 0.76)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .frame(width: proxy.size.width * 0.58, height: proxy.size.height)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
 
         }
@@ -7080,6 +7405,9 @@ private struct TvEpisodeGuideInput: Equatable {
         guard lhs.metaID == rhs.metaID else { return false }
         guard lhs.videosCount == rhs.videosCount else { return false }
         guard lhs.firstVideoID == rhs.firstVideoID, lhs.lastVideoID == rhs.lastVideoID else { return false }
+        if lhs.videos.withUnsafeBufferPointer({ l in rhs.videos.withUnsafeBufferPointer({ r in l.baseAddress == r.baseAddress }) }) {
+            return true
+        }
         return lhs.videos == rhs.videos
     }
 }
@@ -7099,6 +7427,7 @@ private struct TvEpisodeGuide {
     let episodes: [NuvioVideo]
     let seasons: [Int]
     let episodesBySeason: [Int: [NuvioVideo]]
+    let episodeIndexByIDBySeason: [Int: [String: Int]]
     let airedRegularEpisodes: [NuvioVideo]
 
     init(metaID: String, videos: [NuvioVideo], revision: Int) {
@@ -7115,8 +7444,19 @@ private struct TvEpisodeGuide {
             grouped[episode.season, default: []].append(episode)
         }
 
+        var groupedIndex: [Int: [String: Int]] = [:]
+        for (season, seasonEps) in grouped {
+            var indices: [String: Int] = [:]
+            indices.reserveCapacity(seasonEps.count)
+            for (offset, element) in seasonEps.enumerated() {
+                indices[element.id] = offset
+            }
+            groupedIndex[season] = indices
+        }
+
         episodes = ordered
         episodesBySeason = grouped
+        episodeIndexByIDBySeason = groupedIndex
         seasons = orderedSeasons
         airedRegularEpisodes = CatalogWatchedPolicy.airedRegularEpisodes(ordered)
     }
@@ -7362,9 +7702,10 @@ private final class TvDetailsEpisodeCache: ObservableObject {
             let episodeScrollIndex = initialEpisode.flatMap { target in
                 seasonEpisodes.firstIndex(where: { $0.id == target.id })
             } ?? 0
-            let seasonEpisodeIndexByID = seasonEpisodes.enumerated().reduce(into: [:]) { indices, entry in
-                indices[entry.element.id] = entry.offset
-            }
+            let seasonEpisodeIndexByID = guide.episodeIndexByIDBySeason[selectedSeason]
+                ?? seasonEpisodes.enumerated().reduce(into: [:]) { indices, entry in
+                    indices[entry.element.id] = entry.offset
+                }
             let seasonIsWatched = !seasonEpisodes.isEmpty && seasonEpisodes.allSatisfy {
                 displayWatchedKeys.contains("\($0.season):\($0.episode)")
             }
@@ -7486,7 +7827,14 @@ private struct TvDetailsEpisodes: View {
         _selectedSeason = State(initialValue: initialState.selectedSeason)
         _seasonEpisodes = State(initialValue: initialState.seasonEpisodes)
         _seasonEpisodeIndexByID = State(initialValue: initialState.seasonEpisodeIndexByID)
-        _episodeScrollIndex = State(initialValue: initialState.episodeScrollIndex)
+        var initialScrollIndex = initialState.episodeScrollIndex
+        if let restrictFocusToKey, restrictFocusToKey.hasPrefix("episode-card\u{1}") {
+            let targetID = String(restrictFocusToKey.dropFirst("episode-card\u{1}".count))
+            if let targetIndex = initialState.seasonEpisodeIndexByID[targetID] {
+                initialScrollIndex = targetIndex
+            }
+        }
+        _episodeScrollIndex = State(initialValue: initialScrollIndex)
         _watchedEpisodeKeys = State(initialValue: initialState.watchedEpisodeKeys)
         _episodeWatchCounts = State(initialValue: initialState.episodeWatchCounts)
         _watchedSummary = State(initialValue: initialState.watchedSummary)
@@ -7537,6 +7885,13 @@ private struct TvDetailsEpisodes: View {
         }
         .onChange(of: selectedSeason) { _, newSeason in
             setSeasonEpisodes(episodeGuide.episodesBySeason[newSeason] ?? [])
+        }
+        .onChange(of: restrictFocusToKey) { _, newKey in
+            guard let newKey, newKey.hasPrefix("episode-card\u{1}") else { return }
+            let targetID = String(newKey.dropFirst("episode-card\u{1}".count))
+            if let targetIndex = seasonEpisodeIndexByID[targetID] {
+                episodeScrollIndex = targetIndex
+            }
         }
     }
 
@@ -7598,8 +7953,18 @@ private struct TvDetailsEpisodes: View {
     }
 
     private func setSeasonEpisodes(_ newEpisodes: [NuvioVideo], watchedKeys: Set<String>? = nil) {
+        // Episode guides can be replaced asynchronously while the remote is
+        // focused deep into a long season. Keep the same episode when possible,
+        // otherwise clamp the scroll index to the new season's bounds.
+        episodeScrollIndex = TvDetailsEpisodeIndex.reconciled(
+            previousEpisodes: seasonEpisodes,
+            updatedEpisodes: newEpisodes,
+            index: episodeScrollIndex
+        )
         seasonEpisodes = newEpisodes
-        seasonEpisodeIndexByID = Self.episodeIndexByID(newEpisodes)
+        let seasonNumber = newEpisodes.first?.season ?? selectedSeason
+        seasonEpisodeIndexByID = episodeGuide.episodeIndexByIDBySeason[seasonNumber]
+            ?? Self.episodeIndexByID(newEpisodes)
         refreshSeasonWatchedState(for: newEpisodes, watchedKeys: watchedKeys ?? watchedEpisodeKeys)
     }
 
@@ -7657,22 +8022,18 @@ private struct TvDetailsEpisodes: View {
 
     private func materializedEpisodeIndices(visibleCardCount: Int) -> [Int] {
         guard !seasonEpisodes.isEmpty else { return [] }
-        let focusIndex = min(max(episodeScrollIndex, 0), seasonEpisodes.count - 1)
-        var lowerBound = max(0, focusIndex - 4)
-        var upperBound = min(seasonEpisodes.count - 1, focusIndex + visibleCardCount + 2)
-
-        if let restriction = effectiveFocusRestriction {
-            let prefix = "episode-card\u{1}"
-            if restriction.hasPrefix(prefix) {
-                let targetID = String(restriction.dropFirst(prefix.count))
-                if let targetIndex = seasonEpisodeIndexByID[targetID] {
-                    lowerBound = min(lowerBound, targetIndex)
-                    upperBound = max(upperBound, targetIndex)
-                }
-            }
-        }
-
-        return Array(lowerBound...upperBound)
+        let targetIndex: Int? = {
+            guard let restriction = effectiveFocusRestriction,
+                  restriction.hasPrefix("episode-card\u{1}") else { return nil }
+            let targetID = String(restriction.dropFirst("episode-card\u{1}".count))
+            return seasonEpisodeIndexByID[targetID]
+        }()
+        return TvDetailsEpisodeIndex.windowIndices(
+            totalEpisodes: seasonEpisodes.count,
+            scrollIndex: episodeScrollIndex,
+            targetIndex: targetIndex,
+            visibleCardCount: visibleCardCount
+        )
     }
 
     private var episodeCardStrip: some View {
@@ -7682,6 +8043,7 @@ private struct TvDetailsEpisodes: View {
             let visibleCardCount = max(1, Int(ceil(stripWidth / TvEpisodeCardLayout.step)) + 1)
             let materializedIndices = materializedEpisodeIndices(visibleCardCount: visibleCardCount)
             let materializedEpisodes = materializedIndices.map { seasonEpisodes[$0] }
+            let currentSeasonEpisodeNumbers = seasonEpisodes.map(\.episode)
 
             HStack(alignment: .bottom, spacing: TvEpisodeCardLayout.spacing) {
                 ForEach(materializedEpisodes) { video in
@@ -7693,7 +8055,6 @@ private struct TvDetailsEpisodes: View {
                     TvEpisodeCard(
                         video: video,
                         fallbackArtworkURL: meta.backdropUrl,
-                        fallbackRating: seriesRating,
                         continueProgress: continueProgress(for: video),
                         isWatched: watchedEpisodeKeys.contains(watchKey),
                         watchCount: episodeWatchCount,
@@ -7740,14 +8101,14 @@ private struct TvDetailsEpisodes: View {
                                 _ = libraryWatchedContext.setSeasonWatched(
                                     meta,
                                     season: selectedSeason,
-                                    episodes: seasonEpisodes.map(\.episode),
+                                    episodes: currentSeasonEpisodeNumbers,
                                     isWatched: !isSeasonWatched
                                 )
                             } else {
                                 WatchedStore.setSeasonWatched(
                                     meta: meta,
                                     season: selectedSeason,
-                                    episodes: seasonEpisodes.map(\.episode),
+                                    episodes: currentSeasonEpisodeNumbers,
                                     isWatched: !isSeasonWatched
                                 )
                             }
@@ -7776,15 +8137,36 @@ private struct TvDetailsEpisodes: View {
             .animation(smoothFocus ? .spring(response: 0.3, dampingFraction: 1.0) : nil, value: episodeScrollIndex)
         }
         .frame(height: TvEpisodeCardLayout.stripHeight)
-        .task(id: "\(selectedSeason)-\(materializedEpisodeIndices(visibleCardCount: 6).first ?? 0)-\(materializedEpisodeIndices(visibleCardCount: 6).last ?? 0)") {
+        .task(id: "\(selectedSeason)-\((materializedEpisodeIndices(visibleCardCount: 6).first ?? 0) / 6)") {
+            // Debounce to keep rapid D-pad navigation butter-smooth without spamming network/state passes
+            do {
+                try await Task.sleep(nanoseconds: 180_000_000)
+            } catch {
+                return
+            }
             let visibleCount = max(1, Int(ceil(1920 / TvEpisodeCardLayout.step)) + 1)
             let indices = materializedEpisodeIndices(visibleCardCount: visibleCount)
             let episodes = indices.compactMap { seasonEpisodes.indices.contains($0) ? seasonEpisodes[$0] : nil }
             guard !episodes.isEmpty else { return }
+            if let tmdbId = meta.tmdbId {
+                await SeriesGraphRatingsService.shared.registerTmdbId(tmdbId, forImdbId: meta.id)
+                if let imdb = meta.imdbId {
+                    await SeriesGraphRatingsService.shared.registerTmdbId(tmdbId, forImdbId: imdb)
+                }
+            }
             let ids = episodes.map { meta.canonicalEpisodeStreamId(for: $0) }
             let results = await AddonRatingsService.fetchRatingsForEpisodes(episodeIds: ids)
             if !results.isEmpty {
-                episodeRatings.merge(results) { _, new in new }
+                var hasNew = false
+                for (id, ratings) in results {
+                    if episodeRatings[id] != ratings {
+                        hasNew = true
+                        break
+                    }
+                }
+                if hasNew {
+                    episodeRatings.merge(results) { _, new in new }
+                }
             }
         }
     }
@@ -7870,6 +8252,52 @@ private struct TvDetailsEpisodes: View {
     }
 }
 
+/// Keeps the horizontal episode rail inside its bounds when new metadata
+/// replaces or reorders a season's episodes. The next render uses this index
+/// both to materialize nearby cards and to offset their HStack.
+enum TvDetailsEpisodeIndex {
+    static func reconciled(
+        previousEpisodes: [NuvioVideo],
+        updatedEpisodes: [NuvioVideo],
+        index: Int
+    ) -> Int {
+        guard !updatedEpisodes.isEmpty else { return 0 }
+        if previousEpisodes.indices.contains(index) {
+            let previouslySelected = previousEpisodes[index]
+            if let updatedIndex = updatedEpisodes.firstIndex(where: {
+                $0.id == previouslySelected.id
+                    && $0.season == previouslySelected.season
+                    && $0.episode == previouslySelected.episode
+            }) {
+                return updatedIndex
+            }
+            // Some metadata providers replace episode IDs while enriching
+            // titles and artwork; season/episode numbers remain stable.
+            if let updatedIndex = updatedEpisodes.firstIndex(where: {
+                $0.season == previouslySelected.season
+                    && $0.episode == previouslySelected.episode
+            }) {
+                return updatedIndex
+            }
+        }
+        return min(max(index, 0), updatedEpisodes.count - 1)
+    }
+
+    static func windowIndices(
+        totalEpisodes: Int,
+        scrollIndex: Int,
+        targetIndex: Int?,
+        visibleCardCount: Int
+    ) -> [Int] {
+        guard totalEpisodes > 0 else { return [] }
+        let anchorIndex = targetIndex.map { min(max($0, 0), totalEpisodes - 1) }
+            ?? min(max(scrollIndex, 0), totalEpisodes - 1)
+        let lowerBound = max(0, anchorIndex - 4)
+        let upperBound = min(totalEpisodes - 1, anchorIndex + visibleCardCount + 2)
+        return Array(lowerBound...upperBound)
+    }
+}
+
 /// Focus keys for episode cards in the strip.
 private enum TvEpisodeFocus {
     static func card(_ videoID: String) -> String { "episode-card\u{1}\(videoID)" }
@@ -7944,7 +8372,6 @@ private struct TvEpisodeRatingItem: Identifiable {
 private struct TvEpisodeCard: View {
     let video: NuvioVideo
     let fallbackArtworkURL: String?
-    let fallbackRating: Double?
     let continueProgress: Double?
     let isWatched: Bool
     let watchCount: Int
@@ -8299,20 +8726,22 @@ private struct TvEpisodeCard: View {
 
         for rating in episodeRatings {
             let formatted = AddonRatingsService.formatRating(value: rating.value, max: rating.max)
+            let visual = TvRatingVisual.visual(for: rating.source)
             items.append(
                 TvEpisodeRatingItem(
                     id: rating.source,
                     source: rating.source,
-                    displayName: rating.name ?? rating.source.capitalized,
+                    displayName: rating.name ?? visual?.displayName ?? rating.source.capitalized,
                     valueText: formatted,
                     iconUrl: rating.iconUrl.flatMap { URL(string: $0) },
-                    assetName: nil,
-                    color: Color(red: 0.96, green: 0.77, blue: 0.22)
+                    assetName: visual?.assetName,
+                    color: visual?.color ?? Color(red: 0.96, green: 0.77, blue: 0.22)
                 )
             )
         }
 
-        if let ratingText {
+        if let ratingText,
+           !items.contains(where: { AddonRatingsService.normalizedSourceKey($0.source) == "imdb" }) {
             items.append(
                 TvEpisodeRatingItem(
                     id: "imdb",
@@ -8330,13 +8759,10 @@ private struct TvEpisodeCard: View {
     }
 
     private var ratingText: String? {
-        if let r = video.rating?.trimmingCharacters(in: .whitespaces), !r.isEmpty {
-            return r
+        guard let r = video.rating?.trimmingCharacters(in: .whitespaces), !r.isEmpty else {
+            return nil
         }
-        if episodeRatings.isEmpty, let fb = fallbackRating {
-            return String(format: "%.1f", fb)
-        }
-        return nil
+        return r
     }
 
     private var dateText: String? {
@@ -8860,20 +9286,22 @@ private struct TvStreamPickerOverlay: View {
 
         for rating in episodeRatings {
             let formatted = AddonRatingsService.formatRating(value: rating.value, max: rating.max)
+            let visual = TvRatingVisual.visual(for: rating.source)
             items.append(
                 TvEpisodeRatingItem(
                     id: rating.source,
                     source: rating.source,
-                    displayName: rating.name ?? rating.source.capitalized,
+                    displayName: rating.name ?? visual?.displayName ?? rating.source.capitalized,
                     valueText: formatted,
                     iconUrl: rating.iconUrl.flatMap { URL(string: $0) },
-                    assetName: nil,
-                    color: Color(red: 0.96, green: 0.77, blue: 0.22)
+                    assetName: visual?.assetName,
+                    color: visual?.color ?? Color(red: 0.96, green: 0.77, blue: 0.22)
                 )
             )
         }
 
-        if let ratingText = episode.rating?.trimmingCharacters(in: .whitespaces), !ratingText.isEmpty {
+        if let ratingText = episode.rating?.trimmingCharacters(in: .whitespaces), !ratingText.isEmpty,
+           !items.contains(where: { AddonRatingsService.normalizedSourceKey($0.source) == "imdb" }) {
             items.append(
                 TvEpisodeRatingItem(
                     id: "imdb",
@@ -9400,10 +9828,28 @@ private struct TvStreamCardPresentation {
     let showAddonLogo: Bool
 
     init(stream: NuvioStream, badgeSettings: StreamBadgeSettingsSnapshot) {
-        importedBadges = StreamBadgeMatcher.matchedBadges(
+        let matched = StreamBadgeMatcher.matchedBadges(
             for: stream,
             rules: badgeSettings.rules
         )
+        let tags = StreamQualityTags.parse(stream: stream)
+        if tags.isFEL || tags.isMEL {
+            let elSuffix = tags.isFEL ? "FEL" : "MEL"
+            importedBadges = matched.map { badge in
+                let lowerName = badge.name.lowercased()
+                let lowerId = badge.id.lowercased()
+                if (lowerName.contains("dv") || lowerName.contains("dolby") || lowerId.contains("dv") || lowerId.contains("dolby"))
+                    && !badge.name.localizedCaseInsensitiveContains("fel")
+                    && !badge.name.localizedCaseInsensitiveContains("mel") {
+                    var modified = badge
+                    modified.name = "\(badge.name) \(elSuffix)"
+                    return modified
+                }
+                return badge
+            }
+        } else {
+            importedBadges = matched
+        }
         fileSizeLabel = badgeSettings.showFileSizeBadges
             ? StreamBadgeSizing.fileSizeLabel(for: stream)
             : nil

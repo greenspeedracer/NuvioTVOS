@@ -2,6 +2,9 @@ import SwiftUI
 import UIKit
 import Security
 import AetherEngineSMB
+#if canImport(AetherEngine)
+import AetherEngine
+#endif
 
 enum AppFocusOutline {
     static var color: Color {
@@ -13,7 +16,7 @@ enum AppFocusOutline {
     static let emphasizedWidth: CGFloat = 6
 }
 
-private enum SettingsCategory: String, CaseIterable, Identifiable {
+enum SettingsCategory: String, CaseIterable, Identifiable {
     case account = "Account & Profiles"
     case appearance = "Appearance"
     case layout = "Layout & Discovery"
@@ -179,11 +182,14 @@ enum SettingsKey {
     static let continueWatchingSort = "nuvio.tv.settings.layout.continueWatchingSort"
     static let upNextFromFurthestEpisode = "nuvio.tv.settings.layout.upNextFromFurthestEpisode"
     static let showUnairedNextUp = "nuvio.tv.settings.layout.showUnairedNextUp"
+    static let continueWatchingEpisodeRatings = "nuvio.tv.settings.layout.continueWatchingEpisodeRatings"
     static let cardCornerRadius = "nuvio.tv.settings.layout.cardCornerRadius"
     static let cardSize = "nuvio.tv.settings.layout.cardSize"
     static let liquidGlassCards = "nuvio.tv.settings.layout.liquidGlassCards"
     /// Settings → Appearance → Sidebar → Calendar.
     static let showCalendarTab = "nuvio.tv.settings.layout.showCalendarTab"
+    /// Settings → Appearance → Sidebar → Watch Party.
+    static let showWatchPartyTab = "nuvio.tv.settings.layout.showWatchPartyTab"
     /// Settings → Layout → Calendar → Today Row.
     static let homeCalendarToday = "nuvio.tv.settings.layout.homeCalendarToday"
     /// The calendar's own options, chosen from its header.
@@ -289,6 +295,8 @@ enum SettingsKey {
 
     static let trueHDSpatialAudio = "nuvio.tv.settings.playback.trueHDSpatialAudio"
     static let preferDualLayerDolbyVision = "nuvio.tv.settings.playback.preferDualLayerDolbyVision"
+    static let dualLayerRoute = "nuvio.tv.settings.playback.dualLayerRoute"
+    static let preferHDR10Plus = "nuvio.tv.settings.playback.preferHDR10Plus"
     static let lowResUpscaling = "nuvio.tv.settings.playback.lowResUpscaling"
     static let losslessAudioBridge = "nuvio.tv.settings.playback.losslessAudioBridge"
     static let playerEngine = "nuvio.tv.settings.playback.playerEngine"
@@ -364,6 +372,10 @@ enum SettingsKey {
     static let timelineSegmentsEnabled = "nuvio.tv.settings.playback.timelineSegmentsEnabled"
     /// Legacy preference retained for compatibility; seeking snap is always enabled.
     static let timelineSnapEnabled = "nuvio.tv.settings.playback.timelineSnapEnabled"
+    /// AutoSubSync: line add-on subtitles up with the video's embedded subtitles (off by default).
+    static let subtitleAutoSync = "nuvio.tv.settings.playback.subtitleAutoSync"
+    /// Corrections up to this many milliseconds keep the subtitle's own timing.
+    static let subtitleAutoSyncToleranceMs = "nuvio.tv.settings.playback.subtitleAutoSyncToleranceMs"
     static let showLoadingStatus = "nuvio.tv.settings.playback.showLoadingStatus"
     static let audioDelayPersistEnabled = "nuvio.tv.settings.playback.audioDelayPersistEnabled"
     static let persistentAudioDelayMs = "nuvio.tv.settings.playback.persistentAudioDelayMs"
@@ -394,8 +406,8 @@ enum SettingsKey {
         theme, bodyColor, font, language, amoled, amoledSurfaces, reduceMotion,
         homeLayout, sidebarClockFormat, gridRows, catalogAutoRefreshInterval, homeCatalogShowType, heroEnabled, heroCatalogs, fullscreenHeroBackdrop, homeHeroRatingSource, posterLabels, catalogAddonNames, landscapePosters, customPosterURLPattern, customPosterEnabledScreens, discoverLocation,
         searchStyle, preferAddonArtworkInSearch,
-        continueWatchingVisible, continueWatchingLandscape, continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp,
-        showCalendarTab, homeCalendarToday, calendarFilter, calendarHideSpoilers, calendarCheckAvailability, calendarTvmazeTimes,
+        continueWatchingVisible, continueWatchingLandscape, continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp, continueWatchingEpisodeRatings,
+        showCalendarTab, showWatchPartyTab, homeCalendarToday, calendarFilter, calendarHideSpoilers, calendarCheckAvailability, calendarTvmazeTimes,
         cardCornerRadius, cardSize, liquidGlassCards,
         hideUnreleased, showFullDates, detailsActionsBelowInfo,
         detailsSectionOrder, detailsSectionDisabled,
@@ -425,7 +437,7 @@ enum SettingsKey {
         cinemetaDisabled, deletedLocalAddons,
         smbServers, smbLibraryIndex, smbLocalRowEnabled,
         jellyfinServers, jellyfinLibraryIndex, jellyfinLocalRowEnabled,
-        playerEngine, trueHDSpatialAudio, preferDualLayerDolbyVision, lowResUpscaling, losslessAudioBridge, trickplayServer, externalPlayer, smartStreamSelection, reuseLastLink, reuseLastLinkCacheHours, rememberLastSourceFocus, smartStreamUseTopResult, smartStreamQuality, smartSubtitleMatching,
+        playerEngine, trueHDSpatialAudio, preferDualLayerDolbyVision, dualLayerRoute, preferHDR10Plus, lowResUpscaling, losslessAudioBridge, trickplayServer, externalPlayer, smartStreamSelection, reuseLastLink, reuseLastLinkCacheHours, rememberLastSourceFocus, smartStreamUseTopResult, smartStreamQuality, smartSubtitleMatching,
         backgroundStreamPreFetch,
         cachedOnlyStreams, preferHardwareDecodedStreams, preserveAddonStreamOrder, streamSortOption, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
         autoPlayNext, autoPlayNextCountdown, autoSkipIntro, autoSkipRecap, autoSkipOutro, autoSkipMovieCredits, streamAutoPlayPreferBingeGroup, streamAutoPlayReuseBingeGroup, postPlayRecommendationsEnabled, trailersEnabled, backgroundTrailersEnabled, trailerPreviewSound, trailerDelay,
@@ -435,6 +447,7 @@ enum SettingsKey {
         externalPlayerForwardSubtitles, assOverrideMode,
         playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, playerButtonOrder, seekPreviewEnabled, seekPreviewBeyondBuffer, seekrApiKey, seekrEnabled, showLoadingStatus,
         timelineOpeningColor, timelineEndingColor, timelineSegmentsEnabled, timelineSnapEnabled,
+        subtitleAutoSync, subtitleAutoSyncToleranceMs,
         audioDelayPersistEnabled, persistentAudioDelayMs,
         sceneFeatureEnabled, sceneTabOrder, sceneTabDisabled,
         fastNavigation, smoothFocus, playbackDiagnostics, playbackDebug, focusHighlighter,
@@ -1245,42 +1258,47 @@ private enum LanguagePickerKind: Hashable {
 }
 
 struct SettingsView: View {
+    @Binding var selectedCategory: SettingsCategory
     let activeProfile: Profile?
     let accountEmail: String?
     let isAuthenticated: Bool
     let sessionNeedsReauthentication: Bool
     let onChangeProfileName: ((String, String) -> Void)?
     let onChangeProfileAvatar: ((String, String) -> Void)?
+    let onChangeProfileBackground: ((String, String?, String?) -> Void)?
     let onChangeProfilePin: ((String, String?, String?) async -> Bool)?
     let onVerifyProfilePin: ((String, String) async -> Bool)?
     let onSignIn: (() -> Void)?
     let onSignOut: (() -> Void)?
 
     init(
+        selectedCategory: Binding<SettingsCategory>,
         activeProfile: Profile? = nil,
         accountEmail: String? = nil,
         isAuthenticated: Bool = false,
         sessionNeedsReauthentication: Bool = false,
         onChangeProfileName: ((String, String) -> Void)? = nil,
         onChangeProfileAvatar: ((String, String) -> Void)? = nil,
+        onChangeProfileBackground: ((String, String?, String?) -> Void)? = nil,
         onChangeProfilePin: ((String, String?, String?) async -> Bool)? = nil,
         onVerifyProfilePin: ((String, String) async -> Bool)? = nil,
         onSignIn: (() -> Void)? = nil,
         onSignOut: (() -> Void)? = nil
     ) {
+        self._selectedCategory = selectedCategory
         self.activeProfile = activeProfile
         self.accountEmail = accountEmail
         self.isAuthenticated = isAuthenticated
         self.sessionNeedsReauthentication = sessionNeedsReauthentication
         self.onChangeProfileName = onChangeProfileName
         self.onChangeProfileAvatar = onChangeProfileAvatar
+        self.onChangeProfileBackground = onChangeProfileBackground
         self.onChangeProfilePin = onChangeProfilePin
         self.onVerifyProfilePin = onVerifyProfilePin
         self.onSignIn = onSignIn
         self.onSignOut = onSignOut
     }
 
-    @State private var selectedCategory: SettingsCategory = .account
     @State private var presentedLanguagePicker: LanguagePickerKind?
     @State private var presentedProfilePinMode: ProfilePinSheetMode?
     @FocusState private var focusedCategory: SettingsCategory?
@@ -1608,6 +1626,7 @@ struct SettingsView: View {
                 sessionNeedsReauthentication: sessionNeedsReauthentication,
                 onChangeProfileName: onChangeProfileName,
                 onChangeProfileAvatar: onChangeProfileAvatar,
+                onChangeProfileBackground: onChangeProfileBackground,
                 onChangeProfilePin: onChangeProfilePin,
                 onVerifyProfilePin: onVerifyProfilePin,
                 onSignIn: onSignIn,
@@ -1736,6 +1755,7 @@ private struct AccountSettingsView: View {
     let sessionNeedsReauthentication: Bool
     let onChangeProfileName: ((String, String) -> Void)?
     let onChangeProfileAvatar: ((String, String) -> Void)?
+    let onChangeProfileBackground: ((String, String?, String?) -> Void)?
     let onChangeProfilePin: ((String, String?, String?) async -> Bool)?
     let onVerifyProfilePin: ((String, String) async -> Bool)?
     let onSignIn: (() -> Void)?
@@ -1751,6 +1771,7 @@ private struct AccountSettingsView: View {
     @ObservedObject private var iCloudSyncManager = ICloudSettingsSyncManager.shared
     @State private var editableProfileName = ""
     @State private var showingAvatarPicker = false
+    @State private var showingBackgroundPicker = false
 
     private var accountStatusText: String {
         guard isAuthenticated else {
@@ -1835,6 +1856,20 @@ private struct AccountSettingsView: View {
                 }
                 .opacity(activeProfile != nil && onChangeProfileAvatar != nil ? 1 : 0.46)
                 .disabled(activeProfile == nil || onChangeProfileAvatar == nil)
+
+                SettingsActionRow(
+                    title: L10n.string("profile_background_title", fallback: "Profile Background"),
+                    subtitle: L10n.string(
+                        "profile_background_subtitle",
+                        fallback: "Personalize profile selection with supporter animated backgrounds or custom URLs"
+                    ),
+                    value: currentBackgroundLabel,
+                    accentColor: accentColor
+                ) {
+                    showingBackgroundPicker = true
+                }
+                .opacity(activeProfile != nil && onChangeProfileBackground != nil ? 1 : 0.46)
+                .disabled(activeProfile == nil || onChangeProfileBackground == nil)
 
                 SettingsToggleRow(
                     title: L10n.string("profile_pin_title", fallback: "Profile PIN lock"),
@@ -2008,9 +2043,44 @@ private struct AccountSettingsView: View {
                 }
             }
         }
+        .sheet(isPresented: $showingBackgroundPicker) {
+            if let profile = activeProfile {
+                ProfileBackgroundPickerSheet(
+                    isPresented: $showingBackgroundPicker,
+                    title: displayProfileName,
+                    standardColor: profileColor(for: profile),
+                    initialBackgroundId: profile.profileBackgroundId,
+                    initialBackgroundUrl: profile.profileBackgroundUrl
+                ) { backgroundId, backgroundUrl in
+                    onChangeProfileBackground?(profile.id, backgroundId, backgroundUrl)
+                }
+            }
+        }
         .onChange(of: iCloudSyncEnabled) { _, newValue in
             ICloudSettingsSyncManager.shared.isEnabled = newValue
         }
+    }
+
+    private var currentBackgroundLabel: String {
+        guard let profile = activeProfile else {
+            return L10n.string("profile_background_normal", fallback: "Standard")
+        }
+        let custom = profile.profileBackgroundUrl?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !custom.isEmpty {
+            return L10n.string("profile_background_custom", fallback: "Custom")
+        }
+        if let bgId = profile.profileBackgroundId?.trimmingCharacters(in: .whitespacesAndNewlines), !bgId.isEmpty {
+            return ProfileBackgroundCatalogStore.shared.item(for: bgId)?.displayName ?? bgId
+        }
+        return L10n.string("profile_background_normal", fallback: "Standard")
+    }
+
+    private func profileColor(for profile: Profile) -> Color {
+        if let item = AvatarCatalogStore.shared.item(for: profile.avatarId),
+           let bgHex = item.bgColor, !bgHex.isEmpty {
+            return Color(hex: bgHex)
+        }
+        return Color(hex: "#1E88E5")
     }
 
     private var displayProfileName: String {
@@ -2290,6 +2360,7 @@ private struct AppearanceSettingsView: View {
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadius = AppCardStyle.defaultCornerRadiusRaw
     @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
     @AppStorage(SettingsKey.showCalendarTab) private var showCalendarTab = true
+    @AppStorage(SettingsKey.showWatchPartyTab) private var showWatchPartyTab = true
     @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
     @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
     @State private var customPosterURLDraft = ""
@@ -2322,6 +2393,15 @@ private struct AppearanceSettingsView: View {
                         fallback: "Upcoming episodes and releases from your library"
                     ),
                     isOn: $showCalendarTab,
+                    accentColor: accentColor
+                )
+                SettingsToggleRow(
+                    title: L10n.string("nav_watch_party", fallback: "Watch Party"),
+                    subtitle: L10n.string(
+                        "settings_show_watch_party_tab_subtitle",
+                        fallback: "Show Watch Party in the sidebar"
+                    ),
+                    isOn: $showWatchPartyTab,
                     accentColor: accentColor
                 )
             }
@@ -3352,6 +3432,7 @@ private struct LayoutDiscoverySettingsView: View {
     @AppStorage(SettingsKey.continueWatchingSort) private var continueWatchingSort = "Default"
     @AppStorage(SettingsKey.upNextFromFurthestEpisode) private var upNextFromFurthestEpisode = true
     @AppStorage(SettingsKey.showUnairedNextUp) private var showUnairedNextUp = true
+    @AppStorage(SettingsKey.continueWatchingEpisodeRatings) private var continueWatchingEpisodeRatings = true
     @AppStorage(SettingsKey.homeCalendarToday) private var homeCalendarToday = true
     @AppStorage(SettingsKey.hideUnreleased) private var hideUnreleased = false
     @AppStorage(SettingsKey.showFullDates) private var showFullDates = true
@@ -3663,6 +3744,18 @@ private struct LayoutDiscoverySettingsView: View {
                         fallback: "Keep upcoming episodes in Continue Watching with their air date"
                     ),
                     isOn: $showUnairedNextUp,
+                    accentColor: accentColor
+                )
+                .opacity(continueWatchingVisible ? 1 : 0.46)
+                .disabled(!continueWatchingVisible)
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_layout_episode_ratings", fallback: "Episode Ratings"),
+                    subtitle: L10n.string(
+                        "tvos_layout_episode_ratings_subtitle",
+                        fallback: "Show individual episode ratings instead of series ratings for in-progress and upcoming titles"
+                    ),
+                    isOn: $continueWatchingEpisodeRatings,
                     accentColor: accentColor
                 )
                 .opacity(continueWatchingVisible ? 1 : 0.46)
@@ -4076,6 +4169,49 @@ private struct TopShelfSettingsGroup: View {
                 accentColor: accentColor
             )
 
+            if configuration.includesUpNext {
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_topshelf_shuffle_up_next", fallback: "Shuffle Up Next"),
+                    subtitle: L10n.string(
+                        "tvos_settings_topshelf_shuffle_up_next_subtitle",
+                        fallback: "Randomize the order of Up Next titles to surface different content"
+                    ),
+                    isOn: Binding(
+                        get: { configuration.shufflesUpNext },
+                        set: { isOn in
+                            update { $0.shufflesUpNext = isOn }
+                            ContinueWatchingStore.writeTopShelfFeed()
+                        }
+                    ),
+                    accentColor: accentColor
+                )
+            }
+
+            if configuration.includesLibrary {
+                SettingsOptionRow(
+                    title: L10n.string("tvos_settings_topshelf_library_source", fallback: "Library Source"),
+                    subtitle: L10n.string(
+                        "tvos_settings_topshelf_library_source_subtitle",
+                        fallback: "Choose whether Top Shelf pulls from your active library provider or a specific library"
+                    ),
+                    selection: Binding(
+                        get: { configuration.librarySource.rawValue },
+                        set: { raw in
+                            guard let source = TopShelfConfiguration.LibrarySource(rawValue: raw) else { return }
+                            update { $0.librarySource = source }
+                            TopShelfLibraryFeed.write()
+                            TopShelfLibraryFeed.prefetchRemoteLibraryIfNeeded()
+                        }
+                    ),
+                    options: availableLibrarySources.map { $0.rawValue },
+                    accentColor: accentColor,
+                    optionLabel: { raw in
+                        guard let source = TopShelfConfiguration.LibrarySource(rawValue: raw) else { return raw }
+                        return librarySourceLabel(source)
+                    }
+                )
+            }
+
             if catalogs.isEmpty {
                 SettingsInfoRow(
                     title: L10n.string("tvos_settings_topshelf_catalogs", fallback: "Home Catalogs"),
@@ -4153,6 +4289,43 @@ private struct TopShelfSettingsGroup: View {
         .animation(.easeInOut(duration: 0.2), value: configuration)
     }
 
+    private var availableLibrarySources: [TopShelfConfiguration.LibrarySource] {
+        var sources: [TopShelfConfiguration.LibrarySource] = [.active, .local]
+        let store = ProfileSettings.current
+        let profileId = ProfileSettings.activeProfileID
+        if TopShelfLibraryFeed.isSourceAvailable(.simkl, profileId: profileId, store: store) {
+            sources.append(.simkl)
+        }
+        if TopShelfLibraryFeed.isSourceAvailable(.trakt, profileId: profileId, store: store) {
+            sources.append(.trakt)
+        }
+        if TopShelfLibraryFeed.isSourceAvailable(.mdblist, profileId: profileId, store: store) {
+            sources.append(.mdblist)
+        }
+        if TopShelfLibraryFeed.isSourceAvailable(.wetrakr, profileId: profileId, store: store) {
+            sources.append(.wetrakr)
+        }
+        return sources
+    }
+
+    private func librarySourceLabel(_ source: TopShelfConfiguration.LibrarySource) -> String {
+        switch source {
+        case .active:
+            let effective = TopShelfLibraryFeed.effectiveSourceMode(for: .active)
+            return "\(L10n.string("tvos_settings_topshelf_library_active", fallback: "Active Library")) (\(effective.label))"
+        case .local:
+            return L10n.string("library_source_saved", fallback: "Nuvio Library")
+        case .simkl:
+            return "Simkl"
+        case .trakt:
+            return "Trakt"
+        case .mdblist:
+            return "MDBList"
+        case .wetrakr:
+            return "WeTrakr"
+        }
+    }
+
     private func isCatalogSelected(_ id: String) -> Bool {
         if let ids = configuration.catalogRowIDs { return ids.contains(id) }
         return id == catalogs.first?.id
@@ -4178,12 +4351,14 @@ private struct TopShelfSettingsGroup: View {
         next.directorLabel = L10n.string("details_director", fallback: "Director")
         configuration = next
         TopShelfConfigurationStore.save(next)
+        TopShelfLibraryFeed.write()
     }
 
     private func loadCatalogs() {
         configuration = TopShelfConfigurationStore.load()
         backgroundStatus = TopShelfBackgroundRefresh.lastStatus
         catalogs = (TopShelfFeedStore.read(.catalog)?.catalogRows ?? []).filter { !$0.entries.isEmpty }
+        TopShelfLibraryFeed.prefetchRemoteLibraryIfNeeded()
     }
 }
 
@@ -8634,6 +8809,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.playerEngine) private var playerEngine = "Auto"
     @AppStorage(SettingsKey.trueHDSpatialAudio) private var trueHDSpatialAudio = false
     @AppStorage(SettingsKey.preferDualLayerDolbyVision) private var preferDualLayerDolbyVision = false
+    @AppStorage(SettingsKey.dualLayerRoute) private var dualLayerRoute = "softwareHost"
     @AppStorage(SettingsKey.lowResUpscaling) private var lowResUpscaling = true
     @AppStorage(SettingsKey.losslessAudioBridge) private var losslessAudioBridge = false
     @AppStorage(SettingsKey.externalPlayer) private var externalPlayer = ExternalPlayer.builtIn.rawValue
@@ -8667,6 +8843,8 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.timelineOpeningColor) private var timelineOpeningColor = PlaybackChapters.defaultOpeningColor
     @AppStorage(SettingsKey.timelineEndingColor) private var timelineEndingColor = PlaybackChapters.defaultEndingColor
     @AppStorage(SettingsKey.timelineSegmentsEnabled) private var timelineSegmentsEnabled = false
+    @AppStorage(SettingsKey.subtitleAutoSync) private var subtitleAutoSync = false
+    @AppStorage(SettingsKey.subtitleAutoSyncToleranceMs) private var subtitleAutoSyncToleranceMs = 0
     @State private var seekrKeyCheck: SeekrKeyCheck = .unchecked
     @State private var seekrKeyCheckTask: Task<Void, Never>?
     @AppStorage(SettingsKey.showLoadingStatus) private var showLoadingStatus = true
@@ -8702,6 +8880,7 @@ private struct PlaybackSettingsView: View {
     @State private var inSightSectionsEnabledCount = TVSceneTabOrder.enabledTabCount()
 
     private let engines = ["Auto", "AetherEngine", "MPVKit"]
+    private let dualLayerRoutes = ["softwareHost", "avPlayerOutput"]
     private let externalPlayers = ExternalPlayer.settingsOptions
     private let streamQualities = ["Highest", "4K", "1080p", "720p", "Smallest"]
     private let frameRateModes = ["Off", "On start/stop", "Always"]
@@ -8850,9 +9029,42 @@ private struct PlaybackSettingsView: View {
                         "tvos_settings_prefer_dual_layer_dolby_vision_subtitle",
                         fallback: "AetherEngine only. Enable Spatial Audio for supported Atmos/DTS:X on FEL playback; otherwise PCM. Applies next playback."
                     ),
-                    isOn: $preferDualLayerDolbyVision,
+                    isOn: Binding(
+                        get: { preferDualLayerDolbyVision },
+                        set: { newValue in
+                            preferDualLayerDolbyVision = newValue
+                            if newValue {
+                                #if canImport(AetherEngine)
+                                Task(priority: .utility) {
+                                    await AetherEngine.prewarmDualLayerDolbyVision()
+                                }
+                                #endif
+                            }
+                        }
+                    ),
                     accentColor: accentColor
                 )
+
+                if preferDualLayerDolbyVision {
+                    SettingsOptionRow(
+                        title: L10n.string("tvos_settings_dual_layer_route", fallback: "Dual-Layer Route"),
+                        subtitle: L10n.string(
+                            "tvos_settings_dual_layer_route_subtitle",
+                            fallback: "Software Host decodes both layers via CPU/Metal (default). AVPlayer Output composes over native hardware video output (lower memory)."
+                        ),
+                        selection: $dualLayerRoute,
+                        options: dualLayerRoutes,
+                        accentColor: accentColor,
+                        optionLabel: { route in
+                            switch route {
+                            case "avPlayerOutput":
+                                return "AVPlayer Output (Lower Memory)"
+                            default:
+                                return "Software Host (Default)"
+                            }
+                        }
+                    )
+                }
 
                 SettingsToggleRow(
                     title: L10n.string(
@@ -9025,6 +9237,41 @@ private struct PlaybackSettingsView: View {
                 .onChange(of: seekrApiKey) { _, _ in
                     checkSeekrApiKey(afterNanoseconds: 1_000_000_000)
                 }
+            }
+
+            SettingsGroup(
+                title: L10n.string("tvos_settings_subtitle_autosync_title", fallback: "AutoSubSync"),
+                subtitle: L10n.string(
+                    "tvos_settings_subtitle_autosync_subtitle",
+                    fallback: "Lines add-on subtitles up with the timing of the subtitles embedded in the video (MKV). Only the subtitle you play is checked; it switches to the synced copy within seconds. A different intro or a cut scene gets a shift of its own."
+                )
+            ) {
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_subtitle_autosync", fallback: "Use AutoSubSync"),
+                    subtitle: L10n.string(
+                        "tvos_settings_subtitle_autosync_toggle_subtitle",
+                        fallback: "Debrid, Usenet and media servers. The original timing stays available in the player's subtitle settings."
+                    ),
+                    isOn: $subtitleAutoSync,
+                    accentColor: accentColor
+                )
+
+                SettingsOptionRow(
+                    title: L10n.string("tvos_settings_subtitle_autosync_tolerance", fallback: "AutoSubSync Tolerance"),
+                    subtitle: L10n.string(
+                        "tvos_settings_subtitle_autosync_tolerance_subtitle",
+                        fallback: "Keep the subtitle's own timing when the correction is this small or smaller."
+                    ),
+                    selection: Binding(
+                        get: { "\(subtitleAutoSyncToleranceMs) ms" },
+                        set: { value in
+                            subtitleAutoSyncToleranceMs = Int(value.replacingOccurrences(of: " ms", with: "")) ?? 0
+                        }
+                    ),
+                    options: SubtitleAutoSyncSettings.toleranceChoicesMs.map { "\($0) ms" },
+                    accentColor: accentColor
+                )
+                .disabled(!subtitleAutoSync)
             }
 
             SettingsFeatureSummaryCard(
@@ -9741,7 +9988,7 @@ private struct InSightSectionsSettingsSection: View {
                 title: L10n.string("action_reset", fallback: "Reset"),
                 subtitle: L10n.string(
                     "tvos_settings_reset_insight_sections_subtitle",
-                    fallback: "Restore the default section order, enable every section, and enable InSight"
+                    fallback: "Restore the default section order and visibility, and enable InSight"
                 ),
                 value: L10n.string("action_reset", fallback: "Reset"),
                 accentColor: accentColor
@@ -9835,6 +10082,8 @@ private struct InSightSectionsSettingsSection: View {
         switch tab {
         case .chapters:
             return L10n.string("tvos_settings_insight_chapters_subtitle", fallback: "The file's chapters, with stills")
+        case .autoSync:
+            return L10n.string("tvos_settings_insight_autosync_subtitle", fallback: "Sync add-on subtitles by hand, with diagnostics")
         case .scene:
             return L10n.string("tvos_settings_insight_scene_subtitle", fallback: "Cast and song recognition")
         case .info:
@@ -12419,6 +12668,9 @@ private struct AddonsSettingsSection: View {
     @AppStorage(SettingsKey.streamAddonManifestURLs) private var streamAddonManifestURLs = ""
     @AppStorage(SettingsKey.streamAddonManifestStates) private var streamAddonManifestStates = ""
     @State private var addonURLInput = ""
+    @State private var addonNameInput = ""
+    @State private var renamingAddonID: String?
+    @State private var renamingText = ""
     @State private var addons: [AddonItem] = AddonsSettingsSection.initialLocalAddons()
     @State private var syncedAddons: [SyncedAddon] = []
 
@@ -12438,16 +12690,76 @@ private struct AddonsSettingsSection: View {
                 )
                 .settingsEntryAnchor()
 
+                SettingsTextFieldRow(
+                    title: L10n.string("tvos_settings_add_on_name_optional", fallback: "Add-on Name (Optional)"),
+                    subtitle: L10n.string("tvos_settings_add_on_name_optional_subtitle", fallback: "Custom title for this add-on (e.g. AIOStreams 4K)"),
+                    placeholder: L10n.string(
+                        "tvos_settings_addon_name_placeholder",
+                        fallback: "e.g. AIOStreams 4K"
+                    ),
+                    text: $addonNameInput,
+                    fieldWidth: 560,
+                    onCommit: {
+                        if !addonURLInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            addAddonFromInput()
+                        }
+                    }
+                )
+
                 ForEach(Array(syncedAddons.enumerated()), id: \.element.id) { index, addon in
-                    SyncedAddonSettingsRow(
-                        addon: addon,
-                        accentColor: accentColor,
-                        canMoveUp: index > 0,
-                        canMoveDown: index < syncedAddons.count - 1,
-                        onEnabledChange: { isEnabled in setAddonEnabled(at: index, isEnabled: isEnabled) },
-                        onDelete: { removeAddon(at: index) },
-                        onMove: { up in moveAddon(at: index, up: up) }
-                    )
+                    VStack(alignment: .leading, spacing: 12) {
+                        SyncedAddonSettingsRow(
+                            addon: addon,
+                            accentColor: accentColor,
+                            canMoveUp: index > 0,
+                            canMoveDown: index < syncedAddons.count - 1,
+                            onEnabledChange: { isEnabled in setAddonEnabled(at: index, isEnabled: isEnabled) },
+                            onRename: {
+                                if renamingAddonID == addon.id {
+                                    renamingAddonID = nil
+                                    renamingText = ""
+                                } else {
+                                    renamingAddonID = addon.id
+                                    renamingText = addon.customName ?? addon.name
+                                }
+                            },
+                            onDelete: {
+                                if renamingAddonID == addon.id {
+                                    renamingAddonID = nil
+                                    renamingText = ""
+                                }
+                                removeAddon(at: index)
+                            },
+                            onMove: { up in
+                                if renamingAddonID == addon.id {
+                                    renamingAddonID = nil
+                                    renamingText = ""
+                                }
+                                moveAddon(at: index, up: up)
+                            }
+                        )
+
+                        if renamingAddonID == addon.id {
+                            HStack(spacing: 14) {
+                                SettingsTextFieldRow(
+                                    title: L10n.string("tvos_settings_rename_addon", fallback: "Rename Add-on"),
+                                    subtitle: L10n.string("tvos_settings_rename_addon_subtitle", fallback: "Custom title for this add-on"),
+                                    placeholder: addon.name,
+                                    text: $renamingText,
+                                    fieldWidth: 500,
+                                    onCommit: { saveRenamedAddon(at: index) }
+                                )
+                                AddonReorderButton(systemImage: "checkmark", disabled: false) {
+                                    saveRenamedAddon(at: index)
+                                }
+                                AddonReorderButton(systemImage: "xmark", disabled: false) {
+                                    renamingAddonID = nil
+                                    renamingText = ""
+                                }
+                            }
+                            .padding(.leading, 20)
+                        }
+                    }
                 }
 
                 let uncoveredAddons = Array(addons.enumerated()).filter { !isCoveredBySyncedAddon($0.element) }
@@ -12504,6 +12816,18 @@ private struct AddonsSettingsSection: View {
         persistSyncedAddons(removedAddon: removed)
     }
 
+    private func saveRenamedAddon(at index: Int) {
+        guard syncedAddons.indices.contains(index) else { return }
+        let trimmed = renamingText.trimmingCharacters(in: .whitespacesAndNewlines)
+        syncedAddons[index].customName = trimmed.isEmpty ? nil : trimmed
+        syncedAddons[index].name = trimmed.isEmpty
+            ? (syncedAddons[index].manifestID ?? CinemetaCatalogRepository.streamAddonName(for: syncedAddons[index].url))
+            : trimmed
+        persistSyncedAddons()
+        renamingAddonID = nil
+        renamingText = ""
+    }
+
     /// Finalizing the URL field is an add operation, not just a local settings
     /// edit. Canonicalize the complete list and notify sync immediately so the
     /// new add-on reaches the user's other devices.
@@ -12511,10 +12835,13 @@ private struct AddonsSettingsSection: View {
         let editedProfileId = ProfileSettings.activeProfileID ?? ""
         guard let url = CinemetaCatalogRepository.normalizedManifestURL(from: addonURLInput) else { return }
         var preferences = CinemetaCatalogRepository.configuredStreamAddonPreferences
+        let customName = addonNameInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nameToStore = customName.isEmpty ? nil : customName
         if let index = preferences.firstIndex(where: { $0.url == url.absoluteString }) {
             preferences[index].enabled = true
+            if let nameToStore { preferences[index].name = nameToStore }
         } else {
-            preferences.append(StreamAddonPreference(url: url.absoluteString, enabled: true))
+            preferences.append(StreamAddonPreference(url: url.absoluteString, enabled: true, name: nameToStore))
         }
         let cinemetaURL = "https://v3-cinemeta.strem.io/manifest.json"
         if url.absoluteString.caseInsensitiveCompare(cinemetaURL) == .orderedSame {
@@ -12529,6 +12856,7 @@ private struct AddonsSettingsSection: View {
         streamAddonManifestURLs = ProfileSettings.current.string(forKey: SettingsKey.streamAddonManifestURLs) ?? ""
         streamAddonManifestStates = ProfileSettings.current.string(forKey: SettingsKey.streamAddonManifestStates) ?? ""
         addonURLInput = ""
+        addonNameInput = ""
         NotificationCenter.default.post(
             name: NuvioSyncManager.addonOrderChangedNotification,
             object: preferences,
@@ -12539,7 +12867,7 @@ private struct AddonsSettingsSection: View {
     private func persistSyncedAddons(removedAddon: SyncedAddon? = nil) {
         let editedProfileId = ProfileSettings.activeProfileID ?? ""
         let preferences = syncedAddons.map {
-            StreamAddonPreference(url: $0.url.absoluteString, enabled: $0.isEnabled)
+            StreamAddonPreference(url: $0.url.absoluteString, enabled: $0.isEnabled, name: $0.customName)
         }
         var identities: [String: String] = [:]
         for addon in syncedAddons + [removedAddon].compactMap({ $0 }) {
@@ -12575,8 +12903,12 @@ private struct AddonsSettingsSection: View {
         // rows don't flash back to host-derived names.
         var resolved = preferences.compactMap { preference -> SyncedAddon? in
             guard let url = CinemetaCatalogRepository.normalizedManifestURL(from: preference.url) else { return nil }
-            var addon = syncedAddons.first { $0.url == url } ?? SyncedAddon(url: url)
+            var addon = syncedAddons.first { $0.url == url } ?? SyncedAddon(url: url, isEnabled: preference.enabled, customName: preference.name)
             addon.isEnabled = preference.enabled
+            if let prefName = preference.name?.trimmingCharacters(in: .whitespacesAndNewlines), !prefName.isEmpty {
+                addon.customName = prefName
+                addon.name = prefName
+            }
             return addon
         }
         syncedAddons = resolved
@@ -12809,6 +13141,7 @@ private struct AddonsSettingsSection: View {
 private struct SyncedAddon: Identifiable {
     let url: URL
     var name: String
+    var customName: String?
     var manifestID: String?
     var version: String?
     var description: String?
@@ -12820,16 +13153,24 @@ private struct SyncedAddon: Identifiable {
 
     var id: String { url.absoluteString }
 
-    init(url: URL, isEnabled: Bool = true) {
+    init(url: URL, isEnabled: Bool = true, customName: String? = nil) {
         self.url = url
-        self.name = CinemetaCatalogRepository.streamAddonName(for: url)
+        self.customName = customName
+        let trimmedCustom = customName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmedCustom, !trimmedCustom.isEmpty {
+            self.name = trimmedCustom
+        } else {
+            self.name = CinemetaCatalogRepository.streamAddonName(for: url)
+        }
         self.manifestID = nil
         self.isEnabled = isEnabled
     }
 
     mutating func apply(_ manifest: StremioManifest) {
         manifestID = manifest.id
-        if let manifestName = manifest.name?.trimmingCharacters(in: .whitespacesAndNewlines),
+        if let customName = customName?.trimmingCharacters(in: .whitespacesAndNewlines), !customName.isEmpty {
+            name = customName
+        } else if let manifestName = manifest.name?.trimmingCharacters(in: .whitespacesAndNewlines),
            !manifestName.isEmpty {
             name = manifestName
         }
@@ -12928,6 +13269,7 @@ private struct SyncedAddonSettingsRow: View {
     var canMoveUp: Bool = false
     var canMoveDown: Bool = false
     var onEnabledChange: ((Bool) -> Void)? = nil
+    var onRename: (() -> Void)? = nil
     var onDelete: (() -> Void)? = nil
     /// Called with `true` for up, `false` for down. nil hides the arrows.
     var onMove: ((Bool) -> Void)? = nil
@@ -12937,6 +13279,10 @@ private struct SyncedAddonSettingsRow: View {
     var body: some View {
         HStack(spacing: 14) {
             rowButton
+
+            if let onRename {
+                AddonReorderButton(systemImage: "pencil", disabled: false, action: onRename)
+            }
 
             // The row itself toggles active/inactive, so a power button beside it
             // did the same job twice. Uninstall is what the row could not offer.
@@ -15046,23 +15392,25 @@ private struct CollectionEditorSheet: View {
 
     private var isNew: Bool { existing == nil || createsNew }
 
-    /// Which source-add flow is open for a folder index (Android: Catalog / TMDB / Trakt).
+    /// Which source-add flow is open for a folder index (Android: Catalog / TMDB / Trakt / MDBList).
     private enum FolderSourcePicker: Identifiable {
         case catalogs(Int)
         case tmdb(Int)
         case trakt(Int)
+        case mdblist(Int)
 
         var id: String {
             switch self {
             case .catalogs(let i): return "catalogs-\(i)"
             case .tmdb(let i): return "tmdb-\(i)"
             case .trakt(let i): return "trakt-\(i)"
+            case .mdblist(let i): return "mdblist-\(i)"
             }
         }
 
         var folderIndex: Int {
             switch self {
-            case .catalogs(let i), .tmdb(let i), .trakt(let i): return i
+            case .catalogs(let i), .tmdb(let i), .trakt(let i), .mdblist(let i): return i
             }
         }
     }
@@ -15205,6 +15553,7 @@ private struct CollectionEditorSheet: View {
                                     onAddCatalog: { sourcePicker = .catalogs(index) },
                                     onAddTmdb: { sourcePicker = .tmdb(index) },
                                     onAddTrakt: { sourcePicker = .trakt(index) },
+                                    onAddMdbList: { sourcePicker = .mdblist(index) },
                                     onDelete: { removeFolder(at: index) }
                                 )
                             }
@@ -15272,6 +15621,10 @@ private struct CollectionEditorSheet: View {
                 }
             case .trakt(let index):
                 CollectionTraktSourceSheet(accentColor: accentColor) { payload in
+                    appendSource(payload, at: index)
+                }
+            case .mdblist(let index):
+                CollectionMdbListSourceSheet(accentColor: accentColor) { payload in
                     appendSource(payload, at: index)
                 }
             }
@@ -15560,6 +15913,7 @@ private struct CollectionFolderEditorCard: View {
     let onAddCatalog: () -> Void
     let onAddTmdb: () -> Void
     let onAddTrakt: () -> Void
+    let onAddMdbList: () -> Void
     let onDelete: () -> Void
 
     private enum CoverMode: String, CaseIterable, Identifiable {
@@ -15681,6 +16035,18 @@ private struct CollectionFolderEditorCard: View {
                 return L10n.format("tvos_settings_trakt_list_id", fallback: "Trakt · list %@", "\(id)")
             }
             return L10n.string("tvos_settings_trakt_list", fallback: "Trakt list")
+        case "mdblist":
+            let title = (source["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let title, !title.isEmpty {
+                return L10n.format("tvos_settings_mdblist_title", fallback: "MDBList · %@", title)
+            }
+            if let slug = (source["mdblistSlug"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !slug.isEmpty {
+                return L10n.format("tvos_settings_mdblist_slug", fallback: "MDBList · %@", slug)
+            }
+            if let id = source["mdblistId"] {
+                return L10n.format("tvos_settings_mdblist_id", fallback: "MDBList · list %@", "\(id)")
+            }
+            return L10n.string("tvos_settings_mdblist_list", fallback: "MDBList")
         default:
             let catalogId = source["catalogId"] as? String ?? "catalog"
             let type = (source["type"] as? String ?? "").capitalized
@@ -15891,6 +16257,11 @@ private struct CollectionFolderEditorCard: View {
                             title: L10n.string("tvos_settings_add_trakt_list", fallback: "Add Trakt List"),
                             systemImage: "plus",
                             action: onAddTrakt
+                        )
+                        CollectionsGlassButton(
+                            title: L10n.string("tvos_settings_add_mdblist", fallback: "Add MDBList"),
+                            systemImage: "plus",
+                            action: onAddMdbList
                         )
                     }
                     .padding(.vertical, 4)
@@ -16302,7 +16673,7 @@ private struct CollectionCatalogPickerSheet: View {
 
 // MARK: - TMDB / Trakt source sheets (Android folder source buttons)
 
-/// Minimal TMDB source form — writes Android-compatible `provider: tmdb` JSON.
+/// TMDB source form with custom filters — writes Android-compatible `provider: tmdb` JSON.
 private struct CollectionTmdbSourceSheet: View {
     let accentColor: Color
     let onAdd: ([String: Any]) -> Void
@@ -16312,22 +16683,123 @@ private struct CollectionTmdbSourceSheet: View {
     @State private var tmdbIdText = ""
     @State private var sourceType = "DISCOVER"
     @State private var mediaType = "movie"
+    @State private var sortBy = "popularity.desc"
+    @State private var includedGenres: Set<String> = []
+    @State private var excludedGenres: Set<String> = []
+    @State private var includedLanguage = ""
+    @State private var excludedLanguage = ""
+    @State private var minRating: Double? = nil
+    @State private var minVotes: Int? = nil
+    @State private var releaseYearText = ""
+    @State private var originCountryText = ""
+    @State private var keywordsText = ""
+    @State private var excludedKeywordsText = ""
 
     private let sourceTypes = ["DISCOVER", "COLLECTION", "COMPANY", "NETWORK", "LIST", "PERSON", "DIRECTOR"]
     private let mediaTypes = [("movie", "Movie"), ("tv", "TV")]
+
+    private struct TmdbGenreItem: Identifiable {
+        let id: String
+        let name: String
+    }
+
+    private let movieGenres: [TmdbGenreItem] = [
+        TmdbGenreItem(id: "28", name: "Action"),
+        TmdbGenreItem(id: "12", name: "Adventure"),
+        TmdbGenreItem(id: "16", name: "Animation"),
+        TmdbGenreItem(id: "35", name: "Comedy"),
+        TmdbGenreItem(id: "80", name: "Crime"),
+        TmdbGenreItem(id: "99", name: "Documentary"),
+        TmdbGenreItem(id: "18", name: "Drama"),
+        TmdbGenreItem(id: "10751", name: "Family"),
+        TmdbGenreItem(id: "14", name: "Fantasy"),
+        TmdbGenreItem(id: "36", name: "History"),
+        TmdbGenreItem(id: "27", name: "Horror"),
+        TmdbGenreItem(id: "10402", name: "Music"),
+        TmdbGenreItem(id: "9648", name: "Mystery"),
+        TmdbGenreItem(id: "10749", name: "Romance"),
+        TmdbGenreItem(id: "878", name: "Sci-Fi"),
+        TmdbGenreItem(id: "53", name: "Thriller"),
+        TmdbGenreItem(id: "10752", name: "War"),
+        TmdbGenreItem(id: "37", name: "Western")
+    ]
+
+    private let tvGenres: [TmdbGenreItem] = [
+        TmdbGenreItem(id: "10759", name: "Action & Adventure"),
+        TmdbGenreItem(id: "16", name: "Animation"),
+        TmdbGenreItem(id: "35", name: "Comedy"),
+        TmdbGenreItem(id: "80", name: "Crime"),
+        TmdbGenreItem(id: "99", name: "Documentary"),
+        TmdbGenreItem(id: "18", name: "Drama"),
+        TmdbGenreItem(id: "10751", name: "Family"),
+        TmdbGenreItem(id: "10762", name: "Kids"),
+        TmdbGenreItem(id: "9648", name: "Mystery"),
+        TmdbGenreItem(id: "10763", name: "News"),
+        TmdbGenreItem(id: "10764", name: "Reality"),
+        TmdbGenreItem(id: "10765", name: "Sci-Fi & Fantasy"),
+        TmdbGenreItem(id: "10766", name: "Soap"),
+        TmdbGenreItem(id: "10767", name: "Talk"),
+        TmdbGenreItem(id: "10768", name: "War & Politics"),
+        TmdbGenreItem(id: "37", name: "Western")
+    ]
+
+    private let commonLanguages: [(code: String, label: String)] = [
+        ("en", "English"),
+        ("ja", "Japanese"),
+        ("ko", "Korean"),
+        ("es", "Spanish"),
+        ("fr", "French"),
+        ("de", "German"),
+        ("it", "Italian"),
+        ("hi", "Hindi"),
+        ("zh", "Chinese")
+    ]
+
+    private let sortOptions: [(id: String, label: String)] = [
+        ("popularity.desc", "Popularity ↓"),
+        ("popularity.asc", "Popularity ↑"),
+        ("vote_average.desc", "Rating ↓"),
+        ("vote_average.asc", "Rating ↑"),
+        ("primary_release_date.desc", "Release Date ↓"),
+        ("primary_release_date.asc", "Release Date ↑"),
+        ("vote_count.desc", "Vote Count ↓"),
+        ("original_title.asc", "Title (A-Z)")
+    ]
+
+    private let ratingOptions: [(val: Double?, label: String)] = [
+        (nil, "Any"),
+        (6.0, "6.0+"),
+        (7.0, "7.0+"),
+        (7.5, "7.5+"),
+        (8.0, "8.0+")
+    ]
+
+    private let voteOptions: [(val: Int?, label: String)] = [
+        (nil, "Any"),
+        (50, "50+"),
+        (100, "100+"),
+        (500, "500+"),
+        (1000, "1,000+")
+    ]
+
+    private var currentGenres: [TmdbGenreItem] {
+        mediaType == "tv" ? tvGenres : movieGenres
+    }
 
     private var canAdd: Bool {
         !titleText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var body: some View {
-        sourceSheetChrome(title: L10n.string("tvos_settings_add_tmdb_source", fallback: "Add TMDB Source"), subtitle: L10n.string("tvos_settings_attach_a_tmdb_list_collection_company_or_b80d234f", fallback: "Attach a TMDB list, collection, company, or discover query.")) {
-            labeled("Title") {
+        sourceSheetChrome(
+            title: L10n.string("tvos_settings_add_tmdb_source", fallback: "Add TMDB Source"),
+            subtitle: L10n.string("tvos_settings_attach_a_tmdb_list_collection_company_or_b80d234f", fallback: "Attach a TMDB list, collection, company, or discover query with custom filters."),
+            scrollable: true
+        ) {
+            labeled(L10n.string("tvos_settings_source_title", fallback: "Title")) {
                 SettingsSearchStyleField(text: $titleText, placeholder: L10n.string("tvos_settings_source_title", fallback: "Source title"), height: 58, fontSize: 20, horizontalPadding: 22)
             }
-            labeled("TMDB ID (optional)") {
-                SettingsSearchStyleField(text: $tmdbIdText, placeholder: L10n.string("tvos_settings_numeric_tmdb_id", fallback: "Numeric TMDB id"), height: 58, fontSize: 20, horizontalPadding: 22)
-            }
+
             labeled("Source type") {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 10) {
@@ -16339,12 +16811,199 @@ private struct CollectionTmdbSourceSheet: View {
                     }
                 }
             }
+
+            if sourceType != "DISCOVER" {
+                labeled("TMDB ID") {
+                    SettingsSearchStyleField(text: $tmdbIdText, placeholder: L10n.string("tvos_settings_numeric_tmdb_id", fallback: "Numeric TMDB id"), height: 58, fontSize: 20, horizontalPadding: 22)
+                }
+            }
+
             labeled("Media type") {
                 HStack(spacing: 12) {
                     ForEach(mediaTypes, id: \.0) { id, label in
                         CollectionChipButton(title: label, isSelected: mediaType == id) {
                             mediaType = id
                         }
+                    }
+                }
+            }
+
+            if sourceType == "DISCOVER" {
+                labeled("Sort by") {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 10) {
+                            ForEach(sortOptions, id: \.id) { opt in
+                                CollectionChipButton(title: opt.label, isSelected: sortBy == opt.id) {
+                                    sortBy = opt.id
+                                }
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+
+                labeled("Include Genres") {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 10) {
+                            ForEach(currentGenres) { genre in
+                                let isSelected = includedGenres.contains(genre.id)
+                                CollectionChipButton(
+                                    title: genre.name,
+                                    isSelected: isSelected
+                                ) {
+                                    if isSelected {
+                                        includedGenres.remove(genre.id)
+                                    } else {
+                                        includedGenres.insert(genre.id)
+                                        excludedGenres.remove(genre.id)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+
+                labeled("Exclude Genres") {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 10) {
+                            ForEach(currentGenres) { genre in
+                                let isSelected = excludedGenres.contains(genre.id)
+                                CollectionChipButton(
+                                    title: genre.name,
+                                    isSelected: isSelected
+                                ) {
+                                    if isSelected {
+                                        excludedGenres.remove(genre.id)
+                                    } else {
+                                        excludedGenres.insert(genre.id)
+                                        includedGenres.remove(genre.id)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+
+                labeled("Include Original Language") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 10) {
+                                CollectionChipButton(title: "Any", isSelected: includedLanguage.isEmpty) {
+                                    includedLanguage = ""
+                                }
+                                ForEach(commonLanguages, id: \.code) { lang in
+                                    CollectionChipButton(title: lang.label, isSelected: includedLanguage == lang.code) {
+                                        includedLanguage = lang.code
+                                        if excludedLanguage == lang.code {
+                                            excludedLanguage = ""
+                                        }
+                                    }
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                        SettingsSearchStyleField(
+                            text: $includedLanguage,
+                            placeholder: "Custom ISO-639-1 language code (e.g. en, ja, fr)",
+                            height: 52,
+                            fontSize: 18,
+                            horizontalPadding: 20
+                        )
+                    }
+                }
+
+                labeled("Exclude Original Language") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 10) {
+                                CollectionChipButton(title: "None", isSelected: excludedLanguage.isEmpty) {
+                                    excludedLanguage = ""
+                                }
+                                ForEach(commonLanguages, id: \.code) { lang in
+                                    CollectionChipButton(title: lang.label, isSelected: excludedLanguage == lang.code) {
+                                        excludedLanguage = lang.code
+                                        if includedLanguage == lang.code {
+                                            includedLanguage = ""
+                                        }
+                                    }
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                        SettingsSearchStyleField(
+                            text: $excludedLanguage,
+                            placeholder: "Custom excluded ISO-639-1 code (e.g. en, ja)",
+                            height: 52,
+                            fontSize: 18,
+                            horizontalPadding: 20
+                        )
+                    }
+                }
+
+                labeled("Minimum Rating") {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 10) {
+                            ForEach(ratingOptions, id: \.label) { opt in
+                                CollectionChipButton(title: opt.label, isSelected: minRating == opt.val) {
+                                    minRating = opt.val
+                                }
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+
+                labeled("Minimum Vote Count") {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 10) {
+                            ForEach(voteOptions, id: \.label) { opt in
+                                CollectionChipButton(title: opt.label, isSelected: minVotes == opt.val) {
+                                    minVotes = opt.val
+                                }
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+
+                labeled("Release Year") {
+                    SettingsSearchStyleField(
+                        text: $releaseYearText,
+                        placeholder: "e.g. 2024 (optional)",
+                        height: 52,
+                        fontSize: 18,
+                        horizontalPadding: 20
+                    )
+                }
+
+                labeled("Origin Country") {
+                    SettingsSearchStyleField(
+                        text: $originCountryText,
+                        placeholder: "e.g. US, JP, KR, GB, FR (optional)",
+                        height: 52,
+                        fontSize: 18,
+                        horizontalPadding: 20
+                    )
+                }
+
+                labeled("Keywords (Include / Exclude IDs)") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        SettingsSearchStyleField(
+                            text: $keywordsText,
+                            placeholder: "Included TMDB keyword IDs (comma-separated)",
+                            height: 52,
+                            fontSize: 18,
+                            horizontalPadding: 20
+                        )
+                        SettingsSearchStyleField(
+                            text: $excludedKeywordsText,
+                            placeholder: "Excluded TMDB keyword IDs (comma-separated)",
+                            height: 52,
+                            fontSize: 18,
+                            horizontalPadding: 20
+                        )
                     }
                 }
             }
@@ -16368,10 +17027,62 @@ private struct CollectionTmdbSourceSheet: View {
             "tmdbSourceType": sourceType,
             "title": trimmedTitle,
             "mediaType": mediaType,
-            "sortBy": "popularity.desc"
+            "sortBy": sortBy
         ]
         if let id = Int(tmdbIdText.trimmingCharacters(in: .whitespacesAndNewlines)), id > 0 {
             payload["tmdbId"] = id
+        }
+        if sourceType == "DISCOVER" {
+            var filters: [String: Any] = [:]
+            if !includedGenres.isEmpty {
+                let genresStr = includedGenres.sorted().joined(separator: ",")
+                filters["withGenres"] = genresStr
+                filters["with_genres"] = genresStr
+            }
+            if !excludedGenres.isEmpty {
+                let genresStr = excludedGenres.sorted().joined(separator: ",")
+                filters["withoutGenres"] = genresStr
+                filters["without_genres"] = genresStr
+            }
+            let incLang = includedLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !incLang.isEmpty {
+                filters["withOriginalLanguage"] = incLang
+                filters["with_original_language"] = incLang
+            }
+            let excLang = excludedLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !excLang.isEmpty {
+                filters["withoutOriginalLanguage"] = excLang
+                filters["without_original_language"] = excLang
+            }
+            if let rating = minRating, rating > 0 {
+                filters["voteAverageGte"] = rating
+                filters["vote_average_gte"] = rating
+            }
+            if let votes = minVotes, votes > 0 {
+                filters["voteCountGte"] = votes
+                filters["vote_count_gte"] = votes
+            }
+            if let year = Int(releaseYearText.trimmingCharacters(in: .whitespacesAndNewlines)), year > 1880 {
+                filters["year"] = year
+            }
+            let country = originCountryText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !country.isEmpty {
+                filters["withOriginCountry"] = country
+                filters["with_origin_country"] = country
+            }
+            let kw = keywordsText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !kw.isEmpty {
+                filters["withKeywords"] = kw
+                filters["with_keywords"] = kw
+            }
+            let excKw = excludedKeywordsText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !excKw.isEmpty {
+                filters["withoutKeywords"] = excKw
+                filters["without_keywords"] = excKw
+            }
+            if !filters.isEmpty {
+                payload["filters"] = filters
+            }
         }
         onAdd(payload)
         dismiss()
@@ -16440,10 +17151,158 @@ private struct CollectionTraktSourceSheet: View {
     }
 }
 
+/// Minimal MDBList form — writes Android-compatible `provider: mdblist` JSON.
+private struct CollectionMdbListSourceSheet: View {
+    let accentColor: Color
+    let onAdd: ([String: Any]) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var titleText = ""
+    @State private var listSourceText = ""
+    @State private var mediaType = "all"
+    @State private var sortBy = "rank"
+    @State private var userLists: [MdbListUserList] = []
+    @State private var isLoadingUserLists = false
+
+    private let mediaTypes = [("all", "All"), ("movie", "Movie"), ("tv", "TV Series")]
+    private let sortOptions = [
+        ("rank", "Rank"),
+        ("title.asc", "Title (A-Z)"),
+        ("year.desc", "Release Date")
+    ]
+
+    private var canAdd: Bool {
+        !titleText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !listSourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var body: some View {
+        sourceSheetChrome(
+            title: L10n.string("tvos_settings_add_mdblist", fallback: "Add MDBList"),
+            subtitle: L10n.string("tvos_settings_add_mdblist_subtitle", fallback: "Attach a public MDBList list by URL, username/slug, or list ID."),
+            scrollable: true
+        ) {
+            labeled(L10n.string("tvos_settings_source_title", fallback: "Title")) {
+                SettingsSearchStyleField(
+                    text: $titleText,
+                    placeholder: L10n.string("tvos_settings_source_title", fallback: "List title"),
+                    height: 58,
+                    fontSize: 20,
+                    horizontalPadding: 22
+                )
+            }
+
+            labeled("MDBList URL, Slug, or List ID") {
+                SettingsSearchStyleField(
+                    text: $listSourceText,
+                    placeholder: "e.g. https://mdblist.com/lists/user/slug or list ID",
+                    height: 58,
+                    fontSize: 20,
+                    horizontalPadding: 22
+                )
+            }
+
+            if !userLists.isEmpty {
+                labeled("My MDBList Lists") {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 10) {
+                            ForEach(userLists) { list in
+                                CollectionChipButton(
+                                    title: list.name,
+                                    isSelected: listSourceText == (list.slug ?? String(list.id))
+                                ) {
+                                    if titleText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                        titleText = list.name
+                                    }
+                                    listSourceText = list.slug ?? String(list.id)
+                                }
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+            }
+
+            labeled(L10n.string("tvos_settings_media_type", fallback: "Media type")) {
+                HStack(spacing: 12) {
+                    ForEach(mediaTypes, id: \.0) { id, label in
+                        CollectionChipButton(title: label, isSelected: mediaType == id) {
+                            mediaType = id
+                        }
+                    }
+                }
+            }
+
+            labeled(L10n.string("tvos_settings_sort_by", fallback: "Sort by")) {
+                HStack(spacing: 12) {
+                    ForEach(sortOptions, id: \.0) { id, label in
+                        CollectionChipButton(title: label, isSelected: sortBy == id) {
+                            sortBy = id
+                        }
+                    }
+                }
+            }
+        } footer: {
+            CollectionsGlassButton(title: L10n.string("action_cancel", fallback: "Cancel"), action: { dismiss() })
+            CollectionsGlassButton(
+                title: L10n.string("tvos_settings_add", fallback: "Add"),
+                systemImage: "plus",
+                prominent: true,
+                disabled: !canAdd,
+                action: add
+            )
+        }
+        .task {
+            await loadUserLists()
+        }
+    }
+
+    private func loadUserLists() async {
+        guard !isLoadingUserLists else { return }
+        isLoadingUserLists = true
+        if let lists = await MdbListListService.fetchUserLists(), !lists.isEmpty {
+            userLists = lists
+        }
+        isLoadingUserLists = false
+    }
+
+    private func add() {
+        let trimmedTitle = titleText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedSource = listSourceText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTitle.isEmpty, !trimmedSource.isEmpty else { return }
+
+        var payload: [String: Any] = [
+            "provider": "mdblist",
+            "title": trimmedTitle,
+            "mediaType": mediaType,
+            "sortBy": sortBy
+        ]
+
+        if let id = Int(trimmedSource), id > 0 {
+            payload["mdblistId"] = id
+        } else if trimmedSource.lowercased().hasPrefix("http://") || trimmedSource.lowercased().hasPrefix("https://") {
+            payload["mdblistUrl"] = trimmedSource
+            if let components = URLComponents(string: trimmedSource) {
+                let parts = components.path.split(separator: "/").map(String.init)
+                if let listsIndex = parts.firstIndex(of: "lists"), listsIndex + 2 <= parts.count {
+                    let userAndSlug = "\(parts[listsIndex + 1])/\(parts[listsIndex + 2].replacingOccurrences(of: ".json", with: ""))"
+                    payload["mdblistSlug"] = userAndSlug
+                }
+            }
+        } else {
+            payload["mdblistSlug"] = trimmedSource
+        }
+
+        onAdd(payload)
+        dismiss()
+    }
+}
+
 /// Shared liquid-glass panel chrome for the TMDB / Trakt add sheets.
 private func sourceSheetChrome<Content: View, Footer: View>(
     title: String,
     subtitle: String,
+    scrollable: Bool = false,
     @ViewBuilder content: () -> Content,
     @ViewBuilder footer: () -> Footer
 ) -> some View {
@@ -16459,8 +17318,21 @@ private func sourceSheetChrome<Content: View, Footer: View>(
                     .foregroundColor(.white.opacity(0.58))
                     .fixedSize(horizontal: false, vertical: true)
             }
-            VStack(alignment: .leading, spacing: 18) {
-                content()
+            if scrollable {
+                ScrollView(.vertical, showsIndicators: true) {
+                    VStack(alignment: .leading, spacing: 18) {
+                        content()
+                    }
+                    .padding(.top, 4)
+                    .padding(.bottom, 24)
+                    .padding(.horizontal, 4)
+                }
+                .frame(maxHeight: 520)
+                .focusSection()
+            } else {
+                VStack(alignment: .leading, spacing: 18) {
+                    content()
+                }
             }
             HStack(spacing: 14) {
                 Spacer()
@@ -17359,9 +18231,17 @@ private struct SettingsSearchGlassBackground<S: InsettableShape>: ViewModifier {
 }
 
 #if DEBUG
+private struct SettingsViewPreviewHost: View {
+    @State private var selectedCategory: SettingsCategory = .account
+
+    var body: some View {
+        SettingsView(selectedCategory: $selectedCategory)
+    }
+}
+
 struct SettingsView_Previews: PreviewProvider {
     static var previews: some View {
-        SettingsView()
+        SettingsViewPreviewHost()
     }
 }
 #endif
