@@ -12,6 +12,13 @@
       "tintColor": "007AFF",
       "versions": [
         {
+          "version": "3.5.3",
+          "date": "2026-11-23T20:33:03Z",
+          "localizedDescription": "Automated build for upstream release [tvos-beta-3.5.3](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.5.3).\nPatched App Group: `group.M3HWHXLPC7.com.pyksel.nuviotvos`.\n",
+          "downloadURL": "https://github.com/greenspeedracer/NuvioTVOS/releases/download/tvos-beta-3.5.3/NuvioTV-3.5.3-unsigned-release.ipa",
+          "size": 97165702
+        },
+        {
           "version": "3.5.2",
           "date": "2026-11-17T00:03:24Z",
           "localizedDescription": "Automated build for upstream release [tvos-beta-3.5.2](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.5.2).\nPatched App Group: `group.M3HWHXLPC7.com.pyksel.nuviotvos`.\n",
